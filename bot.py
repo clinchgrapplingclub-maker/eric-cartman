@@ -16,10 +16,10 @@ if not TOKEN:
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True
+intents.members = False
 intents.message_content = False
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
 DB_PATH = "ticketbot.db"
 
@@ -97,6 +97,14 @@ def clean_channel_name(text: str) -> str:
     text = re.sub(r"\s+", "-", text).strip("-")
     text = re.sub(r"-{2,}", "-", text)
     return text[:80] if text else "ticket"
+
+
+def is_image_attachment(att: discord.Attachment) -> bool:
+    if att.content_type and att.content_type.startswith("image/"):
+        return True
+
+    filename = att.filename.lower()
+    return filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 
 
 def save_guild_config(
@@ -253,6 +261,113 @@ def delete_ticket_record(channel_id: int):
 
 
 # =========================
+# SETUP SESSION
+# =========================
+class SetupSession:
+    def __init__(self, guild_id: int, user_id: int, banner_url: str, thumbnail_url: str):
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        self.title: Optional[str] = None
+        self.description: Optional[str] = None
+        self.color_hex: Optional[str] = None
+
+        self.banner_url: str = banner_url
+        self.thumbnail_url: str = thumbnail_url
+
+        self.option_1_name: Optional[str] = None
+        self.option_1_category_id: Optional[int] = None
+
+        self.option_2_name: Optional[str] = None
+        self.option_2_category_id: Optional[int] = None
+
+        self.option_3_name: Optional[str] = None
+        self.option_3_category_id: Optional[int] = None
+
+        self.panel_channel_id: Optional[int] = None
+        self.log_channel_id: Optional[int] = None
+        self.support_role_id: Optional[int] = None
+
+
+setup_sessions: dict[tuple[int, int], SetupSession] = {}
+
+
+def get_setup_session(guild_id: int, user_id: int) -> Optional[SetupSession]:
+    return setup_sessions.get((guild_id, user_id))
+
+
+def clear_setup_session(guild_id: int, user_id: int):
+    setup_sessions.pop((guild_id, user_id), None)
+
+
+def build_setup_summary_embed(guild: discord.Guild, session: SetupSession) -> discord.Embed:
+    color = discord.Color.green()
+    if session.color_hex:
+        try:
+            color = hex_to_color(session.color_hex)
+        except Exception:
+            pass
+
+    panel_channel = guild.get_channel(session.panel_channel_id) if session.panel_channel_id else None
+    log_channel = guild.get_channel(session.log_channel_id) if session.log_channel_id else None
+    support_role = guild.get_role(session.support_role_id) if session.support_role_id else None
+
+    option_1_cat = guild.get_channel(session.option_1_category_id) if session.option_1_category_id else None
+    option_2_cat = guild.get_channel(session.option_2_category_id) if session.option_2_category_id else None
+    option_3_cat = guild.get_channel(session.option_3_category_id) if session.option_3_category_id else None
+
+    def fmt(value: Optional[str]) -> str:
+        return value if value else "`Not set`"
+
+    embed = discord.Embed(
+        title="Ticket Setup",
+        description="Use the buttons below to finish the setup.",
+        color=color
+    )
+
+    embed.add_field(
+        name="Panel",
+        value=(
+            f"**Title:** {fmt(session.title)}\n"
+            f"**Description:** {fmt(session.description)}\n"
+            f"**Color:** {fmt(session.color_hex)}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Channels / Role",
+        value=(
+            f"**Panel Channel:** {panel_channel.mention if panel_channel else '`Not set`'}\n"
+            f"**Log Channel:** {log_channel.mention if log_channel else '`Not set`'}\n"
+            f"**Support Team:** {support_role.mention if support_role else '`Not set`'}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Ticket Options",
+        value=(
+            f"**1.** {fmt(session.option_1_name)} - {option_1_cat.mention if option_1_cat else '`Category not set`'}\n"
+            f"**2.** {fmt(session.option_2_name)} - {option_2_cat.mention if option_2_cat else ('`Not needed`' if not session.option_2_name else '`Category not set`')}\n"
+            f"**3.** {fmt(session.option_3_name)} - {option_3_cat.mention if option_3_cat else ('`Not needed`' if not session.option_3_name else '`Category not set`')}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Images",
+        value="**Banner:** uploaded\n**Small Picture:** uploaded",
+        inline=False
+    )
+
+    embed.set_thumbnail(url=session.thumbnail_url)
+    embed.set_image(url=session.banner_url)
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+# =========================
 # HELPERS
 # =========================
 def build_panel_embed(guild_id: int) -> discord.Embed:
@@ -372,6 +487,397 @@ async def send_log(
         await log_channel.send(embed=embed, file=file)
     except discord.Forbidden:
         pass
+
+
+# =========================
+# SETUP MODALS
+# =========================
+class SetupTextModal(discord.ui.Modal, title="Ticket Panel Setup"):
+    panel_title = discord.ui.TextInput(
+        label="Ticket panel title",
+        placeholder="Vision Tickets",
+        max_length=100
+    )
+
+    description = discord.ui.TextInput(
+        label="Description",
+        placeholder="Write the panel description here",
+        style=discord.TextStyle.paragraph,
+        max_length=1000
+    )
+
+    color_hex = discord.ui.TextInput(
+        label="Embed color hexcode",
+        placeholder="#00FF00",
+        max_length=7
+    )
+
+    option_1_name = discord.ui.TextInput(
+        label="Ticket option 1",
+        placeholder="Support Ticket",
+        max_length=100
+    )
+
+    option_2_name = discord.ui.TextInput(
+        label="Ticket option 2 (optional)",
+        placeholder="Purchase Ticket",
+        required=False,
+        max_length=100
+    )
+
+    def __init__(self, session: SetupSession):
+        super().__init__()
+        self.session = session
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            self.session.color_hex = normalize_hex(str(self.color_hex))
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid hex color. Example: #00FF00",
+                ephemeral=True
+            )
+            return
+
+        self.session.title = str(self.panel_title).strip()
+        self.session.description = str(self.description).strip()
+        self.session.option_1_name = str(self.option_1_name).strip()
+        self.session.option_2_name = str(self.option_2_name).strip() or None
+
+        await interaction.response.send_message(
+            embed=build_setup_summary_embed(interaction.guild, self.session),
+            view=SetupHubView(self.session),
+            ephemeral=True
+        )
+
+
+class Option3NameModal(discord.ui.Modal, title="Ticket Option 3"):
+    option_3_name = discord.ui.TextInput(
+        label="Ticket option 3 (leave blank to remove)",
+        placeholder="Report Ticket",
+        required=False,
+        max_length=100
+    )
+
+    def __init__(self, session: SetupSession):
+        super().__init__()
+        self.session = session
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = str(self.option_3_name).strip() or None
+        self.session.option_3_name = value
+
+        if not value:
+            self.session.option_3_category_id = None
+
+        await interaction.response.send_message(
+            embed=build_setup_summary_embed(interaction.guild, self.session),
+            view=SetupHubView(self.session),
+            ephemeral=True
+        )
+
+
+# =========================
+# SETUP SELECTS
+# =========================
+class PanelChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, session: SetupSession):
+        super().__init__(
+            placeholder="Choose panel channel",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.text]
+        )
+        self.session = session
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This setup is not yours.", ephemeral=True)
+            return
+
+        channel = self.values[0]
+        self.session.panel_channel_id = channel.id
+
+        await interaction.response.send_message(
+            f"Panel channel set to {channel.mention}.",
+            ephemeral=True
+        )
+
+
+class LogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, session: SetupSession):
+        super().__init__(
+            placeholder="Choose log channel",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.text]
+        )
+        self.session = session
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This setup is not yours.", ephemeral=True)
+            return
+
+        channel = self.values[0]
+        self.session.log_channel_id = channel.id
+
+        await interaction.response.send_message(
+            f"Log channel set to {channel.mention}.",
+            ephemeral=True
+        )
+
+
+class SupportRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, session: SetupSession):
+        super().__init__(
+            placeholder="Choose support team role",
+            min_values=1,
+            max_values=1
+        )
+        self.session = session
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This setup is not yours.", ephemeral=True)
+            return
+
+        role = self.values[0]
+        self.session.support_role_id = role.id
+
+        await interaction.response.send_message(
+            f"Support role set to {role.mention}.",
+            ephemeral=True
+        )
+
+
+class Option1CategorySelect(discord.ui.ChannelSelect):
+    def __init__(self, session: SetupSession):
+        super().__init__(
+            placeholder="Choose category for option 1",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.category]
+        )
+        self.session = session
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This setup is not yours.", ephemeral=True)
+            return
+
+        category = self.values[0]
+        self.session.option_1_category_id = category.id
+
+        await interaction.response.send_message(
+            f"Option 1 category set to **{category.name}**.",
+            ephemeral=True
+        )
+
+
+class Option2CategorySelect(discord.ui.ChannelSelect):
+    def __init__(self, session: SetupSession):
+        super().__init__(
+            placeholder="Choose category for option 2",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.category]
+        )
+        self.session = session
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This setup is not yours.", ephemeral=True)
+            return
+
+        category = self.values[0]
+        self.session.option_2_category_id = category.id
+
+        await interaction.response.send_message(
+            f"Option 2 category set to **{category.name}**.",
+            ephemeral=True
+        )
+
+
+class Option3CategorySelect(discord.ui.ChannelSelect):
+    def __init__(self, session: SetupSession):
+        super().__init__(
+            placeholder="Choose category for option 3",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.category]
+        )
+        self.session = session
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This setup is not yours.", ephemeral=True)
+            return
+
+        category = self.values[0]
+        self.session.option_3_category_id = category.id
+
+        await interaction.response.send_message(
+            f"Option 3 category set to **{category.name}**.",
+            ephemeral=True
+        )
+
+
+# =========================
+# SETUP VIEWS
+# =========================
+class ChannelsRoleView(discord.ui.View):
+    def __init__(self, session: SetupSession):
+        super().__init__(timeout=900)
+        self.session = session
+        self.add_item(PanelChannelSelect(session))
+        self.add_item(LogChannelSelect(session))
+        self.add_item(SupportRoleSelect(session))
+
+
+class CategoriesView(discord.ui.View):
+    def __init__(self, session: SetupSession):
+        super().__init__(timeout=900)
+        self.session = session
+        self.add_item(Option1CategorySelect(session))
+
+        if session.option_2_name:
+            self.add_item(Option2CategorySelect(session))
+
+        if session.option_3_name:
+            self.add_item(Option3CategorySelect(session))
+
+
+class SetupHubView(discord.ui.View):
+    def __init__(self, session: SetupSession):
+        super().__init__(timeout=900)
+        self.session = session
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This setup is not yours.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Channels / Role", style=discord.ButtonStyle.secondary, row=0)
+    async def channels_role_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose the panel channel, log channel and support team role below.",
+            view=ChannelsRoleView(self.session),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Categories", style=discord.ButtonStyle.secondary, row=0)
+    async def categories_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose the category for each ticket option below.",
+            view=CategoriesView(self.session),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Option 3 Name", style=discord.ButtonStyle.secondary, row=0)
+    async def option3_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(Option3NameModal(self.session))
+
+    @discord.ui.button(label="Refresh Summary", style=discord.ButtonStyle.primary, row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            embed=build_setup_summary_embed(interaction.guild, self.session),
+            view=SetupHubView(self.session),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Publish Panel", style=discord.ButtonStyle.success, row=1)
+    async def publish_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        session = self.session
+
+        if not session.title or not session.description or not session.color_hex:
+            await interaction.response.send_message("Base setup is incomplete.", ephemeral=True)
+            return
+
+        if not session.option_1_name:
+            await interaction.response.send_message("Option 1 name is required.", ephemeral=True)
+            return
+
+        if not session.option_1_category_id:
+            await interaction.response.send_message("Option 1 category is required.", ephemeral=True)
+            return
+
+        if session.option_2_name and not session.option_2_category_id:
+            await interaction.response.send_message("Option 2 category is required.", ephemeral=True)
+            return
+
+        if session.option_3_name and not session.option_3_category_id:
+            await interaction.response.send_message("Option 3 category is required.", ephemeral=True)
+            return
+
+        if not session.panel_channel_id or not session.log_channel_id or not session.support_role_id:
+            await interaction.response.send_message(
+                "Panel channel, log channel and support role must all be set.",
+                ephemeral=True
+            )
+            return
+
+        panel_channel = guild.get_channel(session.panel_channel_id)
+        log_channel = guild.get_channel(session.log_channel_id)
+        support_role = guild.get_role(session.support_role_id)
+
+        if not isinstance(panel_channel, discord.TextChannel):
+            await interaction.response.send_message("Panel channel is invalid.", ephemeral=True)
+            return
+
+        if not isinstance(log_channel, discord.TextChannel):
+            await interaction.response.send_message("Log channel is invalid.", ephemeral=True)
+            return
+
+        if not support_role:
+            await interaction.response.send_message("Support role is invalid.", ephemeral=True)
+            return
+
+        clear_ticket_options(guild.id)
+        save_ticket_option(guild.id, 1, session.option_1_name, session.option_1_category_id)
+
+        if session.option_2_name and session.option_2_category_id:
+            save_ticket_option(guild.id, 2, session.option_2_name, session.option_2_category_id)
+
+        if session.option_3_name and session.option_3_category_id:
+            save_ticket_option(guild.id, 3, session.option_3_name, session.option_3_category_id)
+
+        embed = discord.Embed(
+            title=session.title,
+            description=session.description,
+            color=hex_to_color(session.color_hex)
+        )
+        embed.set_image(url=session.banner_url)
+        embed.set_thumbnail(url=session.thumbnail_url)
+        embed.set_footer(text="made by @fntsheetz")
+
+        panel_message = await panel_channel.send(
+            embed=embed,
+            view=TicketPanelView(guild.id)
+        )
+
+        save_guild_config(
+            guild_id=guild.id,
+            panel_channel_id=panel_channel.id,
+            panel_message_id=panel_message.id,
+            title=session.title,
+            description=session.description,
+            color_hex=session.color_hex,
+            banner_url=session.banner_url,
+            thumbnail_url=session.thumbnail_url,
+            support_role_id=support_role.id,
+            log_channel_id=log_channel.id
+        )
+
+        bot.add_view(TicketPanelView(guild.id), message_id=panel_message.id)
+        clear_setup_session(guild.id, interaction.user.id)
+
+        await interaction.response.send_message(
+            f"Ticket panel created in {panel_channel.mention}.",
+            ephemeral=True
+        )
 
 
 # =========================
@@ -737,25 +1243,13 @@ class TicketControlView(discord.ui.View):
 # =========================
 # COMMANDS
 # =========================
-@bot.tree.command(name="setup", description="Create or update the ticket panel for this server")
+@bot.tree.command(name="setup", description="Open the ticket setup form")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def setup(
     interaction: discord.Interaction,
-    panel_channel: discord.TextChannel,
-    title: str,
-    description: str,
-    support_team: discord.Role,
-    log_channel: discord.TextChannel,
-    embed_color_hex: str,
-    banner_url: str,
-    small_picture_url: str,
-    option_1_name: str,
-    option_1_category: discord.CategoryChannel,
-    option_2_name: Optional[str] = None,
-    option_2_category: Optional[discord.CategoryChannel] = None,
-    option_3_name: Optional[str] = None,
-    option_3_category: Optional[discord.CategoryChannel] = None,
+    banner: discord.Attachment,
+    small_picture: discord.Attachment
 ):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message(
@@ -771,70 +1265,29 @@ async def setup(
         )
         return
 
-    try:
-        color_hex = normalize_hex(embed_color_hex)
-    except ValueError:
+    if not is_image_attachment(banner):
         await interaction.response.send_message(
-            "Invalid hex color. Example: #00FF00",
+            "The banner attachment must be an image.",
             ephemeral=True
         )
         return
 
-    optional_pairs = [
-        (option_2_name, option_2_category),
-        (option_3_name, option_3_category),
-    ]
+    if not is_image_attachment(small_picture):
+        await interaction.response.send_message(
+            "The small picture attachment must be an image.",
+            ephemeral=True
+        )
+        return
 
-    for name, category in optional_pairs:
-        if (name and not category) or (category and not name):
-            await interaction.response.send_message(
-                "Each optional ticket option must include both a name and a category.",
-                ephemeral=True
-            )
-            return
-
-    clear_ticket_options(interaction.guild.id)
-    save_ticket_option(interaction.guild.id, 1, option_1_name, option_1_category.id)
-
-    if option_2_name and option_2_category:
-        save_ticket_option(interaction.guild.id, 2, option_2_name, option_2_category.id)
-
-    if option_3_name and option_3_category:
-        save_ticket_option(interaction.guild.id, 3, option_3_name, option_3_category.id)
-
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=hex_to_color(color_hex)
-    )
-    embed.set_image(url=banner_url)
-    embed.set_thumbnail(url=small_picture_url)
-    embed.set_footer(text="made by @fntsheetz")
-
-    panel_message = await panel_channel.send(
-        embed=embed,
-        view=TicketPanelView(interaction.guild.id)
-    )
-
-    save_guild_config(
+    session = SetupSession(
         guild_id=interaction.guild.id,
-        panel_channel_id=panel_channel.id,
-        panel_message_id=panel_message.id,
-        title=title,
-        description=description,
-        color_hex=color_hex,
-        banner_url=banner_url,
-        thumbnail_url=small_picture_url,
-        support_role_id=support_team.id,
-        log_channel_id=log_channel.id
+        user_id=interaction.user.id,
+        banner_url=banner.url,
+        thumbnail_url=small_picture.url
     )
+    setup_sessions[(interaction.guild.id, interaction.user.id)] = session
 
-    bot.add_view(TicketPanelView(interaction.guild.id), message_id=panel_message.id)
-
-    await interaction.response.send_message(
-        f"Ticket panel created in {panel_channel.mention}.",
-        ephemeral=True
-    )
+    await interaction.response.send_modal(SetupTextModal(session))
 
 
 @bot.tree.command(name="remind", description="DM a user to reply in their ticket")
