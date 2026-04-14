@@ -26,7 +26,6 @@ bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 DB_PATH = "ticketbot.db"
 
 SKIP_WORDS = {"skip", "none", "no", "-"}
-CANCEL_WORDS = {"cancel", "stop", "abort", "exit"}
 
 
 # =========================
@@ -310,14 +309,23 @@ def is_image_attachment(att: discord.Attachment) -> bool:
     return filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 
 
-def extract_id(text: str) -> Optional[int]:
-    match = re.search(r"(\d{15,25})", text)
-    if not match:
-        return None
+async def try_fetch_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+    member = guild.get_member(user_id)
+    if member:
+        return member
     try:
-        return int(match.group(1))
-    except ValueError:
+        return await guild.fetch_member(user_id)
+    except Exception:
         return None
+
+
+async def safe_delete(message: Optional[discord.Message]):
+    if not message:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 def base_embed(
@@ -404,6 +412,54 @@ def build_closed_ticket_embed(guild_id: int, closed_by: discord.Member) -> disco
     return embed
 
 
+def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.Embed:
+    color = hex_to_color(data.color_hex if data.color_hex else "#00FF66")
+
+    panel_channel = guild.get_channel(data.panel_channel_id) if data.panel_channel_id else None
+    support_role = guild.get_role(data.support_role_id) if data.support_role_id else None
+    log_channel = guild.get_channel(data.log_channel_id) if data.log_channel_id else None
+
+    cat1 = guild.get_channel(data.option_1_category_id) if data.option_1_category_id else None
+    cat2 = guild.get_channel(data.option_2_category_id) if data.option_2_category_id else None
+    cat3 = guild.get_channel(data.option_3_category_id) if data.option_3_category_id else None
+
+    embed = discord.Embed(
+        title=data.title or "Setup Preview",
+        description=data.description or "No description set.",
+        color=color
+    )
+
+    embed.add_field(
+        name="Panel Settings",
+        value=(
+            f"**Color:** `{data.color_hex}`\n"
+            f"**Panel Channel:** {panel_channel.mention if panel_channel else '`Not set`'}\n"
+            f"**Support Team:** {support_role.mention if support_role else '`Not set`'}\n"
+            f"**Log Channel:** {log_channel.mention if log_channel else '`Not set`'}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Ticket Options",
+        value=(
+            f"**1.** {data.option_1_name or '`Not set`'} - {cat1.name if cat1 else '`Not set`'}\n"
+            f"**2.** {(data.option_2_name or '`Skipped`')} - {(cat2.name if cat2 else ('`Skipped`' if not data.option_2_name else '`Not set`'))}\n"
+            f"**3.** {(data.option_3_name or '`Skipped`')} - {(cat3.name if cat3 else ('`Skipped`' if not data.option_3_name else '`Not set`'))}"
+        ),
+        inline=False
+    )
+
+    if data.thumbnail_url:
+        embed.set_thumbnail(url=data.thumbnail_url)
+
+    if data.banner_url:
+        embed.set_image(url=data.banner_url)
+
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
 def is_support_or_admin(member: discord.Member, guild_id: int) -> bool:
     if member.guild_permissions.administrator:
         return True
@@ -414,53 +470,6 @@ def is_support_or_admin(member: discord.Member, guild_id: int) -> bool:
 
     role = member.guild.get_role(config["support_role_id"])
     return role in member.roles if role else False
-
-
-def resolve_text_channel(guild: discord.Guild, raw: str) -> Optional[discord.TextChannel]:
-    cid = extract_id(raw)
-    if cid:
-        ch = guild.get_channel(cid)
-        if isinstance(ch, discord.TextChannel):
-            return ch
-
-    raw_clean = raw.strip().replace("#", "")
-    for ch in guild.text_channels:
-        if ch.name.lower() == raw_clean.lower():
-            return ch
-    return None
-
-
-def resolve_role(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
-    rid = extract_id(raw)
-    if rid:
-        role = guild.get_role(rid)
-        if role:
-            return role
-
-    raw_clean = raw.strip().replace("@", "")
-    for role in guild.roles:
-        if role.name.lower() == raw_clean.lower():
-            return role
-    return None
-
-
-async def try_fetch_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
-    member = guild.get_member(user_id)
-    if member:
-        return member
-    try:
-        return await guild.fetch_member(user_id)
-    except Exception:
-        return None
-
-
-async def safe_delete(message: Optional[discord.Message]):
-    if not message:
-        return
-    try:
-        await message.delete()
-    except Exception:
-        pass
 
 
 async def send_log(
@@ -561,113 +570,31 @@ async def set_guild_profile(
             return False, f"Discord API error {resp.status}: {text}"
 
 
-def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.Embed:
-    color = hex_to_color(data.color_hex if data.color_hex else "#00FF66")
-
-    panel_channel = guild.get_channel(data.panel_channel_id) if data.panel_channel_id else None
-    support_role = guild.get_role(data.support_role_id) if data.support_role_id else None
-    log_channel = guild.get_channel(data.log_channel_id) if data.log_channel_id else None
-
-    cat1 = guild.get_channel(data.option_1_category_id) if data.option_1_category_id else None
-    cat2 = guild.get_channel(data.option_2_category_id) if data.option_2_category_id else None
-    cat3 = guild.get_channel(data.option_3_category_id) if data.option_3_category_id else None
-
-    embed = discord.Embed(
-        title=data.title or "Setup Preview",
-        description=data.description or "No description set.",
-        color=color
-    )
-
-    embed.add_field(
-        name="Panel Settings",
-        value=(
-            f"**Color:** `{data.color_hex}`\n"
-            f"**Panel Channel:** {panel_channel.mention if panel_channel else '`Not set`'}\n"
-            f"**Support Team:** {support_role.mention if support_role else '`Not set`'}\n"
-            f"**Log Channel:** {log_channel.mention if log_channel else '`Not set`'}"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Ticket Options",
-        value=(
-            f"**1.** {data.option_1_name or '`Not set`'} - {cat1.name if cat1 else '`Not set`'}\n"
-            f"**2.** {(data.option_2_name or '`Skipped`')} - {(cat2.name if cat2 else ('`Skipped`' if not data.option_2_name else '`Not set`'))}\n"
-            f"**3.** {(data.option_3_name or '`Skipped`')} - {(cat3.name if cat3 else ('`Skipped`' if not data.option_3_name else '`Not set`'))}"
-        ),
-        inline=False
-    )
-
-    if data.thumbnail_url:
-        embed.set_thumbnail(url=data.thumbnail_url)
-
-    if data.banner_url:
-        embed.set_image(url=data.banner_url)
-
-    embed.set_footer(text="made by @fntsheetz")
-    return embed
-
-
 # =========================
-# SETUP CATEGORY PICKER
+# SETUP SELECT HELPERS
 # =========================
-class SetupCategorySelect(discord.ui.ChannelSelect):
-    def __init__(self, data: SetupData):
-        super().__init__(
-            placeholder="Choose a category",
-            min_values=1,
-            max_values=1,
-            channel_types=[discord.ChannelType.category]
-        )
-        self.data = data
-
-
-class SetupCategoryView(discord.ui.View):
-    def __init__(self, data: SetupData, user_id: int):
-        super().__init__(timeout=300)
-        self.data = data
-        self.user_id = user_id
-        self.selected_category_id: Optional[int] = None
-        self.add_item(SetupCategorySelect(data))
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id if interaction.guild else None,
-                    "Access Denied",
-                    "This selection is not for you.",
-                    error=True
-                ),
-                ephemeral=True
-            )
-            return False
-        return True
-
-    @discord.ui.select(cls=SetupCategorySelect)
-    async def _dummy(self, interaction: discord.Interaction, select):
-        pass
-
-
-async def ask_category_select(
+async def ask_channel_select(
     channel: discord.TextChannel,
     user: discord.Member,
     data: SetupData,
     title: str,
     description: str,
-) -> discord.CategoryChannel:
-    prompt_embed = setup_embed(data, title, description)
+) -> discord.TextChannel:
+    prompt = await channel.send(
+        embed=setup_embed(data, title, description),
+        view=discord.ui.View(timeout=300)
+    )
+
     view = discord.ui.View(timeout=300)
     select = discord.ui.ChannelSelect(
-        placeholder="Choose a category",
+        placeholder="Choose a text channel",
         min_values=1,
         max_values=1,
-        channel_types=[discord.ChannelType.category]
+        channel_types=[discord.ChannelType.text]
     )
     view.add_item(select)
 
-    prompt = await channel.send(embed=prompt_embed, view=view)
+    await prompt.edit(embed=setup_embed(data, title, description), view=view)
 
     try:
         while True:
@@ -683,9 +610,155 @@ async def ask_category_select(
                 timeout=300
             )
 
-            values = getattr(interaction.data, "values", None)
-            if values is None:
-                values = interaction.data.get("values", []) if interaction.data else []
+            if not interaction.data:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a text channel."),
+                    ephemeral=True
+                )
+                continue
+
+            values = interaction.data.get("values", [])
+            if not values:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a text channel."),
+                    ephemeral=True
+                )
+                continue
+
+            channel_id = int(values[0])
+            selected_channel = channel.guild.get_channel(channel_id)
+
+            if not isinstance(selected_channel, discord.TextChannel):
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "That is not a valid text channel."),
+                    ephemeral=True
+                )
+                continue
+
+            await interaction.response.edit_message(view=None)
+            return selected_channel
+    finally:
+        try:
+            await prompt.edit(view=None)
+        except Exception:
+            pass
+
+
+async def ask_role_select(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+) -> discord.Role:
+    prompt = await channel.send(
+        embed=setup_embed(data, title, description),
+        view=discord.ui.View(timeout=300)
+    )
+
+    view = discord.ui.View(timeout=300)
+    select = discord.ui.RoleSelect(
+        placeholder="Choose a support role",
+        min_values=1,
+        max_values=1
+    )
+    view.add_item(select)
+
+    await prompt.edit(embed=setup_embed(data, title, description), view=view)
+
+    try:
+        while True:
+            interaction = await bot.wait_for(
+                "interaction",
+                check=lambda i: (
+                    i.type == discord.InteractionType.component
+                    and i.user.id == user.id
+                    and i.channel_id == channel.id
+                    and i.message is not None
+                    and i.message.id == prompt.id
+                ),
+                timeout=300
+            )
+
+            if not interaction.data:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a role."),
+                    ephemeral=True
+                )
+                continue
+
+            values = interaction.data.get("values", [])
+            if not values:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a role."),
+                    ephemeral=True
+                )
+                continue
+
+            role_id = int(values[0])
+            selected_role = channel.guild.get_role(role_id)
+
+            if not isinstance(selected_role, discord.Role):
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "That is not a valid role."),
+                    ephemeral=True
+                )
+                continue
+
+            await interaction.response.edit_message(view=None)
+            return selected_role
+    finally:
+        try:
+            await prompt.edit(view=None)
+        except Exception:
+            pass
+
+
+async def ask_category_select(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+) -> discord.CategoryChannel:
+    prompt = await channel.send(
+        embed=setup_embed(data, title, description),
+        view=discord.ui.View(timeout=300)
+    )
+
+    view = discord.ui.View(timeout=300)
+    select = discord.ui.ChannelSelect(
+        placeholder="Choose a category",
+        min_values=1,
+        max_values=1,
+        channel_types=[discord.ChannelType.category]
+    )
+    view.add_item(select)
+
+    await prompt.edit(embed=setup_embed(data, title, description), view=view)
+
+    try:
+        while True:
+            interaction = await bot.wait_for(
+                "interaction",
+                check=lambda i: (
+                    i.type == discord.InteractionType.component
+                    and i.user.id == user.id
+                    and i.channel_id == channel.id
+                    and i.message is not None
+                    and i.message.id == prompt.id
+                ),
+                timeout=300
+            )
+
+            if not interaction.data:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a category."),
+                    ephemeral=True
+                )
+                continue
+
+            values = interaction.data.get("values", [])
 
             if not values:
                 await interaction.response.send_message(
@@ -742,7 +815,7 @@ async def ask_text(
         reply = await wait_for_user_message(channel, user)
         content = reply.content.strip()
 
-        if content.lower() in CANCEL_WORDS:
+        if content.lower() == "cancel":
             raise SetupCancelled()
 
         if optional and content.lower() in SKIP_WORDS:
@@ -760,54 +833,6 @@ async def ask_text(
             await safe_delete(reply)
 
 
-async def ask_role(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    data: SetupData,
-    guild: discord.Guild,
-    title: str,
-    description: str,
-) -> discord.Role:
-    while True:
-        raw = await ask_text(channel, user, data, title, description)
-        role = resolve_role(guild, raw)
-        if role:
-            return role
-
-        await channel.send(
-            embed=setup_embed(
-                data,
-                "Invalid Role",
-                "Could not find that role. Send a role mention, role ID, or exact role name."
-            ),
-            delete_after=8
-        )
-
-
-async def ask_text_channel(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    data: SetupData,
-    guild: discord.Guild,
-    title: str,
-    description: str,
-) -> discord.TextChannel:
-    while True:
-        raw = await ask_text(channel, user, data, title, description)
-        resolved = resolve_text_channel(guild, raw)
-        if resolved:
-            return resolved
-
-        await channel.send(
-            embed=setup_embed(
-                data,
-                "Invalid Channel",
-                "Could not find that text channel. Send a channel mention, channel ID, or exact channel name."
-            ),
-            delete_after=8
-        )
-
-
 async def ask_image(
     channel: discord.TextChannel,
     user: discord.Member,
@@ -821,7 +846,7 @@ async def ask_image(
         try:
             reply = await wait_for_user_message(channel, user)
 
-            if reply.content.strip().lower() in CANCEL_WORDS:
+            if reply.content.strip().lower() == "cancel":
                 raise SetupCancelled()
 
             if not reply.attachments:
@@ -850,17 +875,7 @@ async def ask_image(
             return attachment.url
         finally:
             await safe_delete(prompt)
-            # Keep image reply message so the attachment URL stays valid.
-
-
-async def ask_optional_name(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    data: SetupData,
-    title: str,
-    description: str,
-) -> Optional[str]:
-    return await ask_text(channel, user, data, title, description, optional=True)
+            # Keep image message so attachment URL still works.
 
 
 async def run_setup_wizard(interaction: discord.Interaction):
@@ -931,17 +946,17 @@ async def run_setup_wizard(interaction: discord.Interaction):
                 )
                 data.color_hex = "#00FF66"
 
-        panel_channel = await ask_text_channel(
-            channel, user, data, guild,
+        panel_channel = await ask_channel_select(
+            channel, user, data,
             "Panel Channel",
-            "Send the channel where the ticket panel should be posted."
+            "Choose the channel where the ticket panel should be posted."
         )
         data.panel_channel_id = panel_channel.id
 
-        support_role = await ask_role(
-            channel, user, data, guild,
+        support_role = await ask_role_select(
+            channel, user, data,
             "Support Team Role",
-            "Send the support team role mention, role ID, or exact role name."
+            "Choose the support team role."
         )
         data.support_role_id = support_role.id
 
@@ -954,42 +969,44 @@ async def run_setup_wizard(interaction: discord.Interaction):
         option_1_category = await ask_category_select(
             channel, user, data,
             "Ticket Option 1 Category",
-            "Choose the category for ticket option 1 from the list below."
+            "Choose the category for ticket option 1."
         )
         data.option_1_category_id = option_1_category.id
 
-        data.option_2_name = await ask_optional_name(
+        data.option_2_name = await ask_text(
             channel, user, data,
             "Ticket Option 2 Name",
-            "Send the name for the second ticket option, or type `skip`."
+            "Send the name for the second ticket option, or type `skip`.",
+            optional=True
         )
 
         if data.option_2_name:
             option_2_category = await ask_category_select(
                 channel, user, data,
                 "Ticket Option 2 Category",
-                "Choose the category for ticket option 2 from the list below."
+                "Choose the category for ticket option 2."
             )
             data.option_2_category_id = option_2_category.id
 
-        data.option_3_name = await ask_optional_name(
+        data.option_3_name = await ask_text(
             channel, user, data,
             "Ticket Option 3 Name",
-            "Send the name for the third ticket option, or type `skip`."
+            "Send the name for the third ticket option, or type `skip`.",
+            optional=True
         )
 
         if data.option_3_name:
             option_3_category = await ask_category_select(
                 channel, user, data,
                 "Ticket Option 3 Category",
-                "Choose the category for ticket option 3 from the list below."
+                "Choose the category for ticket option 3."
             )
             data.option_3_category_id = option_3_category.id
 
-        log_channel = await ask_text_channel(
-            channel, user, data, guild,
+        log_channel = await ask_channel_select(
+            channel, user, data,
             "Log Channel",
-            "Send the log channel mention, channel ID, or exact channel name."
+            "Choose the log channel."
         )
         data.log_channel_id = log_channel.id
 
@@ -1396,13 +1413,6 @@ class CloseTicketButton(discord.ui.Button):
                     opener_member,
                     view_channel=False
                 )
-            else:
-                await interaction.channel.set_permissions(
-                    discord.Object(id=ticket["opener_id"]),
-                    overwrite=None
-                )
-        except ValueError:
-            pass
         except discord.Forbidden:
             await interaction.response.send_message(
                 embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
