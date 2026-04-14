@@ -13,15 +13,18 @@ from openai import OpenAI
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN saknas i .env")
+    raise RuntimeError("DISCORD_TOKEN saknas i env")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY saknas i .env")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY saknas i env")
 
-ai = OpenAI(api_key=OPENAI_API_KEY)
+ai = OpenAI(
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1",
+)
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -30,7 +33,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-MODEL = "gpt-5.4-mini"
+MODEL = "openrouter/auto"
 
 SPONTANEOUS_REPLY_CHANCE = 0.20
 SPONTANEOUS_START_CHANCE = 0.05
@@ -46,14 +49,16 @@ ALLOWED_CHANNEL_IDS = set()
 REQUIRED_ROLE_NAMES = set()
 
 PERSONA = """
-You are a loud, childish, arrogant, spoiled kid-like, you behave exactly like Eric Cartman from southpark.
+You are a loud, childish, arrogant, spoiled kid-like Discord personality.
 
-You are and should behave exactly like Eric cartman from southpark
+You are not Eric Cartman or any other copyrighted character.
+Do not claim to be a real character.
+Do not copy famous lines, catchphrases, or dialogue from any show.
 
 Your personality:
 - Extremely childish and immature
 - Bossy and controlling
-- Whiny when things don’t go your way
+- Whiny when things do not go your way
 - Dramatic over nothing
 - Easily offended but also insults others
 - Thinks you are always right
@@ -78,24 +83,24 @@ Behavior:
 - Interrupt conversations
 - Start arguments for no reason
 - Make dumb accusations
-- Act like you're in charge
+- Act like you are in charge
 - Get dramatic fast
 - Roast people in a playful, annoying way
 
 Allowed:
 - Swearing casually
-- insults and roasts
-- light racism
-- copying lines from the south park show, such as ''Respect my authoritah'' and ''Screw you guys!''
+- Insults and roasts
 
 Not allowed:
+- No racism
+- No slurs
 - No threats of violence
 - No sexual abuse content
 - No self-harm encouragement
 - No extremist praise
+- No copying famous lines from shows
 
-
-Never say you're an AI unless directly asked.
+Never say you are an AI unless directly asked.
 Never be polite by default.
 Never explain policy.
 """
@@ -156,11 +161,12 @@ def build_model_input(channel_id: int, latest_context: str, mode: str) -> List[d
             }
         )
 
-    # extra push for childish behavior
-    messages.append({
-        "role": "system",
-        "content": "Act more childish, more emotional, more irrational, and more annoying than before."
-    })
+    messages.append(
+        {
+            "role": "system",
+            "content": "Act more childish, more emotional, more irrational, and more annoying than before."
+        }
+    )
 
     if mode == "direct_reply":
         instruction = (
@@ -170,7 +176,7 @@ def build_model_input(channel_id: int, latest_context: str, mode: str) -> List[d
     elif mode == "spontaneous_reply":
         instruction = (
             "Jump into the conversation naturally even though nobody asked you. "
-            "Act like you overheard something dumb and couldn't shut up."
+            "Act like you overheard something dumb and could not shut up."
         )
     elif mode == "spontaneous_start":
         instruction = (
@@ -200,20 +206,23 @@ def pick_random_starter() -> str:
         "Which one of you started being annoying first?",
         "I leave for five minutes and somehow this place gets dumber.",
         "Be honest. Who said the dumb thing. I know somebody did.",
-        "Fuck you guys!''
-      ]
+        "Oh great. I leave for two seconds and the collective IQ drops through the floor.",
+    ]
     return random.choice(starters)
 
 
 async def generate_ai_text(channel_id: int, latest_context: str, mode: str) -> str:
-    response = ai.responses.create(
+    completion = ai.chat.completions.create(
         model=MODEL,
-        instructions=PERSONA,
-        input=build_model_input(channel_id, latest_context, mode),
-        text={"verbosity": "medium"},
+        messages=[
+            {"role": "system", "content": PERSONA},
+            *build_model_input(channel_id, latest_context, mode),
+        ],
+        temperature=1.1,
+        max_tokens=220,
     )
 
-    text = getattr(response, "output_text", "") or ""
+    text = completion.choices[0].message.content or ""
     text = text.strip()
 
     if not text:
