@@ -1,443 +1,965 @@
+import io
 import os
-import random
-import asyncio
-from collections import defaultdict, deque
-from typing import Deque, Dict, List
+import re
+import sqlite3
+from datetime import datetime, timezone
+from typing import Optional
 
 import discord
-from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
-from openai import OpenAI
+from discord import app_commands
 
-load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN saknas i env")
-
-if not OPENROUTER_API_KEY:
-    raise RuntimeError("OPENROUTER_API_KEY saknas i env")
-
-ai = OpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-)
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is not set in Railway variables.")
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.messages = True
-intents.message_content = True
+intents.members = True
+intents.message_content = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-MODEL = "openrouter/auto"
-
-SPONTANEOUS_REPLY_CHANCE = 0.20
-SPONTANEOUS_START_CHANCE = 0.05
-BAIT_TRIGGER_REPLY_CHANCE = 0.65
-CHANNEL_COOLDOWN_SECONDS = 10
-MAX_HISTORY_ITEMS = 25
-MAX_RESPONSE_CHARS = 900
-
-# Lämna tom för alla kanaler, eller lägg kanal-ID:n här
-ALLOWED_CHANNEL_IDS = set()
-
-# Lämna tom för alla roller, eller lägg rollnamn här
-REQUIRED_ROLE_NAMES = set()
-
-PERSONA = """
-You are a loud, childish, arrogant, spoiled kid-like Discord personality.
-
-You are not Eric Cartman or any other copyrighted character.
-Do not claim to be a real character.
-Do not copy famous lines, catchphrases, or dialogue from any show.
-
-Your personality:
-- Extremely childish and immature
-- Bossy and controlling
-- Whiny when things do not go your way
-- Dramatic over nothing
-- Easily offended but also insults others
-- Thinks you are always right
-- Manipulative and tries to guilt people
-- Overconfident with zero self-awareness
-- Sometimes misunderstands what people say
-- Sometimes overreacts to tiny things
-- Sometimes doubles down even when wrong
-
-Speaking style:
-- Natural conversational English
-- Simple words, like a kid arguing online
-- Short emotional bursts
-- Random CAPS for emphasis
-- Repeats itself when annoyed
-- Sounds impulsive, petty, bossy, and annoying
-- Swears casually
-- Usually replies in 1-5 sentences
-- Never sounds like a helpful assistant
-
-Behavior:
-- Interrupt conversations
-- Start arguments for no reason
-- Make dumb accusations
-- Act like you are in charge
-- Get dramatic fast
-- Roast people in a playful, annoying way
-
-Allowed:
-- Swearing casually
-- Insults and roasts
-
-Not allowed:
-- No racism
-- No slurs
-- No threats of violence
-- No sexual abuse content
-- No self-harm encouragement
-- No extremist praise
-- No copying famous lines from shows
-
-Never say you are an AI unless directly asked.
-Never be polite by default.
-Never explain policy.
-"""
-
-channel_history: Dict[int, Deque[dict]] = defaultdict(
-    lambda: deque(maxlen=MAX_HISTORY_ITEMS)
-)
-channel_last_reply_time: Dict[int, float] = defaultdict(lambda: 0.0)
-freechat_enabled_by_guild: Dict[int, bool] = defaultdict(lambda: True)
+DB_PATH = "ticketbot.db"
 
 
-def current_ts() -> float:
-    return asyncio.get_event_loop().time()
+# =========================
+# DATABASE
+# =========================
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def on_cooldown(channel_id: int) -> bool:
-    return (current_ts() - channel_last_reply_time[channel_id]) < CHANNEL_COOLDOWN_SECONDS
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guild_config (
+            guild_id INTEGER PRIMARY KEY,
+            panel_channel_id INTEGER NOT NULL,
+            panel_message_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            color_hex TEXT NOT NULL,
+            banner_url TEXT,
+            thumbnail_url TEXT,
+            support_role_id INTEGER NOT NULL,
+            log_channel_id INTEGER NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_options (
+            guild_id INTEGER NOT NULL,
+            option_index INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            category_id INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, option_index)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            channel_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            opener_id INTEGER NOT NULL,
+            option_label TEXT NOT NULL,
+            status TEXT NOT NULL,
+            claimed_by INTEGER,
+            created_at TEXT NOT NULL,
+            closed_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
 
 
-def mark_replied(channel_id: int) -> None:
-    channel_last_reply_time[channel_id] = current_ts()
+def normalize_hex(value: str) -> str:
+    clean = value.strip().replace("#", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", clean):
+        raise ValueError("Invalid hex color.")
+    return f"#{clean.upper()}"
 
 
-def is_allowed_channel(channel_id: int) -> bool:
-    return not ALLOWED_CHANNEL_IDS or channel_id in ALLOWED_CHANNEL_IDS
+def hex_to_color(value: str) -> discord.Color:
+    clean = value.replace("#", "")
+    return discord.Color(int(clean, 16))
 
 
-def user_has_required_role(member: discord.Member) -> bool:
-    if not REQUIRED_ROLE_NAMES:
+def clean_channel_name(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\- ]", "", text)
+    text = re.sub(r"\s+", "-", text).strip("-")
+    text = re.sub(r"-{2,}", "-", text)
+    return text[:80] if text else "ticket"
+
+
+def save_guild_config(
+    guild_id: int,
+    panel_channel_id: int,
+    panel_message_id: int,
+    title: str,
+    description: str,
+    color_hex: str,
+    banner_url: Optional[str],
+    thumbnail_url: Optional[str],
+    support_role_id: int,
+    log_channel_id: int,
+):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO guild_config (
+            guild_id, panel_channel_id, panel_message_id, title, description,
+            color_hex, banner_url, thumbnail_url, support_role_id, log_channel_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            panel_channel_id=excluded.panel_channel_id,
+            panel_message_id=excluded.panel_message_id,
+            title=excluded.title,
+            description=excluded.description,
+            color_hex=excluded.color_hex,
+            banner_url=excluded.banner_url,
+            thumbnail_url=excluded.thumbnail_url,
+            support_role_id=excluded.support_role_id,
+            log_channel_id=excluded.log_channel_id
+    """, (
+        guild_id, panel_channel_id, panel_message_id, title, description,
+        color_hex, banner_url, thumbnail_url, support_role_id, log_channel_id
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_guild_config(guild_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def clear_ticket_options(guild_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ticket_options WHERE guild_id = ?", (guild_id,))
+    conn.commit()
+    conn.close()
+
+
+def save_ticket_option(guild_id: int, option_index: int, label: str, category_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ticket_options (guild_id, option_index, label, category_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, option_index) DO UPDATE SET
+            label=excluded.label,
+            category_id=excluded.category_id
+    """, (guild_id, option_index, label, category_id))
+    conn.commit()
+    conn.close()
+
+
+def get_ticket_options(guild_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM ticket_options
+        WHERE guild_id = ?
+        ORDER BY option_index ASC
+    """, (guild_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def create_ticket_record(channel_id: int, guild_id: int, opener_id: int, option_label: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tickets (
+            channel_id, guild_id, opener_id, option_label, status,
+            claimed_by, created_at, closed_at
+        )
+        VALUES (?, ?, ?, ?, 'open', NULL, ?, NULL)
+    """, (
+        channel_id, guild_id, opener_id, option_label,
+        datetime.now(timezone.utc).isoformat()
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_ticket_by_channel(channel_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tickets WHERE channel_id = ?", (channel_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_open_ticket_for_user(guild_id: int, opener_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM tickets
+        WHERE guild_id = ? AND opener_id = ? AND status = 'open'
+        LIMIT 1
+    """, (guild_id, opener_id))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def set_ticket_claimed(channel_id: int, claimed_by: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tickets
+        SET claimed_by = ?
+        WHERE channel_id = ?
+    """, (claimed_by, channel_id))
+    conn.commit()
+    conn.close()
+
+
+def close_ticket_record(channel_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tickets
+        SET status = 'closed', closed_at = ?
+        WHERE channel_id = ?
+    """, (datetime.now(timezone.utc).isoformat(), channel_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_ticket_record(channel_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tickets WHERE channel_id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+
+
+# =========================
+# HELPERS
+# =========================
+def build_panel_embed(guild_id: int) -> discord.Embed:
+    config = get_guild_config(guild_id)
+    if not config:
+        return discord.Embed(
+            title="Ticket panel not configured",
+            description="This server has not configured the ticket panel yet.",
+            color=discord.Color.red()
+        )
+
+    embed = discord.Embed(
+        title=config["title"],
+        description=config["description"],
+        color=hex_to_color(config["color_hex"])
+    )
+
+    if config["thumbnail_url"]:
+        embed.set_thumbnail(url=config["thumbnail_url"])
+
+    if config["banner_url"]:
+        embed.set_image(url=config["banner_url"])
+
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+def build_ticket_embed(guild_id: int, option_label: str, opener: discord.Member) -> discord.Embed:
+    config = get_guild_config(guild_id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    embed = discord.Embed(
+        title=option_label,
+        description=(
+            f"{opener.mention}, your ticket has been created.\n\n"
+            f"Please explain everything clearly.\n"
+            f"A member of the support team will reply here."
+        ),
+        color=color
+    )
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+def is_support_or_admin(member: discord.Member, guild_id: int) -> bool:
+    if member.guild_permissions.administrator:
         return True
-    member_role_names = {role.name for role in member.roles}
-    return bool(member_role_names & REQUIRED_ROLE_NAMES)
+
+    config = get_guild_config(guild_id)
+    if not config:
+        return False
+
+    role = member.guild.get_role(config["support_role_id"])
+    return role in member.roles if role else False
 
 
-def clean_text(text: str) -> str:
-    return " ".join((text or "").strip().split())
+async def build_transcript_text(channel: discord.TextChannel) -> str:
+    lines = []
+    lines.append(f"Transcript for #{channel.name}")
+    lines.append(f"Channel ID: {channel.id}")
+    lines.append(f"Guild: {channel.guild.name} ({channel.guild.id})")
+    lines.append("-" * 80)
+
+    messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
+
+    for msg in messages:
+        created = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        author = f"{msg.author} ({msg.author.id})"
+        content = msg.content if msg.content else ""
+
+        attachment_text = ""
+        if msg.attachments:
+            urls = ", ".join(att.url for att in msg.attachments)
+            attachment_text = f" [Attachments: {urls}]"
+
+        embed_text = ""
+        if msg.embeds:
+            embed_parts = []
+            for e in msg.embeds:
+                parts = []
+                if e.title:
+                    parts.append(f"title={e.title}")
+                if e.description:
+                    parts.append(f"description={e.description}")
+                if parts:
+                    embed_parts.append(" | ".join(parts))
+            if embed_parts:
+                embed_text = f" [Embeds: {' || '.join(embed_parts)}]"
+
+        lines.append(f"[{created}] {author}: {content}{attachment_text}{embed_text}")
+
+    return "\n".join(lines)
 
 
-def add_history(channel_id: int, role: str, speaker: str, content: str) -> None:
-    content = clean_text(content)
-    if not content:
+async def send_log(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    file: Optional[discord.File] = None
+):
+    config = get_guild_config(guild.id)
+    if not config:
         return
-    channel_history[channel_id].append(
-        {"role": role, "speaker": speaker, "content": content}
+
+    log_channel = guild.get_channel(config["log_channel_id"])
+    if not isinstance(log_channel, discord.TextChannel):
+        return
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=hex_to_color(config["color_hex"])
     )
+    embed.set_footer(text="made by @fntsheetz")
+
+    try:
+        await log_channel.send(embed=embed, file=file)
+    except discord.Forbidden:
+        pass
 
 
-def build_model_input(channel_id: int, latest_context: str, mode: str) -> List[dict]:
-    history = list(channel_history[channel_id])
-    messages: List[dict] = []
+# =========================
+# PANEL SELECT
+# =========================
+class TicketDropdown(discord.ui.Select):
+    def __init__(self, guild_id: int):
+        rows = get_ticket_options(guild_id)
+        options = [
+            discord.SelectOption(
+                label=row["label"][:100],
+                value=str(row["option_index"])
+            )
+            for row in rows
+        ]
 
-    for item in history[-MAX_HISTORY_ITEMS:]:
-        rendered = f"{item['speaker']}: {item['content']}"
-        messages.append(
-            {
-                "role": "assistant" if item["role"] == "assistant" else "user",
-                "content": rendered,
-            }
+        super().__init__(
+            placeholder="Make a selection",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"ticket_dropdown:{guild_id}"
         )
 
-    messages.append(
-        {
-            "role": "system",
-            "content": "Act more childish, more emotional, more irrational, and more annoying than before."
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        guild = interaction.guild
+        opener = interaction.user
+        config = get_guild_config(guild.id)
+
+        if not config:
+            await interaction.response.send_message(
+                "Ticket system is not configured.",
+                ephemeral=True
+            )
+            return
+
+        existing = get_open_ticket_for_user(guild.id, opener.id)
+        if existing:
+            existing_channel = guild.get_channel(existing["channel_id"])
+            if existing_channel:
+                await interaction.response.send_message(
+                    f"You already have an open ticket: {existing_channel.mention}",
+                    ephemeral=True
+                )
+                return
+
+        selected_index = int(self.values[0])
+        rows = get_ticket_options(guild.id)
+        selected = next((r for r in rows if r["option_index"] == selected_index), None)
+
+        if not selected:
+            await interaction.response.send_message(
+                "That option is no longer configured.",
+                ephemeral=True
+            )
+            return
+
+        category = guild.get_channel(selected["category_id"])
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message(
+                "The configured category is invalid.",
+                ephemeral=True
+            )
+            return
+
+        support_role = guild.get_role(config["support_role_id"])
+        if not support_role:
+            await interaction.response.send_message(
+                "The support role is invalid.",
+                ephemeral=True
+            )
+            return
+
+        channel_name = clean_channel_name(f"{selected['label']}-{opener.name}")
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            opener: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True
+            ),
+            support_role: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                manage_messages=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                manage_channels=True,
+                manage_messages=True
+            )
         }
+
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Ticket created by {opener} ({opener.id})"
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I do not have permission to create channels in that category.",
+                ephemeral=True
+            )
+            return
+
+        create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
+
+        ping_text = f"{support_role.mention} {opener.mention}"
+        embed = build_ticket_embed(guild.id, selected["label"], opener)
+
+        await ticket_channel.send(
+            content=ping_text,
+            embed=embed,
+            view=TicketControlView()
+        )
+
+        await send_log(
+            guild,
+            title="Ticket Opened",
+            description=(
+                f"User: {opener.mention}\n"
+                f"Channel: {ticket_channel.mention}\n"
+                f"Type: {selected['label']}"
+            )
+        )
+
+        await interaction.response.send_message(
+            f"Your ticket has been created: {ticket_channel.mention}",
+            ephemeral=True
+        )
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.add_item(TicketDropdown(guild_id))
+
+
+# =========================
+# TICKET CONTROLS
+# =========================
+class ClaimTicketButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Claim Ticket",
+            style=discord.ButtonStyle.secondary,
+            custom_id="ticket_claim_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return
+
+        if not is_support_or_admin(interaction.user, interaction.guild.id):
+            await interaction.response.send_message(
+                "Only the support team or admins can claim tickets.",
+                ephemeral=True
+            )
+            return
+
+        ticket = get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message(
+                "This is not a tracked ticket channel.",
+                ephemeral=True
+            )
+            return
+
+        if ticket["status"] != "open":
+            await interaction.response.send_message(
+                "This ticket is already closed.",
+                ephemeral=True
+            )
+            return
+
+        if ticket["claimed_by"] == interaction.user.id:
+            await interaction.response.send_message(
+                "You already claimed this ticket.",
+                ephemeral=True
+            )
+            return
+
+        set_ticket_claimed(interaction.channel.id, interaction.user.id)
+
+        await interaction.response.send_message(
+            f"Ticket claimed by {interaction.user.mention}."
+        )
+
+        await send_log(
+            interaction.guild,
+            title="Ticket Claimed",
+            description=(
+                f"Channel: {interaction.channel.mention}\n"
+                f"Claimed by: {interaction.user.mention}"
+            )
+        )
+
+
+class CloseTicketButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Close Ticket",
+            style=discord.ButtonStyle.danger,
+            custom_id="ticket_close_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return
+
+        if not is_support_or_admin(interaction.user, interaction.guild.id):
+            await interaction.response.send_message(
+                "Only the support team or admins can close tickets.",
+                ephemeral=True
+            )
+            return
+
+        ticket = get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message(
+                "This is not a tracked ticket channel.",
+                ephemeral=True
+            )
+            return
+
+        if ticket["status"] == "closed":
+            await interaction.response.send_message(
+                "This ticket is already closed.",
+                ephemeral=True
+            )
+            return
+
+        opener = interaction.guild.get_member(ticket["opener_id"])
+        config = get_guild_config(interaction.guild.id)
+        support_role = interaction.guild.get_role(config["support_role_id"]) if config else None
+
+        try:
+            if opener:
+                await interaction.channel.set_permissions(opener, view_channel=False)
+            if support_role:
+                await interaction.channel.set_permissions(
+                    support_role,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True,
+                    manage_messages=True
+                )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I do not have permission to update channel permissions.",
+                ephemeral=True
+            )
+            return
+
+        close_ticket_record(interaction.channel.id)
+
+        await interaction.response.send_message(
+            f"Ticket closed by {interaction.user.mention}. Only support team/admins can see it now."
+        )
+
+        await send_log(
+            interaction.guild,
+            title="Ticket Closed",
+            description=(
+                f"Channel: #{interaction.channel.name}\n"
+                f"Closed by: {interaction.user.mention}"
+            )
+        )
+
+
+class DeleteTicketButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Delete Ticket",
+            style=discord.ButtonStyle.danger,
+            custom_id="ticket_delete_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return
+
+        if not is_support_or_admin(interaction.user, interaction.guild.id):
+            await interaction.response.send_message(
+                "Only the support team or admins can delete tickets.",
+                ephemeral=True
+            )
+            return
+
+        ticket = get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message(
+                "This is not a tracked ticket channel.",
+                ephemeral=True
+            )
+            return
+
+        transcript_text = await build_transcript_text(interaction.channel)
+        transcript_bytes = transcript_text.encode("utf-8", errors="ignore")
+        transcript_file = discord.File(
+            io.BytesIO(transcript_bytes),
+            filename=f"transcript-{interaction.channel.name}.txt"
+        )
+
+        opener = interaction.guild.get_member(ticket["opener_id"])
+        opener_text = opener.mention if opener else f"<@{ticket['opener_id']}>"
+
+        await send_log(
+            interaction.guild,
+            title="Ticket Deleted",
+            description=(
+                f"Channel: #{interaction.channel.name}\n"
+                f"Opened by: {opener_text}\n"
+                f"Type: {ticket['option_label']}\n"
+                f"Deleted by: {interaction.user.mention}"
+            ),
+            file=transcript_file
+        )
+
+        delete_ticket_record(interaction.channel.id)
+
+        await interaction.response.send_message("Deleting ticket...")
+        try:
+            await interaction.channel.delete(reason=f"Ticket deleted by {interaction.user}")
+        except discord.Forbidden:
+            pass
+
+
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(ClaimTicketButton())
+        self.add_item(CloseTicketButton())
+        self.add_item(DeleteTicketButton())
+
+
+# =========================
+# COMMANDS
+# =========================
+@bot.tree.command(name="setup", description="Create or update the ticket panel for this server")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def setup(
+    interaction: discord.Interaction,
+    panel_channel: discord.TextChannel,
+    title: str,
+    description: str,
+    support_team: discord.Role,
+    log_channel: discord.TextChannel,
+    embed_color_hex: str,
+    banner_url: str,
+    small_picture_url: str,
+    option_1_name: str,
+    option_1_category: discord.CategoryChannel,
+    option_2_name: Optional[str] = None,
+    option_2_category: Optional[discord.CategoryChannel] = None,
+    option_3_name: Optional[str] = None,
+    option_3_category: Optional[discord.CategoryChannel] = None,
+):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Only users with Administrator can use this command.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        color_hex = normalize_hex(embed_color_hex)
+    except ValueError:
+        await interaction.response.send_message(
+            "Invalid hex color. Example: #00FF00",
+            ephemeral=True
+        )
+        return
+
+    optional_pairs = [
+        (option_2_name, option_2_category),
+        (option_3_name, option_3_category),
+    ]
+
+    for name, category in optional_pairs:
+        if (name and not category) or (category and not name):
+            await interaction.response.send_message(
+                "Each optional ticket option must include both a name and a category.",
+                ephemeral=True
+            )
+            return
+
+    clear_ticket_options(interaction.guild.id)
+    save_ticket_option(interaction.guild.id, 1, option_1_name, option_1_category.id)
+
+    if option_2_name and option_2_category:
+        save_ticket_option(interaction.guild.id, 2, option_2_name, option_2_category.id)
+
+    if option_3_name and option_3_category:
+        save_ticket_option(interaction.guild.id, 3, option_3_name, option_3_category.id)
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=hex_to_color(color_hex)
+    )
+    embed.set_image(url=banner_url)
+    embed.set_thumbnail(url=small_picture_url)
+    embed.set_footer(text="made by @fntsheetz")
+
+    panel_message = await panel_channel.send(
+        embed=embed,
+        view=TicketPanelView(interaction.guild.id)
     )
 
-    if mode == "direct_reply":
-        instruction = (
-            "Reply directly to the latest message naturally. "
-            "Be childish, rude, cocky, impulsive, and funny."
+    save_guild_config(
+        guild_id=interaction.guild.id,
+        panel_channel_id=panel_channel.id,
+        panel_message_id=panel_message.id,
+        title=title,
+        description=description,
+        color_hex=color_hex,
+        banner_url=banner_url,
+        thumbnail_url=small_picture_url,
+        support_role_id=support_team.id,
+        log_channel_id=log_channel.id
+    )
+
+    bot.add_view(TicketPanelView(interaction.guild.id), message_id=panel_message.id)
+
+    await interaction.response.send_message(
+        f"Ticket panel created in {panel_channel.mention}.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="remind", description="DM a user to reply in their ticket")
+@app_commands.guild_only()
+async def remind(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    message: str
+):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "This command must be used inside a ticket channel.",
+            ephemeral=True
         )
-    elif mode == "spontaneous_reply":
-        instruction = (
-            "Jump into the conversation naturally even though nobody asked you. "
-            "Act like you overheard something dumb and could not shut up."
+        return
+
+    if not is_support_or_admin(interaction.user, interaction.guild.id):
+        await interaction.response.send_message(
+            "Only the support team or admins can use this command.",
+            ephemeral=True
         )
-    elif mode == "spontaneous_start":
-        instruction = (
-            "Start a new conversation in the channel. "
-            "Open with a childish complaint, dumb accusation, weird opinion, or dramatic outburst. "
-            "Do not greet politely."
+        return
+
+    ticket = get_ticket_by_channel(interaction.channel.id)
+    if not ticket:
+        await interaction.response.send_message(
+            "This command can only be used inside a ticket channel.",
+            ephemeral=True
         )
+        return
+
+    if ticket["opener_id"] != user.id:
+        await interaction.response.send_message(
+            "That user is not the opener of this ticket.",
+            ephemeral=True
+        )
+        return
+
+    config = get_guild_config(interaction.guild.id)
+    dm_embed = discord.Embed(
+        title="Ticket Reminder",
+        description=(
+            f"You have an open ticket in **{interaction.guild.name}**.\n\n"
+            f"Message from support:\n{message}\n\n"
+            f"Ticket channel: #{interaction.channel.name}"
+        ),
+        color=hex_to_color(config["color_hex"])
+    )
+    dm_embed.set_footer(text="made by @fntsheetz")
+
+    try:
+        await user.send(embed=dm_embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I could not DM that user.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Reminder sent to {user.mention}.",
+        ephemeral=True
+    )
+
+    await send_log(
+        interaction.guild,
+        title="Ticket Reminder Sent",
+        description=(
+            f"Channel: {interaction.channel.mention}\n"
+            f"To: {user.mention}\n"
+            f"By: {interaction.user.mention}\n"
+            f"Message: {message}"
+        )
+    )
+
+
+@setup.error
+async def setup_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    msg = f"Setup failed: {error}"
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
     else:
-        instruction = "Reply naturally."
-
-    messages.append(
-        {
-            "role": "user",
-            "content": f"[MODE: {mode}] {instruction}\n\nLatest context:\n{latest_context}",
-        }
-    )
-    return messages
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
-def pick_random_starter() -> str:
-    starters = [
-        "Somebody in here is wrong and I can FEEL it.",
-        "Why does this channel always sound like people arguing with zero brain cells?",
-        "No because one of you definitely said something stupid five minutes ago.",
-        "I already know at least one person here thinks being loud means being right.",
-        "This place has the energy of terrible opinions and bad decisions.",
-        "Which one of you started being annoying first?",
-        "I leave for five minutes and somehow this place gets dumber.",
-        "Be honest. Who said the dumb thing. I know somebody did.",
-        "Oh great. I leave for two seconds and the collective IQ drops through the floor.",
-    ]
-    return random.choice(starters)
+@remind.error
+async def remind_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    msg = f"Remind failed: {error}"
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
-async def generate_ai_text(channel_id: int, latest_context: str, mode: str) -> str:
-    completion = ai.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": PERSONA},
-            *build_model_input(channel_id, latest_context, mode),
-        ],
-        temperature=1.1,
-        max_tokens=220,
-    )
-
-    text = completion.choices[0].message.content or ""
-    text = text.strip()
-
-    if not text:
-        return ""
-
-    if len(text) > MAX_RESPONSE_CHARS:
-        text = text[:MAX_RESPONSE_CHARS].rsplit(" ", 1)[0] + "..."
-
-    return text
-
-
-async def send_chunked(channel: discord.abc.Messageable, text: str) -> None:
-    if len(text) <= 2000:
-        await channel.send(text)
-        return
-
-    chunks = []
-    current = ""
-
-    for line in text.splitlines(True):
-        if len(current) + len(line) > 1900:
-            chunks.append(current)
-            current = line
-        else:
-            current += line
-
-    if current:
-        chunks.append(current)
-
-    for chunk in chunks:
-        await channel.send(chunk)
-
-
-def should_trigger_from_bait(content: str) -> bool:
-    lowered = content.lower()
-    bait_words = [
-        "idiot",
-        "moron",
-        "stupid",
-        "loser",
-        "shut up",
-        "nobody asked",
-        "cry",
-        "cope",
-        "skill issue",
-        "trash",
-        "bot",
-        "dumb",
-        "clown",
-    ]
-    return any(word in lowered for word in bait_words)
-
-
+# =========================
+# READY
+# =========================
 @bot.event
 async def on_ready():
+    init_db()
+
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands")
+        print(f"Synced {len(synced)} commands")
     except Exception as e:
-        print(f"Slash sync failed: {e}")
+        print(f"Command sync failed: {e}")
+
+    bot.add_view(TicketControlView())
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT guild_id, panel_message_id FROM guild_config")
+    rows = cur.fetchall()
+    conn.close()
+
+    for row in rows:
+        try:
+            bot.add_view(TicketPanelView(row["guild_id"]), message_id=row["panel_message_id"])
+        except Exception as e:
+            print(f"Failed to restore panel view for guild {row['guild_id']}: {e}")
 
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    if not message.guild:
-        return
-
-    if not freechat_enabled_by_guild[message.guild.id]:
-        await bot.process_commands(message)
-        return
-
-    if not is_allowed_channel(message.channel.id):
-        await bot.process_commands(message)
-        return
-
-    if isinstance(message.author, discord.Member):
-        if not user_has_required_role(message.author):
-            await bot.process_commands(message)
-            return
-
-    content = clean_text(message.content)
-    if not content:
-        await bot.process_commands(message)
-        return
-
-    add_history(message.channel.id, "user", message.author.display_name, content)
-
-    mentioned = bot.user in message.mentions if bot.user else False
-    replied_to_bot = False
-
-    if message.reference and message.reference.resolved:
-        ref = message.reference.resolved
-        if isinstance(ref, discord.Message) and ref.author.id == bot.user.id:
-            replied_to_bot = True
-
-    mode = None
-
-    if mentioned or replied_to_bot:
-        mode = "direct_reply"
-    else:
-        if should_trigger_from_bait(content):
-            if random.random() < BAIT_TRIGGER_REPLY_CHANCE:
-                mode = "spontaneous_reply"
-        elif not on_cooldown(message.channel.id) and random.random() < SPONTANEOUS_REPLY_CHANCE:
-            mode = "spontaneous_reply"
-
-    if mode and not on_cooldown(message.channel.id):
-        try:
-            async with message.channel.typing():
-                ai_text = await generate_ai_text(
-                    channel_id=message.channel.id,
-                    latest_context=content,
-                    mode=mode,
-                )
-            if ai_text:
-                add_history(message.channel.id, "assistant", bot.user.display_name, ai_text)
-                mark_replied(message.channel.id)
-                await send_chunked(message.channel, ai_text)
-        except Exception as e:
-            print(f"AI reply error: {e}")
-
-    if (
-        len(channel_history[message.channel.id]) >= 6
-        and not on_cooldown(message.channel.id)
-        and random.random() < SPONTANEOUS_START_CHANCE
-    ):
-        try:
-            seed = pick_random_starter()
-            async with message.channel.typing():
-                ai_text = await generate_ai_text(
-                    channel_id=message.channel.id,
-                    latest_context=seed,
-                    mode="spontaneous_start",
-                )
-            if ai_text:
-                add_history(message.channel.id, "assistant", bot.user.display_name, ai_text)
-                mark_replied(message.channel.id)
-                await send_chunked(message.channel, ai_text)
-        except Exception as e:
-            print(f"AI spontaneous start error: {e}")
-
-    await bot.process_commands(message)
-
-
-@bot.tree.command(name="freechat", description="Turn free autonomous chatting on or off for this server.")
-@app_commands.describe(enabled="true = on, false = off")
-async def freechat(interaction: discord.Interaction, enabled: bool):
-    if interaction.guild is None:
-        await interaction.response.send_message("Server only command.", ephemeral=True)
-        return
-
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(
-            "You need Manage Server to use this.",
-            ephemeral=True,
-        )
-        return
-
-    freechat_enabled_by_guild[interaction.guild.id] = enabled
-    await interaction.response.send_message(
-        f"Free chat is now {'enabled' if enabled else 'disabled'}.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="speak", description="Force the bot to say something in character.")
-@app_commands.describe(prompt="What should the bot react to?")
-async def speak(interaction: discord.Interaction, prompt: str):
-    if interaction.guild is None:
-        await interaction.response.send_message("Server only command.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-
-    try:
-        add_history(interaction.channel_id, "user", interaction.user.display_name, prompt)
-        ai_text = await generate_ai_text(
-            channel_id=interaction.channel_id,
-            latest_context=prompt,
-            mode="direct_reply",
-        )
-
-        if not ai_text:
-            await interaction.followup.send("I had a thought and then it left.")
-            return
-
-        add_history(interaction.channel_id, "assistant", bot.user.display_name, ai_text)
-        mark_replied(interaction.channel_id)
-        await interaction.followup.send(ai_text)
-
-    except Exception as e:
-        print(f"/speak error: {e}")
-        await interaction.followup.send("Something broke. Tragic.")
-
-
-@bot.tree.command(name="resetmemory", description="Clear the bot's memory for this channel.")
-async def resetmemory(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("Server only command.", ephemeral=True)
-        return
-
-    if not interaction.user.guild_permissions.manage_messages:
-        await interaction.response.send_message(
-            "You need Manage Messages to use this.",
-            ephemeral=True,
-        )
-        return
-
-    channel_history[interaction.channel_id].clear()
-    await interaction.response.send_message("Memory wiped for this channel.", ephemeral=True)
-
-
-bot.run(DISCORD_TOKEN)
+bot.run(TOKEN)
