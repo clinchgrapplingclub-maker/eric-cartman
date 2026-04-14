@@ -272,8 +272,12 @@ class SetupData:
 
 
 active_setup_guilds: set[int] = set()
-active_setup_users: set[tuple[int, int]] = set()
 setup_sessions: dict[tuple[int, int], SetupData] = {}
+
+
+def cleanup_setup(guild_id: int, user_id: int):
+    active_setup_guilds.discard(guild_id)
+    setup_sessions.pop((guild_id, user_id), None)
 
 
 # =========================
@@ -454,6 +458,16 @@ def resolve_role(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
     return None
 
 
+async def try_fetch_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+    member = guild.get_member(user_id)
+    if member:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except Exception:
+        return None
+
+
 async def safe_delete(message: Optional[discord.Message]):
     if not message:
         return
@@ -630,7 +644,7 @@ async def ask_text(
     description: str,
     *,
     optional: bool = False,
-    multiline: bool = False,
+    delete_reply: bool = True,
 ) -> Optional[str]:
     prompt = await channel.send(embed=setup_embed(data, title, description))
     reply = None
@@ -652,7 +666,8 @@ async def ask_text(
         return content
     finally:
         await safe_delete(prompt)
-        await safe_delete(reply)
+        if delete_reply:
+            await safe_delete(reply)
 
 
 async def ask_role(
@@ -739,115 +754,52 @@ async def ask_image(
     title: str,
     description: str,
 ) -> str:
-    prompt = await channel.send(embed=setup_embed(data, title, description))
-    reply = None
+    while True:
+        prompt = await channel.send(embed=setup_embed(data, title, description))
+        reply = None
+        try:
+            reply = await wait_for_user_message(channel, user)
 
-    try:
-        reply = await wait_for_user_message(channel, user)
+            if reply.content.strip().lower() in CANCEL_WORDS:
+                raise SetupCancelled()
 
-        if reply.content.strip().lower() in CANCEL_WORDS:
-            raise SetupCancelled()
+            if not reply.attachments:
+                await channel.send(
+                    embed=setup_embed(
+                        data,
+                        "No Image Found",
+                        "You need to upload an image in your reply."
+                    ),
+                    delete_after=8
+                )
+                continue
 
-        if not reply.attachments:
-            await channel.send(
-                embed=setup_embed(
-                    data,
-                    "No Image Found",
-                    "You need to upload an image in your reply."
-                ),
-                delete_after=8
-            )
-            return await ask_image(channel, user, data, title, description)
+            attachment = reply.attachments[0]
+            if not is_image_attachment(attachment):
+                await channel.send(
+                    embed=setup_embed(
+                        data,
+                        "Invalid Image",
+                        "Attachment must be an image."
+                    ),
+                    delete_after=8
+                )
+                continue
 
-        attachment = reply.attachments[0]
-        if not is_image_attachment(attachment):
-            await channel.send(
-                embed=setup_embed(
-                    data,
-                    "Invalid Image",
-                    "Attachment must be an image."
-                ),
-                delete_after=8
-            )
-            return await ask_image(channel, user, data, title, description)
-
-        return attachment.url
-    finally:
-        await safe_delete(prompt)
-        await safe_delete(reply)
+            return attachment.url
+        finally:
+            await safe_delete(prompt)
+            # Important: DO NOT delete image replies, or the attachment URL can break.
 
 
-async def ask_option_name_and_category(
+async def ask_optional_name(
     channel: discord.TextChannel,
     user: discord.Member,
     data: SetupData,
-    guild: discord.Guild,
-    number: int,
-    *,
-    optional: bool = False,
-) -> tuple[Optional[str], Optional[int]]:
-    prompt_title = f"Ticket Category {number}"
-    prompt_description = (
-        "Reply in this format:\n"
-        "`Ticket Name | Category Name or Category ID`\n\n"
-        "Example:\n"
-        "`Support Ticket | tickets`\n"
-        "`Purchase Ticket | 123456789012345678`\n\n"
-    )
-    if optional:
-        prompt_description += "Type `skip` if you do not want this option."
-
-    while True:
-        raw = await ask_text(
-            channel,
-            user,
-            data,
-            prompt_title,
-            prompt_description,
-            optional=optional
-        )
-        if raw is None:
-            return None, None
-
-        if "|" not in raw:
-            await channel.send(
-                embed=setup_embed(
-                    data,
-                    "Invalid Format",
-                    "Use this exact format:\n`Ticket Name | Category Name or Category ID`"
-                ),
-                delete_after=8
-            )
-            continue
-
-        name_part, category_part = raw.split("|", 1)
-        name = name_part.strip()
-        category_raw = category_part.strip()
-
-        if not name or not category_raw:
-            await channel.send(
-                embed=setup_embed(
-                    data,
-                    "Invalid Format",
-                    "Both ticket name and category are required."
-                ),
-                delete_after=8
-            )
-            continue
-
-        category = resolve_category(guild, category_raw)
-        if not category:
-            await channel.send(
-                embed=setup_embed(
-                    data,
-                    "Invalid Category",
-                    "Could not find that category. Use exact category name or category ID."
-                ),
-                delete_after=8
-            )
-            continue
-
-        return name, category.id
+    title: str,
+    description: str,
+) -> Optional[str]:
+    return await ask_text(channel, user, data, title, description, optional=True)
 
 
 async def run_setup_wizard(interaction: discord.Interaction):
@@ -880,7 +832,8 @@ async def run_setup_wizard(interaction: discord.Interaction):
                 "Ticket Setup Started",
                 "I will ask you one question at a time.\n\n"
                 "Reply in this channel.\n"
-                "Type `cancel` anytime to stop the setup."
+                "Type `cancel` anytime to stop the setup.\n"
+                "Type `skip` on optional questions."
             )
         )
 
@@ -893,8 +846,7 @@ async def run_setup_wizard(interaction: discord.Interaction):
         data.description = await ask_text(
             channel, user, data,
             "Description",
-            "Send the ticket panel description.",
-            multiline=True
+            "Send the ticket panel description."
         )
 
         color_raw = await ask_text(
@@ -921,28 +873,57 @@ async def run_setup_wizard(interaction: discord.Interaction):
         panel_channel = await ask_text_channel(
             channel, user, data, guild,
             "Panel Channel",
-            "Send the panel channel mention, channel ID, or exact channel name."
+            "Send the channel where the ticket panel should be posted."
         )
         data.panel_channel_id = panel_channel.id
 
         support_role = await ask_role(
             channel, user, data, guild,
             "Support Team Role",
-            "Send the support role mention, role ID, or exact role name."
+            "Send the support team role mention, role ID, or exact role name."
         )
         data.support_role_id = support_role.id
 
-        data.option_1_name, data.option_1_category_id = await ask_option_name_and_category(
-            channel, user, data, guild, 1, optional=False
+        data.option_1_name = await ask_text(
+            channel, user, data,
+            "Ticket Option 1 Name",
+            "Send the name for the first ticket option.\nExample: `Support Ticket`"
         )
 
-        data.option_2_name, data.option_2_category_id = await ask_option_name_and_category(
-            channel, user, data, guild, 2, optional=True
+        option_1_category = await ask_category(
+            channel, user, data, guild,
+            "Ticket Option 1 Category",
+            "Send the category for ticket option 1.\nUse exact category name or category ID."
+        )
+        data.option_1_category_id = option_1_category.id
+
+        data.option_2_name = await ask_optional_name(
+            channel, user, data,
+            "Ticket Option 2 Name",
+            "Send the name for the second ticket option, or type `skip`."
         )
 
-        data.option_3_name, data.option_3_category_id = await ask_option_name_and_category(
-            channel, user, data, guild, 3, optional=True
+        if data.option_2_name:
+            option_2_category = await ask_category(
+                channel, user, data, guild,
+                "Ticket Option 2 Category",
+                "Send the category for ticket option 2.\nUse exact category name or category ID."
+            )
+            data.option_2_category_id = option_2_category.id
+
+        data.option_3_name = await ask_optional_name(
+            channel, user, data,
+            "Ticket Option 3 Name",
+            "Send the name for the third ticket option, or type `skip`."
         )
+
+        if data.option_3_name:
+            option_3_category = await ask_category(
+                channel, user, data, guild,
+                "Ticket Option 3 Category",
+                "Send the category for ticket option 3.\nUse exact category name or category ID."
+            )
+            data.option_3_category_id = option_3_category.id
 
         log_channel = await ask_text_channel(
             channel, user, data, guild,
@@ -959,16 +940,14 @@ async def run_setup_wizard(interaction: discord.Interaction):
 
         data.thumbnail_url = await ask_image(
             channel, user, data,
-            "Small Picture",
+            "Server PFP / Small Picture",
             "Reply with the small picture image uploaded as an attachment."
         )
 
-        preview_message = await channel.send(
+        await channel.send(
             embed=build_setup_preview_embed(guild, data),
             view=SetupConfirmView(data)
         )
-
-        setup_sessions[(guild.id, user.id)] = data
 
         await channel.send(
             embed=setup_embed(
@@ -999,12 +978,6 @@ async def run_setup_wizard(interaction: discord.Interaction):
             )
         )
         cleanup_setup(guild.id, user.id)
-
-
-def cleanup_setup(guild_id: int, user_id: int):
-    active_setup_guilds.discard(guild_id)
-    active_setup_users.discard((guild_id, user_id))
-    setup_sessions.pop((guild_id, user_id), None)
 
 
 # =========================
@@ -1354,14 +1327,32 @@ class CloseTicketButton(discord.ui.Button):
 
         config = get_guild_config(interaction.guild.id)
         support_role = interaction.guild.get_role(config["support_role_id"]) if config else None
+        opener_member = await try_fetch_member(interaction.guild, ticket["opener_id"])
 
         try:
-            await interaction.channel.set_permissions(
-                discord.Object(id=ticket["opener_id"]),
-                view_channel=False
+            if opener_member:
+                await interaction.channel.set_permissions(
+                    opener_member,
+                    view_channel=False
+                )
+            else:
+                await interaction.channel.set_permissions(
+                    discord.Object(id=ticket["opener_id"]),
+                    overwrite=None
+                )
+        except ValueError:
+            # If the member isn't available and discord.py rejects target type,
+            # just continue without changing that overwrite.
+            pass
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
+                ephemeral=True
             )
+            return
 
-            if support_role:
+        if support_role:
+            try:
                 await interaction.channel.set_permissions(
                     support_role,
                     view_channel=True,
@@ -1371,12 +1362,12 @@ class CloseTicketButton(discord.ui.Button):
                     embed_links=True,
                     manage_messages=True
                 )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
-                ephemeral=True
-            )
-            return
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update support role permissions.", error=True),
+                    ephemeral=True
+                )
+                return
 
         close_ticket_record(interaction.channel.id)
 
@@ -1423,6 +1414,8 @@ class DeleteTicketButton(discord.ui.Button):
             )
             return
 
+        await interaction.response.defer(ephemeral=False)
+
         transcript_text = await build_transcript_text(interaction.channel)
         transcript_bytes = transcript_text.encode("utf-8", errors="ignore")
         transcript_file = discord.File(
@@ -1446,9 +1439,12 @@ class DeleteTicketButton(discord.ui.Button):
 
         delete_ticket_record(interaction.channel.id)
 
-        await interaction.response.send_message(
-            embed=base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted.")
-        )
+        try:
+            await interaction.followup.send(
+                embed=base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted.")
+            )
+        except Exception:
+            pass
 
         try:
             await interaction.channel.delete(reason=f"Ticket deleted by {interaction.user}")
@@ -1489,7 +1485,6 @@ async def setup(interaction: discord.Interaction):
         return
 
     active_setup_guilds.add(interaction.guild.id)
-    active_setup_users.add((interaction.guild.id, interaction.user.id))
 
     await interaction.response.send_message(
         embed=base_embed(
