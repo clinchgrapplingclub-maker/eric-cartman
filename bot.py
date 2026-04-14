@@ -430,20 +430,6 @@ def resolve_text_channel(guild: discord.Guild, raw: str) -> Optional[discord.Tex
     return None
 
 
-def resolve_category(guild: discord.Guild, raw: str) -> Optional[discord.CategoryChannel]:
-    cid = extract_id(raw)
-    if cid:
-        ch = guild.get_channel(cid)
-        if isinstance(ch, discord.CategoryChannel):
-            return ch
-
-    raw_clean = raw.strip().replace("#", "")
-    for ch in guild.categories:
-        if ch.name.lower() == raw_clean.lower():
-            return ch
-    return None
-
-
 def resolve_role(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
     rid = extract_id(raw)
     if rid:
@@ -624,6 +610,110 @@ def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.
 
 
 # =========================
+# SETUP CATEGORY PICKER
+# =========================
+class SetupCategorySelect(discord.ui.ChannelSelect):
+    def __init__(self, data: SetupData):
+        super().__init__(
+            placeholder="Choose a category",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.category]
+        )
+        self.data = data
+
+
+class SetupCategoryView(discord.ui.View):
+    def __init__(self, data: SetupData, user_id: int):
+        super().__init__(timeout=300)
+        self.data = data
+        self.user_id = user_id
+        self.selected_category_id: Optional[int] = None
+        self.add_item(SetupCategorySelect(data))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                embed=base_embed(
+                    interaction.guild.id if interaction.guild else None,
+                    "Access Denied",
+                    "This selection is not for you.",
+                    error=True
+                ),
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.select(cls=SetupCategorySelect)
+    async def _dummy(self, interaction: discord.Interaction, select):
+        pass
+
+
+async def ask_category_select(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+) -> discord.CategoryChannel:
+    prompt_embed = setup_embed(data, title, description)
+    view = discord.ui.View(timeout=300)
+    select = discord.ui.ChannelSelect(
+        placeholder="Choose a category",
+        min_values=1,
+        max_values=1,
+        channel_types=[discord.ChannelType.category]
+    )
+    view.add_item(select)
+
+    prompt = await channel.send(embed=prompt_embed, view=view)
+
+    try:
+        while True:
+            interaction = await bot.wait_for(
+                "interaction",
+                check=lambda i: (
+                    i.type == discord.InteractionType.component
+                    and i.user.id == user.id
+                    and i.channel_id == channel.id
+                    and i.message is not None
+                    and i.message.id == prompt.id
+                ),
+                timeout=300
+            )
+
+            values = getattr(interaction.data, "values", None)
+            if values is None:
+                values = interaction.data.get("values", []) if interaction.data else []
+
+            if not values:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a category."),
+                    ephemeral=True
+                )
+                continue
+
+            category_id = int(values[0])
+            category = channel.guild.get_channel(category_id)
+
+            if not isinstance(category, discord.CategoryChannel):
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "That is not a valid category."),
+                    ephemeral=True
+                )
+                continue
+
+            await interaction.response.edit_message(view=None)
+            return category
+    finally:
+        try:
+            await prompt.edit(view=None)
+        except Exception:
+            pass
+
+
+# =========================
 # SETUP QUESTION FLOW
 # =========================
 async def wait_for_user_message(channel: discord.TextChannel, user: discord.Member, timeout: int = 300) -> discord.Message:
@@ -718,35 +808,6 @@ async def ask_text_channel(
         )
 
 
-async def ask_category(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    data: SetupData,
-    guild: discord.Guild,
-    title: str,
-    description: str,
-    *,
-    optional: bool = False,
-) -> Optional[discord.CategoryChannel]:
-    while True:
-        raw = await ask_text(channel, user, data, title, description, optional=optional)
-        if raw is None:
-            return None
-
-        resolved = resolve_category(guild, raw)
-        if resolved:
-            return resolved
-
-        await channel.send(
-            embed=setup_embed(
-                data,
-                "Invalid Category",
-                "Could not find that category. Send the category ID or exact category name."
-            ),
-            delete_after=8
-        )
-
-
 async def ask_image(
     channel: discord.TextChannel,
     user: discord.Member,
@@ -789,7 +850,7 @@ async def ask_image(
             return attachment.url
         finally:
             await safe_delete(prompt)
-            # Important: DO NOT delete image replies, or the attachment URL can break.
+            # Keep image reply message so the attachment URL stays valid.
 
 
 async def ask_optional_name(
@@ -890,10 +951,10 @@ async def run_setup_wizard(interaction: discord.Interaction):
             "Send the name for the first ticket option.\nExample: `Support Ticket`"
         )
 
-        option_1_category = await ask_category(
-            channel, user, data, guild,
+        option_1_category = await ask_category_select(
+            channel, user, data,
             "Ticket Option 1 Category",
-            "Send the category for ticket option 1.\nUse exact category name or category ID."
+            "Choose the category for ticket option 1 from the list below."
         )
         data.option_1_category_id = option_1_category.id
 
@@ -904,10 +965,10 @@ async def run_setup_wizard(interaction: discord.Interaction):
         )
 
         if data.option_2_name:
-            option_2_category = await ask_category(
-                channel, user, data, guild,
+            option_2_category = await ask_category_select(
+                channel, user, data,
                 "Ticket Option 2 Category",
-                "Send the category for ticket option 2.\nUse exact category name or category ID."
+                "Choose the category for ticket option 2 from the list below."
             )
             data.option_2_category_id = option_2_category.id
 
@@ -918,10 +979,10 @@ async def run_setup_wizard(interaction: discord.Interaction):
         )
 
         if data.option_3_name:
-            option_3_category = await ask_category(
-                channel, user, data, guild,
+            option_3_category = await ask_category_select(
+                channel, user, data,
                 "Ticket Option 3 Category",
-                "Send the category for ticket option 3.\nUse exact category name or category ID."
+                "Choose the category for ticket option 3 from the list below."
             )
             data.option_3_category_id = option_3_category.id
 
@@ -1341,8 +1402,6 @@ class CloseTicketButton(discord.ui.Button):
                     overwrite=None
                 )
         except ValueError:
-            # If the member isn't available and discord.py rejects target type,
-            # just continue without changing that overwrite.
             pass
         except discord.Forbidden:
             await interaction.response.send_message(
@@ -1375,6 +1434,10 @@ class CloseTicketButton(discord.ui.Button):
             content=None,
             embed=build_closed_ticket_embed(interaction.guild.id, interaction.user),
             view=TicketControlsView()
+        )
+
+        await interaction.channel.send(
+            embed=build_closed_ticket_embed(interaction.guild.id, interaction.user)
         )
 
         await send_log(
