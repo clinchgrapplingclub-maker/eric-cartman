@@ -19,11 +19,14 @@ if not TOKEN:
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = False
-intents.message_content = False
+intents.message_content = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
 DB_PATH = "ticketbot.db"
+
+SKIP_WORDS = {"skip", "none", "no", "-"}
+CANCEL_WORDS = {"cancel", "stop", "abort", "exit"}
 
 
 # =========================
@@ -235,54 +238,42 @@ def delete_ticket_record(channel_id: int):
 
 
 # =========================
-# SETUP SESSION
+# SETUP STATE
 # =========================
-class SetupSession:
-    def __init__(
-        self,
-        guild_id: int,
-        user_id: int,
-        panel_channel_id: int,
-        log_channel_id: int,
-        support_role_id: int,
-        option_1_category_id: int,
-        option_2_category_id: Optional[int],
-        option_3_category_id: Optional[int],
-        option_3_name: Optional[str],
-        banner_url: str,
-        thumbnail_url: str,
-    ):
+class SetupCancelled(Exception):
+    pass
+
+
+class SetupData:
+    def __init__(self, guild_id: int, user_id: int, setup_channel_id: int):
         self.guild_id = guild_id
         self.user_id = user_id
-
-        self.panel_channel_id = panel_channel_id
-        self.log_channel_id = log_channel_id
-        self.support_role_id = support_role_id
-
-        self.option_1_category_id = option_1_category_id
-        self.option_2_category_id = option_2_category_id
-        self.option_3_category_id = option_3_category_id
-        self.option_3_name = option_3_name.strip() if option_3_name else None
-
-        self.banner_url = banner_url
-        self.thumbnail_url = thumbnail_url
+        self.setup_channel_id = setup_channel_id
 
         self.title: Optional[str] = None
         self.description: Optional[str] = None
-        self.color_hex: Optional[str] = None
+        self.color_hex: str = "#00FF66"
+
+        self.panel_channel_id: Optional[int] = None
+        self.support_role_id: Optional[int] = None
+
         self.option_1_name: Optional[str] = None
+        self.option_1_category_id: Optional[int] = None
+
         self.option_2_name: Optional[str] = None
+        self.option_2_category_id: Optional[int] = None
+
+        self.option_3_name: Optional[str] = None
+        self.option_3_category_id: Optional[int] = None
+
+        self.log_channel_id: Optional[int] = None
+        self.banner_url: Optional[str] = None
+        self.thumbnail_url: Optional[str] = None
 
 
-setup_sessions: dict[tuple[int, int], SetupSession] = {}
-
-
-def get_setup_session(guild_id: int, user_id: int) -> Optional[SetupSession]:
-    return setup_sessions.get((guild_id, user_id))
-
-
-def clear_setup_session(guild_id: int, user_id: int):
-    setup_sessions.pop((guild_id, user_id), None)
+active_setup_guilds: set[int] = set()
+active_setup_users: set[tuple[int, int]] = set()
+setup_sessions: dict[tuple[int, int], SetupData] = {}
 
 
 # =========================
@@ -315,22 +306,39 @@ def is_image_attachment(att: discord.Attachment) -> bool:
     return filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 
 
+def extract_id(text: str) -> Optional[int]:
+    match = re.search(r"(\d{15,25})", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
 def base_embed(
     guild_id: Optional[int],
     title: str,
     description: str,
-    color_override: Optional[discord.Color] = None
+    *,
+    error: bool = False
 ) -> discord.Embed:
-    if color_override is not None:
-        color = color_override
+    if error:
+        color = discord.Color.red()
     else:
         config = get_guild_config(guild_id) if guild_id else None
         color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
 
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
     embed = discord.Embed(
         title=title,
         description=description,
-        color=color
+        color=hex_to_color(data.color_hex if data.color_hex else "#00FF66")
     )
     embed.set_footer(text="made by @fntsheetz")
     return embed
@@ -340,16 +348,16 @@ def build_panel_embed(guild_id: int) -> discord.Embed:
     config = get_guild_config(guild_id)
     if not config:
         return base_embed(
-            guild_id=None,
-            title="Ticket panel not configured",
-            description="This server has not configured the ticket panel yet.",
-            color_override=discord.Color.red()
+            None,
+            "Ticket panel not configured",
+            "This server has not configured the ticket panel yet.",
+            error=True
         )
 
-    embed = base_embed(
-        guild_id=guild_id,
+    embed = discord.Embed(
         title=config["title"],
-        description=config["description"]
+        description=config["description"],
+        color=hex_to_color(config["color_hex"])
     )
 
     if config["thumbnail_url"]:
@@ -358,19 +366,38 @@ def build_panel_embed(guild_id: int) -> discord.Embed:
     if config["banner_url"]:
         embed.set_image(url=config["banner_url"])
 
+    embed.set_footer(text="made by @fntsheetz")
     return embed
 
 
 def build_ticket_embed(guild_id: int, option_label: str, opener: discord.Member) -> discord.Embed:
-    return base_embed(
-        guild_id=guild_id,
+    config = get_guild_config(guild_id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    embed = discord.Embed(
         title=option_label,
         description=(
             f"{opener.mention}, your ticket has been created.\n\n"
             f"Please explain everything clearly.\n"
             f"A member of the support team will reply here."
-        )
+        ),
+        color=color
     )
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+def build_closed_ticket_embed(guild_id: int, closed_by: discord.Member) -> discord.Embed:
+    config = get_guild_config(guild_id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    embed = discord.Embed(
+        title="Ticket Closed",
+        description=f"Ticket closed by {closed_by.mention}.",
+        color=color
+    )
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
 
 
 def is_support_or_admin(member: discord.Member, guild_id: int) -> bool:
@@ -383,6 +410,79 @@ def is_support_or_admin(member: discord.Member, guild_id: int) -> bool:
 
     role = member.guild.get_role(config["support_role_id"])
     return role in member.roles if role else False
+
+
+def resolve_text_channel(guild: discord.Guild, raw: str) -> Optional[discord.TextChannel]:
+    cid = extract_id(raw)
+    if cid:
+        ch = guild.get_channel(cid)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+
+    raw_clean = raw.strip().replace("#", "")
+    for ch in guild.text_channels:
+        if ch.name.lower() == raw_clean.lower():
+            return ch
+    return None
+
+
+def resolve_category(guild: discord.Guild, raw: str) -> Optional[discord.CategoryChannel]:
+    cid = extract_id(raw)
+    if cid:
+        ch = guild.get_channel(cid)
+        if isinstance(ch, discord.CategoryChannel):
+            return ch
+
+    raw_clean = raw.strip().replace("#", "")
+    for ch in guild.categories:
+        if ch.name.lower() == raw_clean.lower():
+            return ch
+    return None
+
+
+def resolve_role(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
+    rid = extract_id(raw)
+    if rid:
+        role = guild.get_role(rid)
+        if role:
+            return role
+
+    raw_clean = raw.strip().replace("@", "")
+    for role in guild.roles:
+        if role.name.lower() == raw_clean.lower():
+            return role
+    return None
+
+
+async def safe_delete(message: Optional[discord.Message]):
+    if not message:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def send_log(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    file: Optional[discord.File] = None
+):
+    config = get_guild_config(guild.id)
+    if not config:
+        return
+
+    log_channel = guild.get_channel(config["log_channel_id"])
+    if not isinstance(log_channel, discord.TextChannel):
+        return
+
+    embed = base_embed(guild.id, title, description)
+
+    try:
+        await log_channel.send(embed=embed, file=file)
+    except discord.Forbidden:
+        pass
 
 
 async def build_transcript_text(channel: discord.TextChannel) -> str:
@@ -423,28 +523,6 @@ async def build_transcript_text(channel: discord.TextChannel) -> str:
     return "\n".join(lines)
 
 
-async def send_log(
-    guild: discord.Guild,
-    title: str,
-    description: str,
-    file: Optional[discord.File] = None
-):
-    config = get_guild_config(guild.id)
-    if not config:
-        return
-
-    log_channel = guild.get_channel(config["log_channel_id"])
-    if not isinstance(log_channel, discord.TextChannel):
-        return
-
-    embed = base_embed(guild.id, title, description)
-
-    try:
-        await log_channel.send(embed=embed, file=file)
-    except discord.Forbidden:
-        pass
-
-
 async def set_guild_profile(
     guild_id: int,
     nickname: Optional[str] = None,
@@ -483,165 +561,551 @@ async def set_guild_profile(
             return False, f"Discord API error {resp.status}: {text}"
 
 
+def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.Embed:
+    color = hex_to_color(data.color_hex if data.color_hex else "#00FF66")
+
+    panel_channel = guild.get_channel(data.panel_channel_id) if data.panel_channel_id else None
+    support_role = guild.get_role(data.support_role_id) if data.support_role_id else None
+    log_channel = guild.get_channel(data.log_channel_id) if data.log_channel_id else None
+
+    cat1 = guild.get_channel(data.option_1_category_id) if data.option_1_category_id else None
+    cat2 = guild.get_channel(data.option_2_category_id) if data.option_2_category_id else None
+    cat3 = guild.get_channel(data.option_3_category_id) if data.option_3_category_id else None
+
+    embed = discord.Embed(
+        title=data.title or "Setup Preview",
+        description=data.description or "No description set.",
+        color=color
+    )
+
+    embed.add_field(
+        name="Panel Settings",
+        value=(
+            f"**Color:** `{data.color_hex}`\n"
+            f"**Panel Channel:** {panel_channel.mention if panel_channel else '`Not set`'}\n"
+            f"**Support Team:** {support_role.mention if support_role else '`Not set`'}\n"
+            f"**Log Channel:** {log_channel.mention if log_channel else '`Not set`'}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Ticket Options",
+        value=(
+            f"**1.** {data.option_1_name or '`Not set`'} - {cat1.name if cat1 else '`Not set`'}\n"
+            f"**2.** {(data.option_2_name or '`Skipped`')} - {(cat2.name if cat2 else ('`Skipped`' if not data.option_2_name else '`Not set`'))}\n"
+            f"**3.** {(data.option_3_name or '`Skipped`')} - {(cat3.name if cat3 else ('`Skipped`' if not data.option_3_name else '`Not set`'))}"
+        ),
+        inline=False
+    )
+
+    if data.thumbnail_url:
+        embed.set_thumbnail(url=data.thumbnail_url)
+
+    if data.banner_url:
+        embed.set_image(url=data.banner_url)
+
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
 # =========================
-# SETUP MODAL
+# SETUP QUESTION FLOW
 # =========================
-class SetupTextModal(discord.ui.Modal, title="Ticket Panel Setup"):
-    panel_title = discord.ui.TextInput(
-        label="Ticket panel title",
-        placeholder="Vision Tickets",
-        max_length=100
+async def wait_for_user_message(channel: discord.TextChannel, user: discord.Member, timeout: int = 300) -> discord.Message:
+    def check(m: discord.Message):
+        return (
+            m.author.id == user.id
+            and m.channel.id == channel.id
+            and not m.author.bot
+        )
+    return await bot.wait_for("message", check=check, timeout=timeout)
+
+
+async def ask_text(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+    *,
+    optional: bool = False,
+    multiline: bool = False,
+) -> Optional[str]:
+    prompt = await channel.send(embed=setup_embed(data, title, description))
+    reply = None
+    try:
+        reply = await wait_for_user_message(channel, user)
+        content = reply.content.strip()
+
+        if content.lower() in CANCEL_WORDS:
+            raise SetupCancelled()
+
+        if optional and content.lower() in SKIP_WORDS:
+            return None
+
+        if not content:
+            if optional:
+                return None
+            raise ValueError("Empty answer.")
+
+        return content
+    finally:
+        await safe_delete(prompt)
+        await safe_delete(reply)
+
+
+async def ask_role(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    guild: discord.Guild,
+    title: str,
+    description: str,
+) -> discord.Role:
+    while True:
+        raw = await ask_text(channel, user, data, title, description)
+        role = resolve_role(guild, raw)
+        if role:
+            return role
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Invalid Role",
+                "Could not find that role. Send a role mention, role ID, or exact role name."
+            ),
+            delete_after=8
+        )
+
+
+async def ask_text_channel(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    guild: discord.Guild,
+    title: str,
+    description: str,
+) -> discord.TextChannel:
+    while True:
+        raw = await ask_text(channel, user, data, title, description)
+        resolved = resolve_text_channel(guild, raw)
+        if resolved:
+            return resolved
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Invalid Channel",
+                "Could not find that text channel. Send a channel mention, channel ID, or exact channel name."
+            ),
+            delete_after=8
+        )
+
+
+async def ask_category(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    *,
+    optional: bool = False,
+) -> Optional[discord.CategoryChannel]:
+    while True:
+        raw = await ask_text(channel, user, data, title, description, optional=optional)
+        if raw is None:
+            return None
+
+        resolved = resolve_category(guild, raw)
+        if resolved:
+            return resolved
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Invalid Category",
+                "Could not find that category. Send the category ID or exact category name."
+            ),
+            delete_after=8
+        )
+
+
+async def ask_image(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+) -> str:
+    prompt = await channel.send(embed=setup_embed(data, title, description))
+    reply = None
+
+    try:
+        reply = await wait_for_user_message(channel, user)
+
+        if reply.content.strip().lower() in CANCEL_WORDS:
+            raise SetupCancelled()
+
+        if not reply.attachments:
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "No Image Found",
+                    "You need to upload an image in your reply."
+                ),
+                delete_after=8
+            )
+            return await ask_image(channel, user, data, title, description)
+
+        attachment = reply.attachments[0]
+        if not is_image_attachment(attachment):
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "Invalid Image",
+                    "Attachment must be an image."
+                ),
+                delete_after=8
+            )
+            return await ask_image(channel, user, data, title, description)
+
+        return attachment.url
+    finally:
+        await safe_delete(prompt)
+        await safe_delete(reply)
+
+
+async def ask_option_name_and_category(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    guild: discord.Guild,
+    number: int,
+    *,
+    optional: bool = False,
+) -> tuple[Optional[str], Optional[int]]:
+    prompt_title = f"Ticket Category {number}"
+    prompt_description = (
+        "Reply in this format:\n"
+        "`Ticket Name | Category Name or Category ID`\n\n"
+        "Example:\n"
+        "`Support Ticket | tickets`\n"
+        "`Purchase Ticket | 123456789012345678`\n\n"
     )
+    if optional:
+        prompt_description += "Type `skip` if you do not want this option."
 
-    description = discord.ui.TextInput(
-        label="Description",
-        placeholder="Write the panel description here",
-        style=discord.TextStyle.paragraph,
-        max_length=1000
-    )
+    while True:
+        raw = await ask_text(
+            channel,
+            user,
+            data,
+            prompt_title,
+            prompt_description,
+            optional=optional
+        )
+        if raw is None:
+            return None, None
 
-    color_hex = discord.ui.TextInput(
-        label="Embed color hexcode",
-        placeholder="#00FF00",
-        max_length=7
-    )
+        if "|" not in raw:
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "Invalid Format",
+                    "Use this exact format:\n`Ticket Name | Category Name or Category ID`"
+                ),
+                delete_after=8
+            )
+            continue
 
-    option_1_name = discord.ui.TextInput(
-        label="Ticket option 1",
-        placeholder="Support Ticket",
-        max_length=100
-    )
+        name_part, category_part = raw.split("|", 1)
+        name = name_part.strip()
+        category_raw = category_part.strip()
 
-    option_2_name = discord.ui.TextInput(
-        label="Ticket option 2 (optional)",
-        placeholder="Purchase Ticket",
-        required=False,
-        max_length=100
-    )
+        if not name or not category_raw:
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "Invalid Format",
+                    "Both ticket name and category are required."
+                ),
+                delete_after=8
+            )
+            continue
 
-    def __init__(self, session: SetupSession):
-        super().__init__()
-        self.session = session
+        category = resolve_category(guild, category_raw)
+        if not category:
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "Invalid Category",
+                    "Could not find that category. Use exact category name or category ID."
+                ),
+                delete_after=8
+            )
+            continue
 
-    async def on_submit(self, interaction: discord.Interaction):
+        return name, category.id
+
+
+async def run_setup_wizard(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    guild = interaction.guild
+    user = interaction.user
+    channel = interaction.channel
+
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send(
+            embed=base_embed(
+                guild.id,
+                "Setup Failed",
+                "Setup must be run in a text channel.",
+                error=True
+            ),
+            ephemeral=True
+        )
+        return
+
+    data = SetupData(guild.id, user.id, channel.id)
+    setup_sessions[(guild.id, user.id)] = data
+
+    try:
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Ticket Setup Started",
+                "I will ask you one question at a time.\n\n"
+                "Reply in this channel.\n"
+                "Type `cancel` anytime to stop the setup."
+            )
+        )
+
+        data.title = await ask_text(
+            channel, user, data,
+            "Title",
+            "Send the ticket panel title."
+        )
+
+        data.description = await ask_text(
+            channel, user, data,
+            "Description",
+            "Send the ticket panel description.",
+            multiline=True
+        )
+
+        color_raw = await ask_text(
+            channel, user, data,
+            "Embed Color",
+            "Send the embed hex color.\nExample: `#00FF66`\n\nType `skip` to use the default color.",
+            optional=True
+        )
+        if color_raw:
+            try:
+                data.color_hex = normalize_hex(color_raw)
+            except ValueError:
+                await channel.send(
+                    embed=base_embed(
+                        None,
+                        "Invalid Color",
+                        "Invalid hex color. Default color `#00FF66` will be used.",
+                        error=True
+                    ),
+                    delete_after=8
+                )
+                data.color_hex = "#00FF66"
+
+        panel_channel = await ask_text_channel(
+            channel, user, data, guild,
+            "Panel Channel",
+            "Send the panel channel mention, channel ID, or exact channel name."
+        )
+        data.panel_channel_id = panel_channel.id
+
+        support_role = await ask_role(
+            channel, user, data, guild,
+            "Support Team Role",
+            "Send the support role mention, role ID, or exact role name."
+        )
+        data.support_role_id = support_role.id
+
+        data.option_1_name, data.option_1_category_id = await ask_option_name_and_category(
+            channel, user, data, guild, 1, optional=False
+        )
+
+        data.option_2_name, data.option_2_category_id = await ask_option_name_and_category(
+            channel, user, data, guild, 2, optional=True
+        )
+
+        data.option_3_name, data.option_3_category_id = await ask_option_name_and_category(
+            channel, user, data, guild, 3, optional=True
+        )
+
+        log_channel = await ask_text_channel(
+            channel, user, data, guild,
+            "Log Channel",
+            "Send the log channel mention, channel ID, or exact channel name."
+        )
+        data.log_channel_id = log_channel.id
+
+        data.banner_url = await ask_image(
+            channel, user, data,
+            "Banner",
+            "Reply with the banner image uploaded as an attachment."
+        )
+
+        data.thumbnail_url = await ask_image(
+            channel, user, data,
+            "Small Picture",
+            "Reply with the small picture image uploaded as an attachment."
+        )
+
+        preview_message = await channel.send(
+            embed=build_setup_preview_embed(guild, data),
+            view=SetupConfirmView(data)
+        )
+
+        setup_sessions[(guild.id, user.id)] = data
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Setup Ready",
+                "Review the preview above and click **Publish** or **Cancel**."
+            ),
+            delete_after=20
+        )
+
+    except SetupCancelled:
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Setup Cancelled",
+                "The ticket setup was cancelled."
+            )
+        )
+        cleanup_setup(guild.id, user.id)
+
+    except Exception as e:
+        await channel.send(
+            embed=base_embed(
+                guild.id,
+                "Setup Failed",
+                f"An error happened during setup:\n`{e}`",
+                error=True
+            )
+        )
+        cleanup_setup(guild.id, user.id)
+
+
+def cleanup_setup(guild_id: int, user_id: int):
+    active_setup_guilds.discard(guild_id)
+    active_setup_users.discard((guild_id, user_id))
+    setup_sessions.pop((guild_id, user_id), None)
+
+
+# =========================
+# SETUP CONFIRM VIEW
+# =========================
+class SetupConfirmView(discord.ui.View):
+    def __init__(self, data: SetupData):
+        super().__init__(timeout=900)
+        self.data = data
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.data.user_id:
+            await interaction.response.send_message(
+                embed=base_embed(
+                    interaction.guild.id if interaction.guild else None,
+                    "Access Denied",
+                    "This setup is not yours.",
+                    error=True
+                ),
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Publish", style=discord.ButtonStyle.success)
+    async def publish_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
 
-        try:
-            self.session.color_hex = normalize_hex(str(self.color_hex))
-        except ValueError:
-            await interaction.response.send_message(
-                embed=base_embed(
-                    None,
-                    "Setup Failed",
-                    "Invalid hex color. Example: `#00FF00`.",
-                    color_override=discord.Color.red()
-                ),
-                ephemeral=True
-            )
-            return
+        data = self.data
+        guild = interaction.guild
 
-        self.session.title = str(self.panel_title).strip()
-        self.session.description = str(self.description).strip()
-        self.session.option_1_name = str(self.option_1_name).strip()
-        self.session.option_2_name = str(self.option_2_name).strip() or None
+        clear_ticket_options(guild.id)
+        save_ticket_option(guild.id, 1, data.option_1_name, data.option_1_category_id)
 
-        if self.session.option_2_category_id and not self.session.option_2_name:
-            await interaction.response.send_message(
-                embed=base_embed(
-                    None,
-                    "Setup Failed",
-                    "You selected a category for option 2 but left the option name empty.",
-                    color_override=discord.Color.red()
-                ),
-                ephemeral=True
-            )
-            return
+        if data.option_2_name and data.option_2_category_id:
+            save_ticket_option(guild.id, 2, data.option_2_name, data.option_2_category_id)
 
-        if self.session.option_2_name and not self.session.option_2_category_id:
-            await interaction.response.send_message(
-                embed=base_embed(
-                    None,
-                    "Setup Failed",
-                    "You entered option 2 name but did not choose a category for option 2.",
-                    color_override=discord.Color.red()
-                ),
-                ephemeral=True
-            )
-            return
+        if data.option_3_name and data.option_3_category_id:
+            save_ticket_option(guild.id, 3, data.option_3_name, data.option_3_category_id)
 
-        if self.session.option_3_name and not self.session.option_3_category_id:
-            await interaction.response.send_message(
-                embed=base_embed(
-                    None,
-                    "Setup Failed",
-                    "You entered option 3 name but did not choose a category for option 3.",
-                    color_override=discord.Color.red()
-                ),
-                ephemeral=True
-            )
-            return
-
-        panel_channel = interaction.guild.get_channel(self.session.panel_channel_id)
+        panel_channel = guild.get_channel(data.panel_channel_id)
         if not isinstance(panel_channel, discord.TextChannel):
             await interaction.response.send_message(
-                embed=base_embed(
-                    None,
-                    "Setup Failed",
-                    "Panel channel is invalid.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(guild.id, "Publish Failed", "Panel channel is invalid.", error=True),
                 ephemeral=True
             )
             return
 
-        clear_ticket_options(interaction.guild.id)
-        save_ticket_option(interaction.guild.id, 1, self.session.option_1_name, self.session.option_1_category_id)
-
-        if self.session.option_2_name and self.session.option_2_category_id:
-            save_ticket_option(interaction.guild.id, 2, self.session.option_2_name, self.session.option_2_category_id)
-
-        if self.session.option_3_name and self.session.option_3_category_id:
-            save_ticket_option(interaction.guild.id, 3, self.session.option_3_name, self.session.option_3_category_id)
-
         embed = discord.Embed(
-            title=self.session.title,
-            description=self.session.description,
-            color=hex_to_color(self.session.color_hex)
+            title=data.title,
+            description=data.description,
+            color=hex_to_color(data.color_hex)
         )
-        embed.set_thumbnail(url=self.session.thumbnail_url)
-        embed.set_image(url=self.session.banner_url)
+        embed.set_thumbnail(url=data.thumbnail_url)
+        embed.set_image(url=data.banner_url)
         embed.set_footer(text="made by @fntsheetz")
 
         panel_message = await panel_channel.send(
             embed=embed,
-            view=TicketPanelView(interaction.guild.id)
+            view=TicketPanelView(guild.id)
         )
 
         save_guild_config(
-            guild_id=interaction.guild.id,
-            panel_channel_id=self.session.panel_channel_id,
+            guild_id=guild.id,
+            panel_channel_id=data.panel_channel_id,
             panel_message_id=panel_message.id,
-            title=self.session.title,
-            description=self.session.description,
-            color_hex=self.session.color_hex,
-            banner_url=self.session.banner_url,
-            thumbnail_url=self.session.thumbnail_url,
-            support_role_id=self.session.support_role_id,
-            log_channel_id=self.session.log_channel_id
+            title=data.title,
+            description=data.description,
+            color_hex=data.color_hex,
+            banner_url=data.banner_url,
+            thumbnail_url=data.thumbnail_url,
+            support_role_id=data.support_role_id,
+            log_channel_id=data.log_channel_id
         )
 
-        bot.add_view(TicketPanelView(interaction.guild.id), message_id=panel_message.id)
-        clear_setup_session(interaction.guild.id, interaction.user.id)
+        bot.add_view(TicketPanelView(guild.id), message_id=panel_message.id)
 
-        await interaction.response.send_message(
+        await interaction.response.edit_message(
             embed=base_embed(
-                interaction.guild.id,
+                guild.id,
                 "Setup Complete",
                 f"Ticket panel created in {panel_channel.mention}."
             ),
-            ephemeral=True
+            view=None
         )
+
+        cleanup_setup(guild.id, interaction.user.id)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=base_embed(
+                interaction.guild.id if interaction.guild else None,
+                "Setup Cancelled",
+                "The setup was cancelled."
+            ),
+            view=None
+        )
+        if interaction.guild:
+            cleanup_setup(interaction.guild.id, interaction.user.id)
 
 
 # =========================
@@ -673,12 +1137,7 @@ class TicketDropdown(discord.ui.Select):
 
         if not config:
             await interaction.response.send_message(
-                embed=base_embed(
-                    guild.id,
-                    "Error",
-                    "Ticket system is not configured.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(guild.id, "Error", "Ticket system is not configured.", error=True),
                 ephemeral=True
             )
             return
@@ -703,12 +1162,7 @@ class TicketDropdown(discord.ui.Select):
 
         if not selected:
             await interaction.response.send_message(
-                embed=base_embed(
-                    guild.id,
-                    "Error",
-                    "That ticket option is no longer configured.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True),
                 ephemeral=True
             )
             return
@@ -716,12 +1170,7 @@ class TicketDropdown(discord.ui.Select):
         category = guild.get_channel(selected["category_id"])
         if not isinstance(category, discord.CategoryChannel):
             await interaction.response.send_message(
-                embed=base_embed(
-                    guild.id,
-                    "Error",
-                    "The configured category is invalid.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(guild.id, "Error", "The configured category is invalid.", error=True),
                 ephemeral=True
             )
             return
@@ -729,12 +1178,7 @@ class TicketDropdown(discord.ui.Select):
         support_role = guild.get_role(config["support_role_id"])
         if not support_role:
             await interaction.response.send_message(
-                embed=base_embed(
-                    guild.id,
-                    "Error",
-                    "The support role is invalid.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(guild.id, "Error", "The support role is invalid.", error=True),
                 ephemeral=True
             )
             return
@@ -782,7 +1226,7 @@ class TicketDropdown(discord.ui.Select):
                     guild.id,
                     "Error",
                     "I do not have permission to create channels in that category.",
-                    color_override=discord.Color.red()
+                    error=True
                 ),
                 ephemeral=True
             )
@@ -793,7 +1237,7 @@ class TicketDropdown(discord.ui.Select):
         await ticket_channel.send(
             content=f"{support_role.mention} {opener.mention}",
             embed=build_ticket_embed(guild.id, selected["label"], opener),
-            view=OpenTicketView()
+            view=TicketControlsView()
         )
 
         await send_log(
@@ -807,11 +1251,7 @@ class TicketDropdown(discord.ui.Select):
         )
 
         await interaction.response.send_message(
-            embed=base_embed(
-                guild.id,
-                "Ticket Created",
-                f"Your ticket has been created: {ticket_channel.mention}"
-            ),
+            embed=base_embed(guild.id, "Ticket Created", f"Your ticket has been created: {ticket_channel.mention}"),
             ephemeral=True
         )
 
@@ -823,7 +1263,7 @@ class TicketPanelView(discord.ui.View):
 
 
 # =========================
-# TICKET CONTROL VIEWS
+# TICKET BUTTONS
 # =========================
 class ClaimTicketButton(discord.ui.Button):
     def __init__(self):
@@ -842,12 +1282,7 @@ class ClaimTicketButton(discord.ui.Button):
 
         if not is_support_or_admin(interaction.user, interaction.guild.id):
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Access Denied",
-                    "Only the support team or admins can claim tickets.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can claim tickets.", error=True),
                 ephemeral=True
             )
             return
@@ -855,35 +1290,14 @@ class ClaimTicketButton(discord.ui.Button):
         ticket = get_ticket_by_channel(interaction.channel.id)
         if not ticket:
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Error",
-                    "This is not a tracked ticket channel.",
-                    color_override=discord.Color.red()
-                ),
-                ephemeral=True
-            )
-            return
-
-        if ticket["status"] != "open":
-            await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Error",
-                    "This ticket is already closed.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
                 ephemeral=True
             )
             return
 
         if ticket["claimed_by"] == interaction.user.id:
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Already Claimed",
-                    "You already claimed this ticket."
-                ),
+                embed=base_embed(interaction.guild.id, "Already Claimed", "You already claimed this ticket."),
                 ephemeral=True
             )
             return
@@ -891,20 +1305,13 @@ class ClaimTicketButton(discord.ui.Button):
         set_ticket_claimed(interaction.channel.id, interaction.user.id)
 
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "Ticket Claimed",
-                f"Ticket claimed by {interaction.user.mention}."
-            )
+            embed=base_embed(interaction.guild.id, "Ticket Claimed", f"Ticket claimed by {interaction.user.mention}.")
         )
 
         await send_log(
             interaction.guild,
             "Ticket Claimed",
-            (
-                f"Channel: {interaction.channel.mention}\n"
-                f"Claimed by: {interaction.user.mention}"
-            )
+            f"Channel: {interaction.channel.mention}\nClaimed by: {interaction.user.mention}"
         )
 
 
@@ -925,12 +1332,7 @@ class CloseTicketButton(discord.ui.Button):
 
         if not is_support_or_admin(interaction.user, interaction.guild.id):
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Access Denied",
-                    "Only the support team or admins can close tickets.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True),
                 ephemeral=True
             )
             return
@@ -938,23 +1340,14 @@ class CloseTicketButton(discord.ui.Button):
         ticket = get_ticket_by_channel(interaction.channel.id)
         if not ticket:
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Error",
-                    "This is not a tracked ticket channel.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
                 ephemeral=True
             )
             return
 
         if ticket["status"] == "closed":
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Already Closed",
-                    "This ticket is already closed."
-                ),
+                embed=base_embed(interaction.guild.id, "Already Closed", "This ticket is already closed."),
                 ephemeral=True
             )
             return
@@ -980,36 +1373,23 @@ class CloseTicketButton(discord.ui.Button):
                 )
         except discord.Forbidden:
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Error",
-                    "I do not have permission to update channel permissions.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
                 ephemeral=True
             )
             return
 
         close_ticket_record(interaction.channel.id)
 
-        closed_embed = base_embed(
-            interaction.guild.id,
-            "Ticket Closed",
-            f"Ticket closed by {interaction.user.mention}."
-        )
-
         await interaction.response.edit_message(
-            embed=closed_embed,
-            view=ClosedTicketView()
+            content=None,
+            embed=build_closed_ticket_embed(interaction.guild.id, interaction.user),
+            view=TicketControlsView()
         )
 
         await send_log(
             interaction.guild,
             "Ticket Closed",
-            (
-                f"Channel: #{interaction.channel.name}\n"
-                f"Closed by: {interaction.user.mention}"
-            )
+            f"Channel: #{interaction.channel.name}\nClosed by: {interaction.user.mention}"
         )
 
 
@@ -1030,12 +1410,7 @@ class DeleteTicketButton(discord.ui.Button):
 
         if not is_support_or_admin(interaction.user, interaction.guild.id):
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Access Denied",
-                    "Only the support team or admins can delete tickets.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True),
                 ephemeral=True
             )
             return
@@ -1043,12 +1418,7 @@ class DeleteTicketButton(discord.ui.Button):
         ticket = get_ticket_by_channel(interaction.channel.id)
         if not ticket:
             await interaction.response.send_message(
-                embed=base_embed(
-                    interaction.guild.id,
-                    "Error",
-                    "This is not a tracked ticket channel.",
-                    color_override=discord.Color.red()
-                ),
+                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
                 ephemeral=True
             )
             return
@@ -1077,11 +1447,7 @@ class DeleteTicketButton(discord.ui.Button):
         delete_ticket_record(interaction.channel.id)
 
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "Deleting Ticket",
-                "The ticket is being deleted."
-            )
+            embed=base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted.")
         )
 
         try:
@@ -1090,125 +1456,51 @@ class DeleteTicketButton(discord.ui.Button):
             pass
 
 
-class OpenTicketView(discord.ui.View):
+class TicketControlsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(ClaimTicketButton())
         self.add_item(CloseTicketButton())
-
-
-class ClosedTicketView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
         self.add_item(DeleteTicketButton())
 
 
 # =========================
 # COMMANDS
 # =========================
-@bot.tree.command(name="setup", description="Open the ticket setup form")
+@bot.tree.command(name="setup", description="Start the guided ticket setup")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def setup(
-    interaction: discord.Interaction,
-    panel_channel: discord.TextChannel,
-    log_channel: discord.TextChannel,
-    support_team: discord.Role,
-    option_1_category: discord.CategoryChannel,
-    banner: discord.Attachment,
-    small_picture: discord.Attachment,
-    option_2_category: Optional[discord.CategoryChannel] = None,
-    option_3_category: Optional[discord.CategoryChannel] = None,
-    option_3_name: Optional[str] = None,
-):
+async def setup(interaction: discord.Interaction):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message(
-            embed=base_embed(
-                None,
-                "Error",
-                "This command can only be used in a server.",
-                color_override=discord.Color.red()
-            ),
-            ephemeral=True
-        )
         return
 
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
-            embed=base_embed(
-                None,
-                "Access Denied",
-                "Only users with Administrator can use this command.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(None, "Access Denied", "Only users with Administrator can use this command.", error=True),
             ephemeral=True
         )
         return
 
-    if not is_image_attachment(banner):
+    if interaction.guild.id in active_setup_guilds:
         await interaction.response.send_message(
-            embed=base_embed(
-                None,
-                "Setup Failed",
-                "The banner attachment must be an image.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(interaction.guild.id, "Setup Running", "A setup is already running in this server."),
             ephemeral=True
         )
         return
 
-    if not is_image_attachment(small_picture):
-        await interaction.response.send_message(
-            embed=base_embed(
-                None,
-                "Setup Failed",
-                "The small picture attachment must be an image.",
-                color_override=discord.Color.red()
-            ),
-            ephemeral=True
-        )
-        return
+    active_setup_guilds.add(interaction.guild.id)
+    active_setup_users.add((interaction.guild.id, interaction.user.id))
 
-    if option_3_name and not option_3_category:
-        await interaction.response.send_message(
-            embed=base_embed(
-                None,
-                "Setup Failed",
-                "If you enter option 3 name, you must also choose option 3 category.",
-                color_override=discord.Color.red()
-            ),
-            ephemeral=True
-        )
-        return
-
-    if option_3_category and not option_3_name:
-        await interaction.response.send_message(
-            embed=base_embed(
-                None,
-                "Setup Failed",
-                "If you choose option 3 category, you must also enter option 3 name.",
-                color_override=discord.Color.red()
-            ),
-            ephemeral=True
-        )
-        return
-
-    session = SetupSession(
-        guild_id=interaction.guild.id,
-        user_id=interaction.user.id,
-        panel_channel_id=panel_channel.id,
-        log_channel_id=log_channel.id,
-        support_role_id=support_team.id,
-        option_1_category_id=option_1_category.id,
-        option_2_category_id=option_2_category.id if option_2_category else None,
-        option_3_category_id=option_3_category.id if option_3_category else None,
-        option_3_name=option_3_name,
-        banner_url=banner.url,
-        thumbnail_url=small_picture.url
+    await interaction.response.send_message(
+        embed=base_embed(
+            interaction.guild.id,
+            "Setup Started",
+            "The guided setup has started in this channel."
+        ),
+        ephemeral=True
     )
-    setup_sessions[(interaction.guild.id, interaction.user.id)] = session
 
-    await interaction.response.send_modal(SetupTextModal(session))
+    await run_setup_wizard(interaction)
 
 
 @bot.tree.command(name="remind", description="DM a user to reply in their ticket")
@@ -1223,24 +1515,14 @@ async def remind(
 
     if not isinstance(interaction.channel, discord.TextChannel):
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "Error",
-                "This command must be used inside a ticket channel.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(interaction.guild.id, "Error", "This command must be used inside a ticket channel.", error=True),
             ephemeral=True
         )
         return
 
     if not is_support_or_admin(interaction.user, interaction.guild.id):
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "Access Denied",
-                "Only the support team or admins can use this command.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can use this command.", error=True),
             ephemeral=True
         )
         return
@@ -1248,24 +1530,14 @@ async def remind(
     ticket = get_ticket_by_channel(interaction.channel.id)
     if not ticket:
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "Error",
-                "This command can only be used inside a ticket channel.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(interaction.guild.id, "Error", "This command can only be used inside a ticket channel.", error=True),
             ephemeral=True
         )
         return
 
     if ticket["opener_id"] != user.id:
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "Error",
-                "That user is not the opener of this ticket.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(interaction.guild.id, "Error", "That user is not the opener of this ticket.", error=True),
             ephemeral=True
         )
         return
@@ -1286,22 +1558,13 @@ async def remind(
         await user.send(embed=dm_embed)
     except discord.Forbidden:
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "DM Failed",
-                "I could not DM that user.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(interaction.guild.id, "DM Failed", "I could not DM that user.", error=True),
             ephemeral=True
         )
         return
 
     await interaction.response.send_message(
-        embed=base_embed(
-            interaction.guild.id,
-            "Reminder Sent",
-            f"Reminder sent to {user.mention}."
-        ),
+        embed=base_embed(interaction.guild.id, "Reminder Sent", f"Reminder sent to {user.mention}."),
         ephemeral=True
     )
 
@@ -1330,24 +1593,14 @@ async def serverprofile(
 
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
-            embed=base_embed(
-                None,
-                "Access Denied",
-                "Only users with Administrator can use this command.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(None, "Access Denied", "Only users with Administrator can use this command.", error=True),
             ephemeral=True
         )
         return
 
     if avatar is not None and not is_image_attachment(avatar):
         await interaction.response.send_message(
-            embed=base_embed(
-                None,
-                "Update Failed",
-                "Avatar attachment must be an image.",
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(None, "Update Failed", "Avatar attachment must be an image.", error=True),
             ephemeral=True
         )
         return
@@ -1360,34 +1613,28 @@ async def serverprofile(
 
     if success:
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "Server Profile Updated",
-                "The bot profile was updated for this server."
-            ),
+            embed=base_embed(interaction.guild.id, "Server Profile Updated", "The bot profile was updated for this server."),
             ephemeral=True
         )
     else:
         await interaction.response.send_message(
-            embed=base_embed(
-                interaction.guild.id,
-                "Update Failed",
-                message,
-                color_override=discord.Color.red()
-            ),
+            embed=base_embed(interaction.guild.id, "Update Failed", message, error=True),
             ephemeral=True
         )
 
 
 @setup.error
 async def setup_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    msg = f"Setup failed: {error}"
+    if interaction.guild:
+        cleanup_setup(interaction.guild.id, interaction.user.id)
+
     embed = base_embed(
         interaction.guild.id if interaction.guild else None,
         "Setup Failed",
-        msg,
-        color_override=discord.Color.red()
+        f"{error}",
+        error=True
     )
+
     if interaction.response.is_done():
         await interaction.followup.send(embed=embed, ephemeral=True)
     else:
@@ -1396,13 +1643,13 @@ async def setup_error(interaction: discord.Interaction, error: app_commands.AppC
 
 @remind.error
 async def remind_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    msg = f"Remind failed: {error}"
     embed = base_embed(
         interaction.guild.id if interaction.guild else None,
         "Remind Failed",
-        msg,
-        color_override=discord.Color.red()
+        f"{error}",
+        error=True
     )
+
     if interaction.response.is_done():
         await interaction.followup.send(embed=embed, ephemeral=True)
     else:
@@ -1411,13 +1658,13 @@ async def remind_error(interaction: discord.Interaction, error: app_commands.App
 
 @serverprofile.error
 async def serverprofile_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    msg = f"Server profile update failed: {error}"
     embed = base_embed(
         interaction.guild.id if interaction.guild else None,
         "Update Failed",
-        msg,
-        color_override=discord.Color.red()
+        f"{error}",
+        error=True
     )
+
     if interaction.response.is_done():
         await interaction.followup.send(embed=embed, ephemeral=True)
     else:
@@ -1437,8 +1684,7 @@ async def on_ready():
     except Exception as e:
         print(f"Command sync failed: {e}")
 
-    bot.add_view(OpenTicketView())
-    bot.add_view(ClosedTicketView())
+    bot.add_view(TicketControlsView())
 
     conn = db()
     cur = conn.cursor()
