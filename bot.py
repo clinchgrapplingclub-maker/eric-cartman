@@ -54,11 +54,10 @@ db_pool: Optional[asyncpg.Pool] = None
 
 db_init_lock = asyncio.Lock()
 active_setup_guilds: set[int] = set()
+setup_sessions: dict[tuple[int, int], "SetupData"] = {}
 
 ticket_channel_locks: dict[int, asyncio.Lock] = {}
 ticket_create_locks: dict[tuple[int, int], asyncio.Lock] = {}
-
-setup_sessions: dict[tuple[int, int], "SetupData"] = {}
 
 guild_config_cache: dict[int, dict[str, Any]] = {}
 ticket_options_cache: dict[int, list[dict[str, Any]]] = {}
@@ -94,6 +93,13 @@ class SetupCancelled(Exception):
 
 
 @dataclass
+class ImageData:
+    filename: str
+    mime_type: str
+    raw: bytes
+
+
+@dataclass
 class SetupData:
     guild_id: int
     user_id: int
@@ -116,15 +122,8 @@ class SetupData:
     option_3_category_id: Optional[int] = None
 
     log_channel_id: Optional[int] = None
-    banner_url: Optional[str] = None
-    thumbnail_url: Optional[str] = None
-
-
-@dataclass
-class ImageData:
-    filename: str
-    mime_type: str
-    raw: bytes
+    banner_image: Optional[ImageData] = None
+    thumbnail_image: Optional[ImageData] = None
 
 
 def cleanup_setup(guild_id: int, user_id: int):
@@ -324,7 +323,6 @@ async def save_ticket_option(guild_id: int, option_index: int, label: str, categ
             category_id = EXCLUDED.category_id,
             updated_at = NOW()
     """, guild_id, option_index, label, category_id)
-
     ticket_options_cache.pop(guild_id, None)
 
 
@@ -428,6 +426,13 @@ def clean_channel_name(text: str) -> str:
     text = re.sub(r"\s+", "-", text).strip("-")
     text = re.sub(r"-{2,}", "-", text)
     return text[:80] if text else "ticket"
+
+
+def safe_attachment_name(filename: str, fallback: str) -> str:
+    if not filename:
+        return fallback
+    name = re.sub(r"[^a-zA-Z0-9._-]", "-", filename)
+    return name[:100] or fallback
 
 
 def is_image_attachment(att: discord.Attachment) -> bool:
@@ -586,12 +591,6 @@ def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.
         inline=False
     )
 
-    if data.thumbnail_url:
-        embed.set_thumbnail(url=data.thumbnail_url)
-
-    if data.banner_url:
-        embed.set_image(url=data.banner_url)
-
     embed.set_footer(text="made by @fntsheetz")
     return embed
 
@@ -663,32 +662,23 @@ async def safe_component_reply(
     except Exception:
         pass
 
+
+async def safe_ephemeral_edit_or_followup(
+    interaction: discord.Interaction,
+    *,
+    embed: discord.Embed
+):
     try:
-        if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
-            await interaction.channel.send(content=content, embed=embed)
+        await interaction.edit_original_response(embed=embed, content=None, view=None)
+        return
     except Exception:
         pass
 
-
-async def safe_edit_original_response(
-    interaction: discord.Interaction,
-    *,
-    embed: Optional[discord.Embed] = None,
-    content: Optional[str] = None,
-    view: Optional[discord.ui.View] = None
-) -> bool:
     try:
-        await interaction.edit_original_response(content=content, embed=embed, view=view)
-        return True
-    except Exception:
-        return False
-
-
-async def ensure_interaction_ack(interaction: discord.Interaction, *, ephemeral: bool = True):
-    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
-    with suppress(Exception):
-        await interaction.response.defer(ephemeral=ephemeral, thinking=False)
+    except Exception:
+        pass
 
 
 async def refresh_panel_message(message: Optional[discord.Message], guild_id: int):
@@ -1003,7 +993,7 @@ async def set_guild_profile(
 
 
 # =========================================================
-# WAITERS / QUESTION HELPERS
+# SETUP HELPERS
 # =========================================================
 async def wait_for_user_message(channel: discord.TextChannel, user: discord.Member, timeout: int = 300) -> discord.Message:
     def check(m: discord.Message):
@@ -1381,30 +1371,17 @@ async def run_setup_wizard(interaction: discord.Interaction):
         )
         data.log_channel_id = log_channel.id
 
-        banner_attachment = await ask_image(
+        data.banner_image = await ask_image(
             channel, user, embed_builder,
             "Banner",
             "Reply with the banner image uploaded as an attachment."
         )
-        data.banner_url = None
 
-        thumbnail_attachment = await ask_image(
+        data.thumbnail_image = await ask_image(
             channel, user, embed_builder,
             "Server PFP / Small Picture",
             "Reply with the small picture image uploaded as an attachment."
         )
-        data.thumbnail_url = None
-
-        # Re-upload by sending temp message so URLs are stable
-        tmp_files = [
-            discord.File(io.BytesIO(banner_attachment.raw), filename=banner_attachment.filename),
-            discord.File(io.BytesIO(thumbnail_attachment.raw), filename=thumbnail_attachment.filename),
-        ]
-        temp_msg = await channel.send(files=tmp_files)
-
-        if len(temp_msg.attachments) >= 2:
-            data.banner_url = temp_msg.attachments[0].url
-            data.thumbnail_url = temp_msg.attachments[1].url
 
         await channel.send(
             embed=build_setup_preview_embed(guild, data),
@@ -1459,7 +1436,7 @@ class SetupConfirmView(discord.ui.View):
         if not interaction.guild:
             return
 
-        await ensure_interaction_ack(interaction, ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=True)
 
         data = self.data
         guild = interaction.guild
@@ -1476,8 +1453,7 @@ class SetupConfirmView(discord.ui.View):
 
             panel_channel = guild.get_channel(data.panel_channel_id)
             if not isinstance(panel_channel, discord.TextChannel):
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(guild.id, "Publish Failed", "Panel channel is invalid.", error=True),
                     ephemeral=True
                 )
@@ -1488,14 +1464,40 @@ class SetupConfirmView(discord.ui.View):
                 description=data.description,
                 color=hex_to_color(data.color_hex)
             )
-            if data.thumbnail_url:
-                embed.set_thumbnail(url=data.thumbnail_url)
-            if data.banner_url:
-                embed.set_image(url=data.banner_url)
+
+            files: list[discord.File] = []
+
+            if data.thumbnail_image:
+                thumb_name = safe_attachment_name(data.thumbnail_image.filename, "thumbnail.png")
+                embed.set_thumbnail(url=f"attachment://{thumb_name}")
+                files.append(discord.File(io.BytesIO(data.thumbnail_image.raw), filename=thumb_name))
+
+            if data.banner_image:
+                banner_name = safe_attachment_name(data.banner_image.filename, "banner.png")
+                embed.set_image(url=f"attachment://{banner_name}")
+                files.append(discord.File(io.BytesIO(data.banner_image.raw), filename=banner_name))
+
             embed.set_footer(text="made by @fntsheetz", icon_url=get_bot_guild_avatar_url(guild.id))
 
             panel_view = await TicketPanelView.build(guild.id)
-            panel_message = await panel_channel.send(embed=embed, view=panel_view)
+            panel_message = await panel_channel.send(embed=embed, files=files, view=panel_view)
+
+            banner_url = None
+            thumbnail_url = None
+            for att in panel_message.attachments:
+                low = att.filename.lower()
+                if thumbnail_url is None and ("thumb" in low or "icon" in low or "pfp" in low):
+                    thumbnail_url = att.url
+                elif banner_url is None:
+                    banner_url = att.url
+
+            if data.banner_image and banner_url is None and panel_message.attachments:
+                banner_url = panel_message.attachments[0].url
+            if data.thumbnail_image and thumbnail_url is None:
+                if len(panel_message.attachments) >= 2:
+                    thumbnail_url = panel_message.attachments[1].url
+                elif len(panel_message.attachments) == 1 and not data.banner_image:
+                    thumbnail_url = panel_message.attachments[0].url
 
             await save_guild_config(
                 guild_id=guild.id,
@@ -1504,8 +1506,8 @@ class SetupConfirmView(discord.ui.View):
                 title=data.title,
                 description=data.description,
                 color_hex=data.color_hex,
-                banner_url=data.banner_url,
-                thumbnail_url=data.thumbnail_url,
+                banner_url=banner_url,
+                thumbnail_url=thumbnail_url,
                 support_role_id=data.support_role_id,
                 log_channel_id=data.log_channel_id
             )
@@ -1519,8 +1521,7 @@ class SetupConfirmView(discord.ui.View):
                         view=None
                     )
 
-            await safe_component_reply(
-                interaction,
+            await interaction.followup.send(
                 embed=await base_embed(guild.id, "Setup Complete", f"Ticket panel created in {panel_channel.mention}."),
                 ephemeral=True
             )
@@ -1529,15 +1530,14 @@ class SetupConfirmView(discord.ui.View):
 
         except Exception as e:
             log.exception("Failed to publish setup in guild %s", guild.id)
-            await safe_component_reply(
-                interaction,
+            await interaction.followup.send(
                 embed=await base_embed(guild.id, "Publish Failed", f"An error happened:\n`{e}`", error=True),
                 ephemeral=True
             )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await ensure_interaction_ack(interaction, ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=False)
 
         with suppress(Exception):
             if interaction.message:
@@ -1553,8 +1553,7 @@ class SetupConfirmView(discord.ui.View):
         if interaction.guild:
             cleanup_setup(interaction.guild.id, interaction.user.id)
 
-        await safe_component_reply(
-            interaction,
+        await interaction.followup.send(
             embed=await base_embed(
                 interaction.guild.id if interaction.guild else None,
                 "Setup Cancelled",
@@ -1590,8 +1589,6 @@ class TicketDropdown(discord.ui.Select):
         guild = interaction.guild
         opener = interaction.user
 
-        await ensure_interaction_ack(interaction, ephemeral=True)
-
         config = await get_guild_config(guild.id)
         if not config:
             await safe_component_reply(
@@ -1601,66 +1598,73 @@ class TicketDropdown(discord.ui.Select):
             )
             return
 
-        await refresh_panel_message(interaction.message, guild.id)
+        try:
+            await interaction.response.send_message(
+                embed=await base_embed(guild.id, "Opening Ticket", "Opening your ticket..."),
+                ephemeral=True
+            )
+        except Exception:
+            return
 
         create_lock = get_ticket_create_lock(guild.id, opener.id)
+
         async with create_lock:
             try:
                 existing = await get_open_ticket_for_user(guild.id, opener.id)
                 if existing:
                     existing_channel = guild.get_channel(existing["channel_id"])
                     if existing_channel:
-                        embed = await base_embed(
-                            guild.id,
-                            "Open Ticket Found",
-                            f"You already have an open ticket: {existing_channel.mention}"
+                        await safe_ephemeral_edit_or_followup(
+                            interaction,
+                            embed=await base_embed(
+                                guild.id,
+                                "Open Ticket Found",
+                                f"You already have an open ticket: {existing_channel.mention}"
+                            )
                         )
-                        ok = await safe_edit_original_response(interaction, embed=embed)
-                        if not ok:
-                            await safe_component_reply(interaction, embed=embed, ephemeral=True)
                         return
 
                 try:
                     selected_index = int(self.values[0])
                 except Exception:
-                    embed = await base_embed(guild.id, "Error", "Invalid selection.", error=True)
-                    ok = await safe_edit_original_response(interaction, embed=embed)
-                    if not ok:
-                        await safe_component_reply(interaction, embed=embed, ephemeral=True)
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "Invalid selection.", error=True)
+                    )
                     return
 
                 rows = await get_ticket_options(guild.id)
                 selected = next((r for r in rows if r["option_index"] == selected_index), None)
 
                 if not selected:
-                    embed = await base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True)
-                    ok = await safe_edit_original_response(interaction, embed=embed)
-                    if not ok:
-                        await safe_component_reply(interaction, embed=embed, ephemeral=True)
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True)
+                    )
                     return
 
                 category = guild.get_channel(selected["category_id"])
                 if not isinstance(category, discord.CategoryChannel):
-                    embed = await base_embed(guild.id, "Error", "The configured category is invalid.", error=True)
-                    ok = await safe_edit_original_response(interaction, embed=embed)
-                    if not ok:
-                        await safe_component_reply(interaction, embed=embed, ephemeral=True)
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "The configured category is invalid.", error=True)
+                    )
                     return
 
                 support_role = guild.get_role(config["support_role_id"])
                 if not support_role:
-                    embed = await base_embed(guild.id, "Error", "The support role is invalid.", error=True)
-                    ok = await safe_edit_original_response(interaction, embed=embed)
-                    if not ok:
-                        await safe_component_reply(interaction, embed=embed, ephemeral=True)
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "The support role is invalid.", error=True)
+                    )
                     return
 
                 me = guild.me
                 if me is None:
-                    embed = await base_embed(guild.id, "Error", "Bot member could not be resolved in this server.", error=True)
-                    ok = await safe_edit_original_response(interaction, embed=embed)
-                    if not ok:
-                        await safe_component_reply(interaction, embed=embed, ephemeral=True)
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "Bot member could not be resolved in this server.", error=True)
+                    )
                     return
 
                 base_name = clean_channel_name(f"{selected['label']}-{opener.name}")
@@ -1709,36 +1713,36 @@ class TicketDropdown(discord.ui.Select):
                         reason=f"Ticket created by {opener} ({opener.id})"
                     )
                 except discord.Forbidden:
-                    embed = await base_embed(
-                        guild.id,
-                        "Error",
-                        "I do not have permission to create channels in that category.",
-                        error=True
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(
+                            guild.id,
+                            "Error",
+                            "I do not have permission to create channels in that category.",
+                            error=True
+                        )
                     )
-                    ok = await safe_edit_original_response(interaction, embed=embed)
-                    if not ok:
-                        await safe_component_reply(interaction, embed=embed, ephemeral=True)
                     return
                 except discord.HTTPException as e:
-                    embed = await base_embed(
-                        guild.id,
-                        "Error",
-                        f"Failed to create the ticket channel.\n`{e}`",
-                        error=True
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(
+                            guild.id,
+                            "Error",
+                            f"Failed to create the ticket channel.\n`{e}`",
+                            error=True
+                        )
                     )
-                    ok = await safe_edit_original_response(interaction, embed=embed)
-                    if not ok:
-                        await safe_component_reply(interaction, embed=embed, ephemeral=True)
                     return
 
                 await create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
 
                 ticket_view = TicketControlsView()
-                embed = await build_ticket_embed(guild.id, selected["label"], opener)
+                ticket_embed = await build_ticket_embed(guild.id, selected["label"], opener)
 
                 await ticket_channel.send(
                     content=f"{support_role.mention} {opener.mention}",
-                    embed=embed,
+                    embed=ticket_embed,
                     view=ticket_view
                 )
 
@@ -1752,17 +1756,21 @@ class TicketDropdown(discord.ui.Select):
                     )
                 )
 
-                result_embed = await base_embed(guild.id, "Ticket Created", f"Your ticket has been created: {ticket_channel.mention}")
-                ok = await safe_edit_original_response(interaction, embed=result_embed)
-                if not ok:
-                    await safe_component_reply(interaction, embed=result_embed, ephemeral=True)
+                await safe_ephemeral_edit_or_followup(
+                    interaction,
+                    embed=await base_embed(
+                        guild.id,
+                        "Ticket Created",
+                        f"Your ticket has been created: {ticket_channel.mention}"
+                    )
+                )
 
             except Exception as e:
                 log.exception("Ticket creation failed in guild %s for user %s", guild.id, opener.id)
-                embed = await base_embed(guild.id, "Error", f"Failed to create ticket.\n`{e}`", error=True)
-                ok = await safe_edit_original_response(interaction, embed=embed)
-                if not ok:
-                    await safe_component_reply(interaction, embed=embed, ephemeral=True)
+                await safe_ephemeral_edit_or_followup(
+                    interaction,
+                    embed=await base_embed(guild.id, "Error", f"Failed to create ticket.\n`{e}`", error=True)
+                )
 
 
 class TicketPanelView(discord.ui.View):
@@ -1794,41 +1802,38 @@ class ClaimTicketButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
+
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        await ensure_interaction_ack(interaction, ephemeral=True)
+        await safe_defer(interaction, ephemeral=False, thinking=False)
 
         lock = get_ticket_channel_lock(interaction.channel.id)
         async with lock:
             ticket = await get_ticket_by_channel(interaction.channel.id)
             if not ticket:
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
                     ephemeral=True
                 )
                 return
 
             if ticket["status"] == "closed":
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Ticket Closed", "This ticket is already closed."),
                     ephemeral=True
                 )
                 return
 
             if not await is_support_or_admin(interaction.user, interaction.guild.id):
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can claim tickets.", error=True),
                     ephemeral=True
                 )
                 return
 
             if ticket["claimed_by"] == interaction.user.id:
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Already Claimed", "You already claimed this ticket."),
                     ephemeral=True
                 )
@@ -1836,8 +1841,7 @@ class ClaimTicketButton(discord.ui.Button):
 
             await set_ticket_claimed(interaction.channel.id, interaction.user.id)
 
-            await safe_component_reply(
-                interaction,
+            await interaction.followup.send(
                 embed=await base_embed(interaction.guild.id, "Ticket Claimed", f"Ticket claimed by {interaction.user.mention}."),
                 ephemeral=False
             )
@@ -1861,33 +1865,31 @@ class CloseTicketButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
+
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        await ensure_interaction_ack(interaction, ephemeral=True)
+        await safe_defer(interaction, ephemeral=True, thinking=False)
 
         lock = get_ticket_channel_lock(interaction.channel.id)
         async with lock:
             ticket = await get_ticket_by_channel(interaction.channel.id)
             if not ticket:
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
                     ephemeral=True
                 )
                 return
 
             if ticket["status"] == "closed":
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Already Closed", "This ticket is already closed."),
                     ephemeral=True
                 )
                 return
 
             if not await is_support_or_admin(interaction.user, interaction.guild.id):
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True),
                     ephemeral=True
                 )
@@ -1901,8 +1903,7 @@ class CloseTicketButton(discord.ui.Button):
                 if opener_member:
                     await interaction.channel.set_permissions(opener_member, view_channel=False)
             except discord.Forbidden:
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
                     ephemeral=True
                 )
@@ -1920,8 +1921,7 @@ class CloseTicketButton(discord.ui.Button):
                         manage_messages=True
                     )
                 except discord.Forbidden:
-                    await safe_component_reply(
-                        interaction,
+                    await interaction.followup.send(
                         embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update support role permissions.", error=True),
                         ephemeral=True
                     )
@@ -1935,7 +1935,9 @@ class CloseTicketButton(discord.ui.Button):
             except Exception:
                 pass
 
-            await interaction.channel.send(embed=await build_closed_ticket_embed(interaction.guild.id, interaction.user))
+            await interaction.channel.send(
+                embed=await build_closed_ticket_embed(interaction.guild.id, interaction.user)
+            )
 
             await dm_ticket_closed(
                 interaction.guild,
@@ -1950,8 +1952,7 @@ class CloseTicketButton(discord.ui.Button):
                 f"Channel: #{interaction.channel.name}\nClosed by: {interaction.user.mention}"
             )
 
-            await safe_component_reply(
-                interaction,
+            await interaction.followup.send(
                 embed=await base_embed(interaction.guild.id, "Ticket Closed", f"Ticket closed by {interaction.user.mention}."),
                 ephemeral=True
             )
@@ -1968,25 +1969,24 @@ class DeleteTicketButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
+
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        await ensure_interaction_ack(interaction, ephemeral=False)
+        await safe_defer(interaction, ephemeral=True, thinking=False)
 
         lock = get_ticket_channel_lock(interaction.channel.id)
         async with lock:
             ticket = await get_ticket_by_channel(interaction.channel.id)
             if not ticket:
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
                     ephemeral=True
                 )
                 return
 
             if not await is_support_or_admin(interaction.user, interaction.guild.id):
-                await safe_component_reply(
-                    interaction,
+                await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True),
                     ephemeral=True
                 )
@@ -2011,7 +2011,8 @@ class DeleteTicketButton(discord.ui.Button):
 
             with suppress(Exception):
                 await interaction.followup.send(
-                    embed=await base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted.")
+                    embed=await base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted."),
+                    ephemeral=True
                 )
 
             with suppress(Exception):
@@ -2061,7 +2062,11 @@ async def setup(interaction: discord.Interaction):
     active_setup_guilds.add(interaction.guild.id)
 
     await interaction.response.send_message(
-        embed=await base_embed(interaction.guild.id, "Setup Started", "The guided setup has started in this channel."),
+        embed=await base_embed(
+            interaction.guild.id,
+            "Setup Started",
+            "The guided setup has started in this channel."
+        ),
         ephemeral=True
     )
 
