@@ -6,12 +6,14 @@ import io
 import os
 import re
 import sqlite3
+import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 
 import discord
 from discord.ext import commands
 from discord import app_commands
+
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -31,6 +33,28 @@ SKIP_WORDS = {"skip", "none", "no", "-"}
 CANCEL_WORDS = {"cancel", "stop", "abort", "exit"}
 
 db_lock = asyncio.Lock()
+ticket_channel_locks: dict[int, asyncio.Lock] = {}
+ticket_create_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+# =========================
+# LOCK HELPERS
+# =========================
+def get_ticket_channel_lock(channel_id: int) -> asyncio.Lock:
+    lock = ticket_channel_locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        ticket_channel_locks[channel_id] = lock
+    return lock
+
+
+def get_ticket_create_lock(guild_id: int, user_id: int) -> asyncio.Lock:
+    key = (guild_id, user_id)
+    lock = ticket_create_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        ticket_create_locks[key] = lock
+    return lock
 
 
 # =========================
@@ -39,12 +63,10 @@ db_lock = asyncio.Lock()
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=30000;")
-
     return conn
 
 
@@ -55,7 +77,7 @@ def column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -
     return any(col["name"] == column_name for col in cols)
 
 
-def init_db():
+def init_db_sync():
     conn = db()
     cur = conn.cursor()
 
@@ -109,6 +131,28 @@ def init_db():
     conn.close()
 
 
+async def init_db():
+    async with db_lock:
+        await asyncio.to_thread(init_db_sync)
+
+
+def get_guild_config_sync(guild_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+async def get_guild_config_async(guild_id: int):
+    return await asyncio.to_thread(get_guild_config_sync, guild_id)
+
+
+def get_guild_config(guild_id: int):
+    return get_guild_config_sync(guild_id)
+
+
 async def save_guild_config(
     guild_id: int,
     panel_channel_id: int,
@@ -121,7 +165,7 @@ async def save_guild_config(
     support_role_id: int,
     log_channel_id: int,
 ):
-    async with db_lock:
+    def _run():
         conn = db()
         cur = conn.cursor()
         cur.execute("""
@@ -147,27 +191,24 @@ async def save_guild_config(
         conn.commit()
         conn.close()
 
-
-def get_guild_config(guild_id: int):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+    async with db_lock:
+        await asyncio.to_thread(_run)
 
 
 async def clear_ticket_options(guild_id: int):
-    async with db_lock:
+    def _run():
         conn = db()
         cur = conn.cursor()
         cur.execute("DELETE FROM ticket_options WHERE guild_id = ?", (guild_id,))
         conn.commit()
         conn.close()
 
+    async with db_lock:
+        await asyncio.to_thread(_run)
+
 
 async def save_ticket_option(guild_id: int, option_index: int, label: str, category_id: int):
-    async with db_lock:
+    def _run():
         conn = db()
         cur = conn.cursor()
         cur.execute("""
@@ -180,8 +221,11 @@ async def save_ticket_option(guild_id: int, option_index: int, label: str, categ
         conn.commit()
         conn.close()
 
+    async with db_lock:
+        await asyncio.to_thread(_run)
 
-def get_ticket_options(guild_id: int):
+
+def get_ticket_options_sync(guild_id: int):
     conn = db()
     cur = conn.cursor()
     cur.execute("""
@@ -194,8 +238,12 @@ def get_ticket_options(guild_id: int):
     return rows
 
 
+def get_ticket_options(guild_id: int):
+    return get_ticket_options_sync(guild_id)
+
+
 async def create_ticket_record(channel_id: int, guild_id: int, opener_id: int, option_label: str):
-    async with db_lock:
+    def _run():
         conn = db()
         cur = conn.cursor()
         cur.execute("""
@@ -211,8 +259,11 @@ async def create_ticket_record(channel_id: int, guild_id: int, opener_id: int, o
         conn.commit()
         conn.close()
 
+    async with db_lock:
+        await asyncio.to_thread(_run)
 
-def get_ticket_by_channel(channel_id: int):
+
+def get_ticket_by_channel_sync(channel_id: int):
     conn = db()
     cur = conn.cursor()
     cur.execute("SELECT * FROM tickets WHERE channel_id = ?", (channel_id,))
@@ -221,7 +272,11 @@ def get_ticket_by_channel(channel_id: int):
     return row
 
 
-def get_open_ticket_for_user(guild_id: int, opener_id: int):
+def get_ticket_by_channel(channel_id: int):
+    return get_ticket_by_channel_sync(channel_id)
+
+
+def get_open_ticket_for_user_sync(guild_id: int, opener_id: int):
     conn = db()
     cur = conn.cursor()
     cur.execute("""
@@ -234,8 +289,12 @@ def get_open_ticket_for_user(guild_id: int, opener_id: int):
     return row
 
 
+def get_open_ticket_for_user(guild_id: int, opener_id: int):
+    return get_open_ticket_for_user_sync(guild_id, opener_id)
+
+
 async def set_ticket_claimed(channel_id: int, claimed_by: int):
-    async with db_lock:
+    def _run():
         conn = db()
         cur = conn.cursor()
         cur.execute("""
@@ -246,27 +305,51 @@ async def set_ticket_claimed(channel_id: int, claimed_by: int):
         conn.commit()
         conn.close()
 
+    async with db_lock:
+        await asyncio.to_thread(_run)
+
 
 async def close_ticket_record(channel_id: int, closed_by: Optional[int] = None):
-    async with db_lock:
+    def _run():
         conn = db()
         cur = conn.cursor()
         cur.execute("""
             UPDATE tickets
-            SET status = 'closed', closed_by = ?, closed_at = ?
+            SET status = 'closed',
+                closed_by = ?,
+                closed_at = ?
             WHERE channel_id = ?
-        """, (closed_by, datetime.now(timezone.utc).isoformat(), channel_id))
+        """, (
+            closed_by,
+            datetime.now(timezone.utc).isoformat(),
+            channel_id
+        ))
         conn.commit()
         conn.close()
 
+    async with db_lock:
+        await asyncio.to_thread(_run)
+
 
 async def delete_ticket_record(channel_id: int):
-    async with db_lock:
+    def _run():
         conn = db()
         cur = conn.cursor()
         cur.execute("DELETE FROM tickets WHERE channel_id = ?", (channel_id,))
         conn.commit()
         conn.close()
+
+    async with db_lock:
+        await asyncio.to_thread(_run)
+
+
+def get_all_panel_rows_sync():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT guild_id, panel_message_id FROM guild_config")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 # =========================
@@ -434,35 +517,7 @@ def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
 
 
 def setprofile_embed(guild_id: int, title: str, description: str) -> discord.Embed:
-    embed = base_embed(guild_id, title, description)
-    return embed
-
-
-def build_panel_embed(guild_id: int) -> discord.Embed:
-    config = get_guild_config(guild_id)
-    if not config:
-        return base_embed(
-            None,
-            "Ticket panel not configured",
-            "This server has not configured the ticket panel yet.",
-            error=True
-        )
-
-    embed = discord.Embed(
-        title=config["title"],
-        description=config["description"],
-        color=hex_to_color(config["color_hex"])
-    )
-
-    if config["thumbnail_url"]:
-        embed.set_thumbnail(url=config["thumbnail_url"])
-
-    if config["banner_url"]:
-        embed.set_image(url=config["banner_url"])
-
-    footer_icon = get_bot_guild_avatar_url(guild_id)
-    embed.set_footer(text="made by @fntsheetz", icon_url=footer_icon)
-    return embed
+    return base_embed(guild_id, title, description)
 
 
 def build_ticket_embed(guild_id: int, option_label: str, opener: discord.Member) -> discord.Embed:
@@ -576,8 +631,6 @@ async def send_log(
             await log_channel.send(embed=embed, file=file)
         else:
             await log_channel.send(embed=embed)
-    except discord.Forbidden:
-        pass
     except Exception:
         pass
 
@@ -586,8 +639,121 @@ def format_ts(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = False, thinking: bool = False) -> bool:
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+async def safe_component_reply(
+    interaction: discord.Interaction,
+    *,
+    embed: Optional[discord.Embed] = None,
+    content: Optional[str] = None,
+    ephemeral: bool = False
+):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+            return
+    except Exception:
+        pass
+
+    try:
+        await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+        return
+    except Exception:
+        pass
+
+    try:
+        if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+            await interaction.channel.send(content=content, embed=embed)
+    except Exception:
+        pass
+
+
+async def safe_edit_component_message(interaction: discord.Interaction, *, view=None, embed=None, content=None):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(content=content, embed=embed, view=view)
+            return True
+    except Exception:
+        pass
+
+    try:
+        if interaction.message:
+            await interaction.message.edit(content=content, embed=embed, view=view)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def refresh_panel_message(message: Optional[discord.Message], guild_id: int):
+    if not message:
+        return
+    try:
+        await message.edit(view=TicketPanelView(guild_id))
+    except Exception:
+        pass
+
+
+async def dm_ticket_closed(
+    guild: discord.Guild,
+    opener_id: int,
+    closed_by: discord.Member,
+    channel_name: str
+):
+    config = get_guild_config(guild.id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    user = await try_fetch_user(opener_id)
+    if not user:
+        return
+
+    embed = discord.Embed(
+        title="Ticket Closed",
+        description=(
+            f"Your ticket in **{guild.name}** has been closed.\n\n"
+            f"Closed by: {closed_by.mention}\n"
+            f"Ticket: #{channel_name}"
+        ),
+        color=color
+    )
+    embed.set_footer(text="made by @fntsheetz")
+
+    try:
+        await user.send(embed=embed)
+    except Exception:
+        pass
+
+
+# =========================
+# TRANSCRIPT
+# =========================
+async def fetch_channel_history_with_retry(channel: discord.TextChannel, attempts: int = 4):
+    last_error = None
+
+    for attempt in range(attempts):
+        try:
+            return [msg async for msg in channel.history(limit=None, oldest_first=True)]
+        except (discord.DiscordServerError, discord.HTTPException) as e:
+            last_error = e
+            await asyncio.sleep(1.25 * (attempt + 1))
+        except Exception as e:
+            last_error = e
+            break
+
+    raise last_error if last_error else RuntimeError("Failed to fetch channel history.")
+
+
 async def build_transcript_html(channel: discord.TextChannel) -> str:
-    messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
+    messages = await fetch_channel_history_with_retry(channel)
 
     rows = []
 
@@ -597,6 +763,7 @@ async def build_transcript_html(channel: discord.TextChannel) -> str:
         author_id = msg.author.id
 
         content = html.escape(msg.content) if msg.content else ""
+        content_html = content.replace("\n", "<br>") if content else '<span class="muted">No text content</span>'
 
         attachment_html = ""
         if msg.attachments:
@@ -635,8 +802,6 @@ async def build_transcript_html(channel: discord.TextChannel) -> str:
                         {''.join(embed_parts)}
                     </div>
                 """
-
-        content_html = content.replace("\n", "<br>") if content else '<span class="muted">No text content</span>'
 
         rows.append(f"""
             <div class="message">
@@ -755,32 +920,67 @@ async def build_transcript_html(channel: discord.TextChannel) -> str:
     return doc
 
 
+async def build_transcript_zip(channel: discord.TextChannel) -> discord.File:
+    try:
+        transcript_html = await build_transcript_html(channel)
+    except Exception as e:
+        transcript_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Transcript Error</title></head>
+<body style="background:#111;color:#fff;font-family:Arial;padding:20px;">
+<h1>Transcript could not be fully generated</h1>
+<p>Channel: #{html.escape(channel.name)}</p>
+<p>Guild: {html.escape(channel.guild.name)}</p>
+<p>Error: {html.escape(str(e))}</p>
+<p>Generated: {format_ts(datetime.now(timezone.utc))}</p>
+</body>
+</html>"""
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"transcript-{channel.name}.html", transcript_html)
+    zip_buffer.seek(0)
+
+    return discord.File(
+        zip_buffer,
+        filename=f"transcript-{channel.name}.zip"
+    )
+
+
+# =========================
+# GUILD PROFILE HELPERS
+# =========================
 async def patch_guild_profile_with_retry(guild_id: int, payload: dict, max_attempts: int = 5) -> tuple[bool, str]:
     headers = {
         "Authorization": f"Bot {TOKEN}",
         "Content-Type": "application/json"
     }
     url = f"https://discord.com/api/v10/guilds/{guild_id}/members/@me"
-
     timeout = aiohttp.ClientTimeout(total=60)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for _ in range(max_attempts):
-            async with session.patch(url, json=payload, headers=headers) as resp:
-                if 200 <= resp.status < 300:
-                    return True, "Guild profile updated successfully."
+        for attempt in range(max_attempts):
+            try:
+                async with session.patch(url, json=payload, headers=headers) as resp:
+                    if 200 <= resp.status < 300:
+                        return True, "Guild profile updated successfully."
 
-                if resp.status == 429:
-                    try:
-                        data = await resp.json()
-                        retry_after = float(data.get("retry_after", 1.5))
-                    except Exception:
-                        retry_after = 1.5
-                    await asyncio.sleep(retry_after + 0.25)
+                    if resp.status == 429:
+                        try:
+                            data = await resp.json()
+                            retry_after = float(data.get("retry_after", 1.5))
+                        except Exception:
+                            retry_after = 1.5
+                        await asyncio.sleep(retry_after + 0.25)
+                        continue
+
+                    text = await resp.text()
+                    return False, f"Discord API error {resp.status}: {text}"
+            except aiohttp.ClientError:
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(1.0 + attempt)
                     continue
-
-                text = await resp.text()
-                return False, f"Discord API error {resp.status}: {text}"
+                return False, "Discord API connection error."
 
     return False, "Discord API rate-limited too many times. Try again."
 
@@ -816,38 +1016,6 @@ async def set_guild_profile(
         return False, "Nothing to update."
 
     return await patch_guild_profile_with_retry(guild_id, payload)
-
-
-async def dm_ticket_closed(
-    guild: discord.Guild,
-    opener_id: int,
-    closed_by: discord.Member,
-    channel_name: str
-):
-    config = get_guild_config(guild.id)
-    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
-
-    user = await try_fetch_user(opener_id)
-    if not user:
-        return
-
-    embed = discord.Embed(
-        title="Ticket Closed",
-        description=(
-            f"Your ticket in **{guild.name}** has been closed.\n\n"
-            f"Closed by: {closed_by.mention}\n"
-            f"Ticket: #{channel_name}"
-        ),
-        color=color
-    )
-    embed.set_footer(text="made by @fntsheetz")
-
-    try:
-        await user.send(embed=embed)
-    except discord.Forbidden:
-        pass
-    except Exception:
-        pass
 
 
 # =========================
@@ -1131,7 +1299,6 @@ async def ask_image(
             return attachment
         finally:
             await safe_delete(prompt)
-            # Keep image reply so attachment remains accessible.
 
 
 # =========================
@@ -1173,17 +1340,8 @@ async def run_setup_wizard(interaction: discord.Interaction):
             )
         )
 
-        data.title = await ask_text(
-            channel, user, embed_builder,
-            "Title",
-            "Send the ticket panel title."
-        )
-
-        data.description = await ask_text(
-            channel, user, embed_builder,
-            "Description",
-            "Send the ticket panel description."
-        )
+        data.title = await ask_text(channel, user, embed_builder, "Title", "Send the ticket panel title.")
+        data.description = await ask_text(channel, user, embed_builder, "Description", "Send the ticket panel description.")
 
         color_raw = await ask_text(
             channel, user, embed_builder,
@@ -1442,6 +1600,8 @@ class SetupConfirmView(discord.ui.View):
         if not interaction.guild:
             return
 
+        await safe_defer(interaction, ephemeral=True)
+
         data = self.data
         guild = interaction.guild
 
@@ -1456,7 +1616,8 @@ class SetupConfirmView(discord.ui.View):
 
         panel_channel = guild.get_channel(data.panel_channel_id)
         if not isinstance(panel_channel, discord.TextChannel):
-            await interaction.response.send_message(
+            await safe_component_reply(
+                interaction,
                 embed=base_embed(guild.id, "Publish Failed", "Panel channel is invalid.", error=True),
                 ephemeral=True
             )
@@ -1491,29 +1652,52 @@ class SetupConfirmView(discord.ui.View):
 
         bot.add_view(TicketPanelView(guild.id), message_id=panel_message.id)
 
-        await interaction.response.edit_message(
-            embed=base_embed(
-                guild.id,
-                "Setup Complete",
-                f"Ticket panel created in {panel_channel.mention}."
-            ),
-            view=None
+        try:
+            if interaction.message:
+                await interaction.message.edit(
+                    embed=base_embed(guild.id, "Setup Complete", f"Ticket panel created in {panel_channel.mention}."),
+                    view=None
+                )
+        except Exception:
+            pass
+
+        await safe_component_reply(
+            interaction,
+            embed=base_embed(guild.id, "Setup Complete", f"Ticket panel created in {panel_channel.mention}."),
+            ephemeral=True
         )
 
         cleanup_setup(guild.id, interaction.user.id)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
+        await safe_defer(interaction, ephemeral=True)
+
+        try:
+            if interaction.message:
+                await interaction.message.edit(
+                    embed=base_embed(
+                        interaction.guild.id if interaction.guild else None,
+                        "Setup Cancelled",
+                        "The setup was cancelled."
+                    ),
+                    view=None
+                )
+        except Exception:
+            pass
+
+        if interaction.guild:
+            cleanup_setup(interaction.guild.id, interaction.user.id)
+
+        await safe_component_reply(
+            interaction,
             embed=base_embed(
                 interaction.guild.id if interaction.guild else None,
                 "Setup Cancelled",
                 "The setup was cancelled."
             ),
-            view=None
+            ephemeral=True
         )
-        if interaction.guild:
-            cleanup_setup(interaction.guild.id, interaction.user.id)
 
 
 # =========================
@@ -1539,156 +1723,183 @@ class TicketDropdown(discord.ui.Select):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
 
+        # defer directly to stop Unknown interaction
+        await safe_defer(interaction, ephemeral=True)
+
         guild = interaction.guild
         opener = interaction.user
         config = get_guild_config(guild.id)
 
+        # refresh panel message so dropdown doesn't feel stuck
+        await refresh_panel_message(interaction.message, guild.id)
+
         if not config:
-            await interaction.response.send_message(
+            await safe_component_reply(
+                interaction,
                 embed=base_embed(guild.id, "Error", "Ticket system is not configured.", error=True),
                 ephemeral=True
             )
             return
 
-        existing = get_open_ticket_for_user(guild.id, opener.id)
-        if existing:
-            existing_channel = guild.get_channel(existing["channel_id"])
-            if existing_channel:
-                await interaction.response.send_message(
+        create_lock = get_ticket_create_lock(guild.id, opener.id)
+
+        async with create_lock:
+            existing = get_open_ticket_for_user(guild.id, opener.id)
+            if existing:
+                existing_channel = guild.get_channel(existing["channel_id"])
+                if existing_channel:
+                    await safe_component_reply(
+                        interaction,
+                        embed=base_embed(
+                            guild.id,
+                            "Open Ticket Found",
+                            f"You already have an open ticket: {existing_channel.mention}"
+                        ),
+                        ephemeral=True
+                    )
+                    return
+
+            try:
+                selected_index = int(self.values[0])
+            except Exception:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(guild.id, "Error", "Invalid selection.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            rows = get_ticket_options(guild.id)
+            selected = next((r for r in rows if r["option_index"] == selected_index), None)
+
+            if not selected:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            category = guild.get_channel(selected["category_id"])
+            if not isinstance(category, discord.CategoryChannel):
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(guild.id, "Error", "The configured category is invalid.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            support_role = guild.get_role(config["support_role_id"])
+            if not support_role:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(guild.id, "Error", "The support role is invalid.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            me = guild.me
+            if me is None:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(guild.id, "Error", "Bot member could not be resolved in this server.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            base_name = clean_channel_name(f"{selected['label']}-{opener.name}")
+            channel_name = base_name
+
+            existing_names = {c.name for c in guild.channels}
+            counter = 2
+            while channel_name in existing_names:
+                suffix = f"-{counter}"
+                channel_name = f"{base_name[:80-len(suffix)]}{suffix}"
+                counter += 1
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                opener: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True
+                ),
+                support_role: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True,
+                    manage_messages=True
+                ),
+                me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True,
+                    manage_channels=True,
+                    manage_messages=True
+                )
+            }
+
+            try:
+                ticket_channel = await guild.create_text_channel(
+                    name=channel_name,
+                    category=category,
+                    overwrites=overwrites,
+                    reason=f"Ticket created by {opener} ({opener.id})"
+                )
+            except discord.Forbidden:
+                await safe_component_reply(
+                    interaction,
                     embed=base_embed(
                         guild.id,
-                        "Open Ticket Found",
-                        f"You already have an open ticket: {existing_channel.mention}"
+                        "Error",
+                        "I do not have permission to create channels in that category.",
+                        error=True
+                    ),
+                    ephemeral=True
+                )
+                return
+            except discord.HTTPException as e:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(
+                        guild.id,
+                        "Error",
+                        f"Failed to create the ticket channel.\n`{e}`",
+                        error=True
                     ),
                     ephemeral=True
                 )
                 return
 
-        selected_index = int(self.values[0])
-        rows = get_ticket_options(guild.id)
-        selected = next((r for r in rows if r["option_index"] == selected_index), None)
+            await create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
 
-        if not selected:
-            await interaction.response.send_message(
-                embed=base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True),
+            await ticket_channel.send(
+                content=f"{support_role.mention} {opener.mention}",
+                embed=build_ticket_embed(guild.id, selected["label"], opener),
+                view=TicketControlsView()
+            )
+
+            await send_log(
+                guild,
+                "Ticket Opened",
+                (
+                    f"User: {opener.mention}\n"
+                    f"Channel: {ticket_channel.mention}\n"
+                    f"Type: {selected['label']}"
+                )
+            )
+
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(guild.id, "Ticket Created", f"Your ticket has been created: {ticket_channel.mention}"),
                 ephemeral=True
             )
-            return
-
-        category = guild.get_channel(selected["category_id"])
-        if not isinstance(category, discord.CategoryChannel):
-            await interaction.response.send_message(
-                embed=base_embed(guild.id, "Error", "The configured category is invalid.", error=True),
-                ephemeral=True
-            )
-            return
-
-        support_role = guild.get_role(config["support_role_id"])
-        if not support_role:
-            await interaction.response.send_message(
-                embed=base_embed(guild.id, "Error", "The support role is invalid.", error=True),
-                ephemeral=True
-            )
-            return
-
-        base_name = clean_channel_name(f"{selected['label']}-{opener.name}")
-        channel_name = base_name
-
-        existing_names = {c.name for c in guild.channels}
-        counter = 2
-        while channel_name in existing_names:
-            suffix = f"-{counter}"
-            channel_name = f"{base_name[:80-len(suffix)]}{suffix}"
-            counter += 1
-
-        me = guild.me
-        if me is None:
-            await interaction.response.send_message(
-                embed=base_embed(guild.id, "Error", "Bot member could not be resolved in this server.", error=True),
-                ephemeral=True
-            )
-            return
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            opener: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True
-            ),
-            support_role: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True,
-                manage_messages=True
-            ),
-            me: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True,
-                embed_links=True,
-                manage_channels=True,
-                manage_messages=True
-            )
-        }
-
-        try:
-            ticket_channel = await guild.create_text_channel(
-                name=channel_name,
-                category=category,
-                overwrites=overwrites,
-                reason=f"Ticket created by {opener} ({opener.id})"
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                embed=base_embed(
-                    guild.id,
-                    "Error",
-                    "I do not have permission to create channels in that category.",
-                    error=True
-                ),
-                ephemeral=True
-            )
-            return
-        except discord.HTTPException as e:
-            await interaction.response.send_message(
-                embed=base_embed(
-                    guild.id,
-                    "Error",
-                    f"Failed to create the ticket channel.\n`{e}`",
-                    error=True
-                ),
-                ephemeral=True
-            )
-            return
-
-        await create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
-
-        await ticket_channel.send(
-            content=f"{support_role.mention} {opener.mention}",
-            embed=build_ticket_embed(guild.id, selected["label"], opener),
-            view=TicketControlsView()
-        )
-
-        await send_log(
-            guild,
-            "Ticket Opened",
-            (
-                f"User: {opener.mention}\n"
-                f"Channel: {ticket_channel.mention}\n"
-                f"Type: {selected['label']}"
-            )
-        )
-
-        await interaction.response.send_message(
-            embed=base_embed(guild.id, "Ticket Created", f"Your ticket has been created: {ticket_channel.mention}"),
-            ephemeral=True
-        )
 
 
 class TicketPanelView(discord.ui.View):
@@ -1703,11 +1914,11 @@ class TicketPanelView(discord.ui.View):
 # TICKET BUTTONS
 # =========================
 class ClaimTicketButton(discord.ui.Button):
-    def __init__(self, disabled: bool = False):
+    def __init__(self, disabled: bool = False, *, closed_variant: bool = False):
         super().__init__(
             label="Claim Ticket",
             style=discord.ButtonStyle.secondary,
-            custom_id="ticket_claim_button",
+            custom_id="ticket_claim_button_closed" if closed_variant else "ticket_claim_button",
             disabled=disabled
         )
 
@@ -1718,151 +1929,65 @@ class ClaimTicketButton(discord.ui.Button):
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        if not is_support_or_admin(interaction.user, interaction.guild.id):
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can claim tickets.", error=True),
-                ephemeral=True
-            )
-            return
+        await safe_defer(interaction, ephemeral=True)
 
-        ticket = get_ticket_by_channel(interaction.channel.id)
-        if not ticket:
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
-                ephemeral=True
-            )
-            return
-
-        if ticket["status"] == "closed":
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Ticket Closed", "This ticket is already closed."),
-                ephemeral=True
-            )
-            return
-
-        if ticket["claimed_by"] == interaction.user.id:
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Already Claimed", "You already claimed this ticket."),
-                ephemeral=True
-            )
-            return
-
-        await set_ticket_claimed(interaction.channel.id, interaction.user.id)
-
-        await interaction.response.send_message(
-            embed=base_embed(interaction.guild.id, "Ticket Claimed", f"Ticket claimed by {interaction.user.mention}.")
-        )
-
-        await send_log(
-            interaction.guild,
-            "Ticket Claimed",
-            f"Channel: {interaction.channel.mention}\nClaimed by: {interaction.user.mention}"
-        )
-
-
-class CloseTicketButton(discord.ui.Button):
-    def __init__(self, disabled: bool = False):
-        super().__init__(
-            label="Close Ticket",
-            style=discord.ButtonStyle.danger,
-            custom_id="ticket_close_button",
-            disabled=disabled
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return
-
-        if not isinstance(interaction.channel, discord.TextChannel):
-            return
-
-        if not is_support_or_admin(interaction.user, interaction.guild.id):
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True),
-                ephemeral=True
-            )
-            return
-
-        ticket = get_ticket_by_channel(interaction.channel.id)
-        if not ticket:
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
-                ephemeral=True
-            )
-            return
-
-        if ticket["status"] == "closed":
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Already Closed", "This ticket is already closed."),
-                ephemeral=True
-            )
-            return
-
-        config = get_guild_config(interaction.guild.id)
-        support_role = interaction.guild.get_role(config["support_role_id"]) if config else None
-        opener_member = await try_fetch_member(interaction.guild, ticket["opener_id"])
-
-        try:
-            if opener_member:
-                await interaction.channel.set_permissions(
-                    opener_member,
-                    view_channel=False
-                )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
-                ephemeral=True
-            )
-            return
-
-        if support_role:
-            try:
-                await interaction.channel.set_permissions(
-                    support_role,
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    attach_files=True,
-                    embed_links=True,
-                    manage_messages=True
-                )
-            except discord.Forbidden:
-                await interaction.response.send_message(
-                    embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update support role permissions.", error=True),
+        lock = get_ticket_channel_lock(interaction.channel.id)
+        async with lock:
+            ticket = get_ticket_by_channel(interaction.channel.id)
+            if not ticket:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
                     ephemeral=True
                 )
                 return
 
-        await close_ticket_record(interaction.channel.id, interaction.user.id)
+            if ticket["status"] == "closed":
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Ticket Closed", "This ticket is already closed."),
+                    ephemeral=True
+                )
+                return
 
-        # Keep the original created-ticket message intact. Only change the buttons.
-        await interaction.response.edit_message(view=ClosedTicketControlsView())
+            if not is_support_or_admin(interaction.user, interaction.guild.id):
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can claim tickets.", error=True),
+                    ephemeral=True
+                )
+                return
 
-        # Send separate close message below.
-        await interaction.channel.send(
-            embed=build_closed_ticket_embed(interaction.guild.id, interaction.user)
-        )
+            if ticket["claimed_by"] == interaction.user.id:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Already Claimed", "You already claimed this ticket."),
+                    ephemeral=True
+                )
+                return
 
-        await dm_ticket_closed(
-            interaction.guild,
-            ticket["opener_id"],
-            interaction.user,
-            interaction.channel.name
-        )
+            await set_ticket_claimed(interaction.channel.id, interaction.user.id)
 
-        await send_log(
-            interaction.guild,
-            "Ticket Closed",
-            f"Channel: #{interaction.channel.name}\nClosed by: {interaction.user.mention}"
-        )
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(interaction.guild.id, "Ticket Claimed", f"Ticket claimed by {interaction.user.mention}."),
+                ephemeral=False
+            )
+
+            await send_log(
+                interaction.guild,
+                "Ticket Claimed",
+                f"Channel: {interaction.channel.mention}\nClaimed by: {interaction.user.mention}"
+            )
 
 
-class DeleteTicketButton(discord.ui.Button):
-    def __init__(self):
+class CloseTicketButton(discord.ui.Button):
+    def __init__(self, disabled: bool = False, *, closed_variant: bool = False):
         super().__init__(
-            label="Delete Ticket",
+            label="Close Ticket",
             style=discord.ButtonStyle.danger,
-            custom_id="ticket_delete_button"
+            custom_id="ticket_close_button_closed" if closed_variant else "ticket_close_button",
+            disabled=disabled
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1872,59 +1997,168 @@ class DeleteTicketButton(discord.ui.Button):
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        if not is_support_or_admin(interaction.user, interaction.guild.id):
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True),
+        await safe_defer(interaction, ephemeral=True)
+
+        lock = get_ticket_channel_lock(interaction.channel.id)
+        async with lock:
+            ticket = get_ticket_by_channel(interaction.channel.id)
+            if not ticket:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            if ticket["status"] == "closed":
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Already Closed", "This ticket is already closed."),
+                    ephemeral=True
+                )
+                return
+
+            if not is_support_or_admin(interaction.user, interaction.guild.id):
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            config = get_guild_config(interaction.guild.id)
+            support_role = interaction.guild.get_role(config["support_role_id"]) if config else None
+            opener_member = await try_fetch_member(interaction.guild, ticket["opener_id"])
+
+            try:
+                if opener_member:
+                    await interaction.channel.set_permissions(
+                        opener_member,
+                        view_channel=False
+                    )
+            except discord.Forbidden:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            if support_role:
+                try:
+                    await interaction.channel.set_permissions(
+                        support_role,
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        attach_files=True,
+                        embed_links=True,
+                        manage_messages=True
+                    )
+                except discord.Forbidden:
+                    await safe_component_reply(
+                        interaction,
+                        embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update support role permissions.", error=True),
+                        ephemeral=True
+                    )
+                    return
+
+            await close_ticket_record(interaction.channel.id, interaction.user.id)
+
+            try:
+                if interaction.message:
+                    await interaction.message.edit(view=ClosedTicketControlsView())
+            except Exception:
+                pass
+
+            await interaction.channel.send(
+                embed=build_closed_ticket_embed(interaction.guild.id, interaction.user)
+            )
+
+            await dm_ticket_closed(
+                interaction.guild,
+                ticket["opener_id"],
+                interaction.user,
+                interaction.channel.name
+            )
+
+            await send_log(
+                interaction.guild,
+                "Ticket Closed",
+                f"Channel: #{interaction.channel.name}\nClosed by: {interaction.user.mention}"
+            )
+
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(interaction.guild.id, "Ticket Closed", f"Ticket closed by {interaction.user.mention}."),
                 ephemeral=True
             )
-            return
 
-        ticket = get_ticket_by_channel(interaction.channel.id)
-        if not ticket:
-            await interaction.response.send_message(
-                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
-                ephemeral=True
-            )
-            return
 
-        await interaction.response.defer(ephemeral=False)
-
-        transcript_html = await build_transcript_html(interaction.channel)
-        transcript_bytes = transcript_html.encode("utf-8", errors="ignore")
-        transcript_file = discord.File(
-            io.BytesIO(transcript_bytes),
-            filename=f"transcript-{interaction.channel.name}.html"
+class DeleteTicketButton(discord.ui.Button):
+    def __init__(self, *, closed_variant: bool = False):
+        super().__init__(
+            label="Delete Ticket",
+            style=discord.ButtonStyle.danger,
+            custom_id="ticket_delete_button_closed" if closed_variant else "ticket_delete_button"
         )
 
-        opener_text = f"<@{ticket['opener_id']}>"
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
 
-        await send_log(
-            interaction.guild,
-            "Ticket Deleted",
-            (
-                f"Channel: #{interaction.channel.name}\n"
-                f"Opened by: {opener_text}\n"
-                f"Type: {ticket['option_label']}\n"
-                f"Deleted by: {interaction.user.mention}"
-            ),
-            file=transcript_file
-        )
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return
 
-        await delete_ticket_record(interaction.channel.id)
+        await safe_defer(interaction, ephemeral=False)
 
-        try:
-            await interaction.followup.send(
-                embed=base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted.")
+        lock = get_ticket_channel_lock(interaction.channel.id)
+        async with lock:
+            ticket = get_ticket_by_channel(interaction.channel.id)
+            if not ticket:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            if not is_support_or_admin(interaction.user, interaction.guild.id):
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            transcript_file = await build_transcript_zip(interaction.channel)
+            opener_text = f"<@{ticket['opener_id']}>"
+
+            await send_log(
+                interaction.guild,
+                "Ticket Deleted",
+                (
+                    f"Channel: #{interaction.channel.name}\n"
+                    f"Opened by: {opener_text}\n"
+                    f"Type: {ticket['option_label']}\n"
+                    f"Deleted by: {interaction.user.mention}"
+                ),
+                file=transcript_file
             )
-        except Exception:
-            pass
 
-        try:
-            await interaction.channel.delete(reason=f"Ticket deleted by {interaction.user}")
-        except discord.Forbidden:
-            pass
-        except Exception:
-            pass
+            await delete_ticket_record(interaction.channel.id)
+
+            try:
+                await interaction.followup.send(
+                    embed=base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted.")
+                )
+            except Exception:
+                pass
+
+            try:
+                await interaction.channel.delete(reason=f"Ticket deleted by {interaction.user}")
+            except Exception:
+                pass
 
 
 class TicketControlsView(discord.ui.View):
@@ -1938,9 +2172,9 @@ class TicketControlsView(discord.ui.View):
 class ClosedTicketControlsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(ClaimTicketButton(disabled=True))
-        self.add_item(CloseTicketButton(disabled=True))
-        self.add_item(DeleteTicketButton())
+        self.add_item(ClaimTicketButton(disabled=True, closed_variant=True))
+        self.add_item(CloseTicketButton(disabled=True, closed_variant=True))
+        self.add_item(DeleteTicketButton(closed_variant=True))
 
 
 # =========================
@@ -2208,7 +2442,7 @@ async def serverprofile_error(interaction: discord.Interaction, error: app_comma
 # =========================
 @bot.event
 async def on_ready():
-    init_db()
+    await init_db()
 
     try:
         synced = await bot.tree.sync()
@@ -2219,12 +2453,7 @@ async def on_ready():
     bot.add_view(TicketControlsView())
     bot.add_view(ClosedTicketControlsView())
 
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT guild_id, panel_message_id FROM guild_config")
-    rows = cur.fetchall()
-    conn.close()
-
+    rows = await asyncio.to_thread(get_all_panel_rows_sync)
     for row in rows:
         try:
             bot.add_view(TicketPanelView(row["guild_id"]), message_id=row["panel_message_id"])
