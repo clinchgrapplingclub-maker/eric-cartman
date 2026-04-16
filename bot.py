@@ -6,7 +6,6 @@ import io
 import logging
 import os
 import re
-import signal
 import zipfile
 from contextlib import suppress
 from dataclasses import dataclass
@@ -55,18 +54,16 @@ db_pool: Optional[asyncpg.Pool] = None
 
 db_init_lock = asyncio.Lock()
 active_setup_guilds: set[int] = set()
-active_setprofile_guilds: set[int] = set()
 
 ticket_channel_locks: dict[int, asyncio.Lock] = {}
 ticket_create_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
 setup_sessions: dict[tuple[int, int], "SetupData"] = {}
-setprofile_sessions: dict[tuple[int, int], "SetProfileData"] = {}
 
 guild_config_cache: dict[int, dict[str, Any]] = {}
 ticket_options_cache: dict[int, list[dict[str, Any]]] = {}
 
-http_timeout = aiohttp.ClientTimeout(total=60)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60)
 
 
 # =========================================================
@@ -124,24 +121,15 @@ class SetupData:
 
 
 @dataclass
-class SetProfileData:
-    guild_id: int
-    user_id: int
-    channel_id: int
-
-    display: Optional[str] = None
-    avatar_attachment: Optional[discord.Attachment] = None
-    banner_attachment: Optional[discord.Attachment] = None
+class ImageData:
+    filename: str
+    mime_type: str
+    raw: bytes
 
 
 def cleanup_setup(guild_id: int, user_id: int):
     active_setup_guilds.discard(guild_id)
     setup_sessions.pop((guild_id, user_id), None)
-
-
-def cleanup_setprofile(guild_id: int, user_id: int):
-    active_setprofile_guilds.discard(guild_id)
-    setprofile_sessions.pop((guild_id, user_id), None)
 
 
 # =========================================================
@@ -153,8 +141,6 @@ async def create_db_pool():
     if db_pool is not None:
         return
 
-    # statement_cache_size=0 is intentional to avoid PgBouncer prepared statement issues
-    # on hosted environments where a transaction pooler can sit in front of PostgreSQL.
     db_pool = await asyncpg.create_pool(
         dsn=DATABASE_URL,
         min_size=1,
@@ -532,10 +518,6 @@ def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
     return embed
 
 
-async def setprofile_embed(guild_id: int, title: str, description: str) -> discord.Embed:
-    return await base_embed(guild_id, title, description)
-
-
 async def build_ticket_embed(guild_id: int, option_label: str, opener: discord.Member) -> discord.Embed:
     config = await get_guild_config(guild_id)
     color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
@@ -702,23 +684,21 @@ async def safe_edit_original_response(
         return False
 
 
-async def refresh_panel_message(message: Optional[discord.Message], guild_id: int):
-    if not message:
-        return
-    try:
-        await message.edit(view=TicketPanelView(guild_id))
-    except Exception:
-        pass
-
-
 async def ensure_interaction_ack(interaction: discord.Interaction, *, ephemeral: bool = True):
-    """
-    Extremely defensive ack helper to reduce 'interaction failed'.
-    """
     if interaction.response.is_done():
         return
     with suppress(Exception):
         await interaction.response.defer(ephemeral=ephemeral, thinking=False)
+
+
+async def refresh_panel_message(message: Optional[discord.Message], guild_id: int):
+    if not message:
+        return
+    try:
+        view = await TicketPanelView.build(guild_id)
+        await message.edit(view=view)
+    except Exception:
+        pass
 
 
 async def dm_ticket_closed(
@@ -970,7 +950,7 @@ async def patch_guild_profile_with_retry(guild_id: int, payload: dict, max_attem
     }
     url = f"https://discord.com/api/v10/guilds/{guild_id}/members/@me"
 
-    async with aiohttp.ClientSession(timeout=http_timeout) as session:
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
         for attempt in range(max_attempts):
             try:
                 async with session.patch(url, json=payload, headers=headers) as resp:
@@ -1000,29 +980,21 @@ async def patch_guild_profile_with_retry(guild_id: int, payload: dict, max_attem
 async def set_guild_profile(
     guild_id: int,
     nickname: Optional[str] = None,
-    avatar_attachment: Optional[discord.Attachment] = None,
-    banner_attachment: Optional[discord.Attachment] = None
+    avatar_image: Optional[ImageData] = None,
+    banner_image: Optional[ImageData] = None
 ) -> tuple[bool, str]:
     payload = {}
 
     if nickname is not None:
         payload["nick"] = nickname
 
-    if avatar_attachment is not None:
-        if not is_image_attachment(avatar_attachment):
-            return False, "Avatar attachment must be an image."
-        raw = await avatar_attachment.read()
-        mime = avatar_attachment.content_type or "image/png"
-        b64 = base64.b64encode(raw).decode("utf-8")
-        payload["avatar"] = f"data:{mime};base64,{b64}"
+    if avatar_image is not None:
+        b64 = base64.b64encode(avatar_image.raw).decode("utf-8")
+        payload["avatar"] = f"data:{avatar_image.mime_type};base64,{b64}"
 
-    if banner_attachment is not None:
-        if not is_image_attachment(banner_attachment):
-            return False, "Banner attachment must be an image."
-        raw = await banner_attachment.read()
-        mime = banner_attachment.content_type or "image/png"
-        b64 = base64.b64encode(raw).decode("utf-8")
-        payload["banner"] = f"data:{mime};base64,{b64}"
+    if banner_image is not None:
+        b64 = base64.b64encode(banner_image.raw).decode("utf-8")
+        payload["banner"] = f"data:{banner_image.mime_type};base64,{b64}"
 
     if not payload:
         return False, "Nothing to update."
@@ -1084,7 +1056,7 @@ async def ask_image(
     embed_builder,
     title: str,
     description: str,
-) -> discord.Attachment:
+) -> ImageData:
     while True:
         prompt = await channel.send(embed=embed_builder(title, description))
         reply: Optional[discord.Message] = None
@@ -1110,7 +1082,12 @@ async def ask_image(
                 )
                 continue
 
-            return attachment
+            raw = await attachment.read()
+            return ImageData(
+                filename=attachment.filename,
+                mime_type=attachment.content_type or "image/png",
+                raw=raw
+            )
         finally:
             await safe_delete_message(prompt)
             if reply is not None:
@@ -1409,14 +1386,25 @@ async def run_setup_wizard(interaction: discord.Interaction):
             "Banner",
             "Reply with the banner image uploaded as an attachment."
         )
-        data.banner_url = banner_attachment.url
+        data.banner_url = None
 
         thumbnail_attachment = await ask_image(
             channel, user, embed_builder,
             "Server PFP / Small Picture",
             "Reply with the small picture image uploaded as an attachment."
         )
-        data.thumbnail_url = thumbnail_attachment.url
+        data.thumbnail_url = None
+
+        # Re-upload by sending temp message so URLs are stable
+        tmp_files = [
+            discord.File(io.BytesIO(banner_attachment.raw), filename=banner_attachment.filename),
+            discord.File(io.BytesIO(thumbnail_attachment.raw), filename=thumbnail_attachment.filename),
+        ]
+        temp_msg = await channel.send(files=tmp_files)
+
+        if len(temp_msg.attachments) >= 2:
+            data.banner_url = temp_msg.attachments[0].url
+            data.thumbnail_url = temp_msg.attachments[1].url
 
         await channel.send(
             embed=build_setup_preview_embed(guild, data),
@@ -1442,118 +1430,6 @@ async def run_setup_wizard(interaction: discord.Interaction):
             embed=await base_embed(guild.id, "Setup Failed", f"An error happened during setup:\n`{e}`", error=True)
         )
         cleanup_setup(guild.id, user.id)
-
-
-# =========================================================
-# SETPROFILE FLOW
-# =========================================================
-async def run_setprofile_wizard(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return
-
-    guild = interaction.guild
-    user = interaction.user
-    channel = interaction.channel
-
-    if not isinstance(channel, discord.TextChannel):
-        await interaction.followup.send(
-            embed=await base_embed(guild.id, "Set Profile Failed", "This command must be run in a text channel.", error=True),
-            ephemeral=True
-        )
-        return
-
-    data = SetProfileData(guild.id, user.id, channel.id)
-    setprofile_sessions[(guild.id, user.id)] = data
-    embed_builder = lambda t, d: asyncio.create_task(setprofile_embed(guild.id, t, d))
-
-    try:
-        await channel.send(
-            embed=await setprofile_embed(
-                guild.id,
-                "Set Profile Started",
-                "I will ask you 3 questions.\n\n"
-                "Reply in this channel.\n"
-                "Type `cancel` anytime to stop."
-            )
-        )
-
-        async def local_embed(title: str, description: str):
-            return await setprofile_embed(guild.id, title, description)
-
-        data.display = await ask_text(
-            channel, user, lambda t, d: asyncio.get_running_loop().run_until_complete(local_embed(t, d)),
-            "Display",
-            "Send the display name the bot should have in this server."
-        )
-    except RuntimeError:
-        # fallback because run_until_complete cannot be used inside running loop
-        pass
-
-    # Re-run in a clean way using sync builder wrapper
-    data = SetProfileData(guild.id, user.id, channel.id)
-    setprofile_sessions[(guild.id, user.id)] = data
-
-    def embed_builder_sync(title: str, description: str) -> discord.Embed:
-        # safe lightweight fallback; preserves same visuals
-        embed = discord.Embed(
-            title=title,
-            description=description,
-            color=discord.Color.green()
-        )
-        embed.set_footer(text="made by @fntsheetz")
-        return embed
-
-    try:
-        data.display = await ask_text(
-            channel, user, embed_builder_sync,
-            "Display",
-            "Send the display name the bot should have in this server."
-        )
-
-        data.avatar_attachment = await ask_image(
-            channel, user, embed_builder_sync,
-            "Profile Picture",
-            "Reply with the image that should be the bot's profile picture in this server."
-        )
-
-        data.banner_attachment = await ask_image(
-            channel, user, embed_builder_sync,
-            "Banner",
-            "Reply with the image that should be the bot's banner in this server."
-        )
-
-        success, message = await set_guild_profile(
-            guild_id=guild.id,
-            nickname=data.display,
-            avatar_attachment=data.avatar_attachment,
-            banner_attachment=data.banner_attachment
-        )
-
-        if success:
-            await channel.send(
-                embed=await setprofile_embed(
-                    guild.id,
-                    "Server Profile Updated",
-                    "The bot server profile was updated in this server."
-                )
-            )
-        else:
-            await channel.send(embed=await base_embed(guild.id, "Update Failed", message, error=True))
-
-        cleanup_setprofile(guild.id, user.id)
-
-    except SetupCancelled:
-        await channel.send(
-            embed=await setprofile_embed(guild.id, "Set Profile Cancelled", "The server profile update was cancelled.")
-        )
-        cleanup_setprofile(guild.id, user.id)
-
-    except Exception as e:
-        log.exception("Setprofile wizard failed in guild %s", guild.id)
-        await channel.send(
-            embed=await base_embed(guild.id, "Set Profile Failed", f"An error happened:\n`{e}`", error=True)
-        )
-        cleanup_setprofile(guild.id, user.id)
 
 
 # =========================================================
@@ -1618,7 +1494,7 @@ class SetupConfirmView(discord.ui.View):
                 embed.set_image(url=data.banner_url)
             embed.set_footer(text="made by @fntsheetz", icon_url=get_bot_guild_avatar_url(guild.id))
 
-            panel_view = TicketPanelView(guild.id)
+            panel_view = await TicketPanelView.build(guild.id)
             panel_message = await panel_channel.send(embed=embed, view=panel_view)
 
             await save_guild_config(
@@ -1634,7 +1510,7 @@ class SetupConfirmView(discord.ui.View):
                 log_channel_id=data.log_channel_id
             )
 
-            bot.add_view(TicketPanelView(guild.id), message_id=panel_message.id)
+            bot.add_view(await TicketPanelView.build(guild.id), message_id=panel_message.id)
 
             with suppress(Exception):
                 if interaction.message:
@@ -1893,12 +1769,6 @@ class TicketPanelView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=None)
         self.guild_id = guild_id
-
-    async def on_timeout(self):
-        pass
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return True
 
     @classmethod
     async def build(cls, guild_id: int) -> "TicketPanelView":
@@ -2198,10 +2068,15 @@ async def setup(interaction: discord.Interaction):
     await run_setup_wizard(interaction)
 
 
-@bot.tree.command(name="setprofile", description="Set the bot display, profile picture and banner for this server")
+@bot.tree.command(name="setprofile", description="Change the bot nickname, avatar and banner for this server")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def setprofile(interaction: discord.Interaction):
+async def setprofile(
+    interaction: discord.Interaction,
+    nickname: Optional[str] = None,
+    avatar: Optional[discord.Attachment] = None,
+    banner: Optional[discord.Attachment] = None,
+):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return
 
@@ -2212,21 +2087,77 @@ async def setprofile(interaction: discord.Interaction):
         )
         return
 
-    if interaction.guild.id in active_setprofile_guilds:
+    if avatar is not None and not is_image_attachment(avatar):
         await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id, "Set Profile Running", "A setprofile session is already running in this server."),
+            embed=await base_embed(None, "Update Failed", "Avatar attachment must be an image.", error=True),
             ephemeral=True
         )
         return
 
-    active_setprofile_guilds.add(interaction.guild.id)
+    if banner is not None and not is_image_attachment(banner):
+        await interaction.response.send_message(
+            embed=await base_embed(None, "Update Failed", "Banner attachment must be an image.", error=True),
+            ephemeral=True
+        )
+        return
 
-    await interaction.response.send_message(
-        embed=await base_embed(interaction.guild.id, "Set Profile Started", "The guided server profile setup has started in this channel."),
-        ephemeral=True
-    )
+    if nickname is None and avatar is None and banner is None:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id, "Update Failed", "You need to provide at least one value to update.", error=True),
+            ephemeral=True
+        )
+        return
 
-    await run_setprofile_wizard(interaction)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    avatar_image = None
+    banner_image = None
+
+    try:
+        if avatar is not None:
+            avatar_raw = await avatar.read()
+            avatar_image = ImageData(
+                filename=avatar.filename,
+                mime_type=avatar.content_type or "image/png",
+                raw=avatar_raw
+            )
+
+        if banner is not None:
+            banner_raw = await banner.read()
+            banner_image = ImageData(
+                filename=banner.filename,
+                mime_type=banner.content_type or "image/png",
+                raw=banner_raw
+            )
+
+        success, message = await set_guild_profile(
+            guild_id=interaction.guild.id,
+            nickname=nickname,
+            avatar_image=avatar_image,
+            banner_image=banner_image
+        )
+
+        if success:
+            await interaction.followup.send(
+                embed=await base_embed(
+                    interaction.guild.id,
+                    "Server Profile Updated",
+                    "The bot profile was updated for this server."
+                ),
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                embed=await base_embed(interaction.guild.id, "Update Failed", message, error=True),
+                ephemeral=True
+            )
+
+    except Exception as e:
+        log.exception("Setprofile command failed in guild %s", interaction.guild.id)
+        await interaction.followup.send(
+            embed=await base_embed(interaction.guild.id, "Update Failed", f"An error happened:\n`{e}`", error=True),
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name="remind", description="DM a user to reply in their ticket")
@@ -2302,50 +2233,6 @@ async def remind(interaction: discord.Interaction, user: discord.Member, message
     )
 
 
-@bot.tree.command(name="serverprofile", description="Change the bot nickname and avatar for this server")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def serverprofile(
-    interaction: discord.Interaction,
-    nickname: Optional[str] = None,
-    avatar: Optional[discord.Attachment] = None,
-):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return
-
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            embed=await base_embed(None, "Access Denied", "Only users with Administrator can use this command.", error=True),
-            ephemeral=True
-        )
-        return
-
-    if avatar is not None and not is_image_attachment(avatar):
-        await interaction.response.send_message(
-            embed=await base_embed(None, "Update Failed", "Avatar attachment must be an image.", error=True),
-            ephemeral=True
-        )
-        return
-
-    success, message = await set_guild_profile(
-        guild_id=interaction.guild.id,
-        nickname=nickname,
-        avatar_attachment=avatar,
-        banner_attachment=None
-    )
-
-    if success:
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id, "Server Profile Updated", "The bot profile was updated for this server."),
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id, "Update Failed", message, error=True),
-            ephemeral=True
-        )
-
-
 # =========================================================
 # COMMAND ERROR HANDLERS
 # =========================================================
@@ -2361,28 +2248,31 @@ async def setup_error(interaction: discord.Interaction, error: app_commands.AppC
         error=True
     )
 
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
 
 
 @setprofile.error
 async def setprofile_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if interaction.guild:
-        cleanup_setprofile(interaction.guild.id, interaction.user.id)
-
     embed = await base_embed(
         interaction.guild.id if interaction.guild else None,
-        "Set Profile Failed",
+        "Update Failed",
         f"{error}",
         error=True
     )
 
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
 
 
 @remind.error
@@ -2394,25 +2284,13 @@ async def remind_error(interaction: discord.Interaction, error: app_commands.App
         error=True
     )
 
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@serverprofile.error
-async def serverprofile_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    embed = await base_embed(
-        interaction.guild.id if interaction.guild else None,
-        "Update Failed",
-        f"{error}",
-        error=True
-    )
-
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -2455,7 +2333,20 @@ async def on_guild_remove(guild: discord.Guild):
     guild_config_cache.pop(guild.id, None)
     ticket_options_cache.pop(guild.id, None)
     active_setup_guilds.discard(guild.id)
-    active_setprofile_guilds.discard(guild.id)
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        ticket = await get_ticket_by_channel(channel.id)
+        if ticket:
+            await delete_ticket_record(channel.id)
+            ticket_channel_locks.pop(channel.id, None)
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -2469,24 +2360,12 @@ async def close_resources():
         log.info("Postgres pool closed.")
 
 
-def install_signal_handlers():
-    loop = asyncio.get_event_loop()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with suppress(NotImplementedError):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(close_resources()))
-
-
 # =========================================================
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    install_signal_handlers()
     try:
         bot.run(TOKEN, log_handler=None)
     finally:
-        # best effort final cleanup
         with suppress(Exception):
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(close_resources())
-            loop.close()
+            asyncio.run(close_resources())
