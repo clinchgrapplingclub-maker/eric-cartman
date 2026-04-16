@@ -9,7 +9,7 @@ import re
 import zipfile
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 import asyncpg
@@ -51,6 +51,7 @@ SKIP_WORDS = {"skip", "none", "no", "-"}
 CANCEL_WORDS = {"cancel", "stop", "abort", "exit"}
 
 db_pool: Optional[asyncpg.Pool] = None
+ban_expiry_task: Optional[asyncio.Task] = None
 
 db_init_lock = asyncio.Lock()
 active_setup_guilds: set[int] = set()
@@ -201,6 +202,22 @@ async def init_db():
             """)
 
             await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ticket_bans (
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    reason TEXT NOT NULL,
+                    duration_text TEXT NOT NULL,
+                    banned_by BIGINT NOT NULL,
+                    banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    unbanned_by BIGINT,
+                    unbanned_at TIMESTAMPTZ,
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
+
+            await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tickets_guild_opener_status
                 ON tickets(guild_id, opener_id, status)
             """)
@@ -218,6 +235,11 @@ async def init_db():
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_ticket_options_guild
                 ON ticket_options(guild_id)
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ticket_bans_active_expires
+                ON ticket_bans(active, expires_at)
             """)
 
         log.info("Database initialized.")
@@ -405,6 +427,77 @@ async def get_all_panel_rows() -> list[dict[str, Any]]:
     """)
 
 
+async def get_active_ticket_ban(guild_id: int, user_id: int) -> Optional[dict[str, Any]]:
+    row = await db_fetchrow("""
+        SELECT guild_id, user_id, reason, duration_text, banned_by, banned_at,
+               expires_at, active, unbanned_by, unbanned_at
+        FROM ticket_bans
+        WHERE guild_id = $1
+          AND user_id = $2
+          AND active = TRUE
+    """, guild_id, user_id)
+
+    if not row:
+        return None
+
+    expires_at = row.get("expires_at")
+    if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+        await deactivate_ticket_ban(guild_id, user_id, None)
+        return None
+
+    return row
+
+
+async def upsert_ticket_ban(
+    guild_id: int,
+    user_id: int,
+    reason: str,
+    duration_text: str,
+    banned_by: int,
+    expires_at: Optional[datetime]
+):
+    await db_execute("""
+        INSERT INTO ticket_bans (
+            guild_id, user_id, reason, duration_text, banned_by, banned_at,
+            expires_at, active, unbanned_by, unbanned_at
+        )
+        VALUES ($1,$2,$3,$4,$5,NOW(),$6,TRUE,NULL,NULL)
+        ON CONFLICT (guild_id, user_id)
+        DO UPDATE SET
+            reason = EXCLUDED.reason,
+            duration_text = EXCLUDED.duration_text,
+            banned_by = EXCLUDED.banned_by,
+            banned_at = NOW(),
+            expires_at = EXCLUDED.expires_at,
+            active = TRUE,
+            unbanned_by = NULL,
+            unbanned_at = NULL
+    """, guild_id, user_id, reason, duration_text, banned_by, expires_at)
+
+
+async def deactivate_ticket_ban(guild_id: int, user_id: int, unbanned_by: Optional[int]):
+    await db_execute("""
+        UPDATE ticket_bans
+        SET active = FALSE,
+            unbanned_by = $3,
+            unbanned_at = NOW()
+        WHERE guild_id = $1
+          AND user_id = $2
+          AND active = TRUE
+    """, guild_id, user_id, unbanned_by)
+
+
+async def get_expired_ticket_bans() -> list[dict[str, Any]]:
+    return await db_fetch("""
+        SELECT guild_id, user_id, reason, duration_text, banned_by, banned_at,
+               expires_at, active, unbanned_by, unbanned_at
+        FROM ticket_bans
+        WHERE active = TRUE
+          AND expires_at IS NOT NULL
+          AND expires_at <= NOW()
+    """)
+
+
 # =========================================================
 # GENERAL HELPERS
 # =========================================================
@@ -440,6 +533,41 @@ def is_image_attachment(att: discord.Attachment) -> bool:
         return True
     filename = att.filename.lower()
     return filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+
+
+def format_ts(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def format_ban_expiry(expires_at: Optional[datetime]) -> str:
+    if expires_at is None:
+        return "Permanent"
+    return format_ts(expires_at)
+
+
+def parse_duration_to_expiry(duration_text: str) -> tuple[Optional[datetime], str]:
+    clean = duration_text.strip().lower()
+
+    if clean in {"perm", "permanent", "forever"}:
+        return None, "perm"
+
+    match = re.fullmatch(r"(\d+)\s*(min|m|h|d)", clean)
+    if not match:
+        raise ValueError("Invalid duration format. Use 1min, 5m, 1h, 1d or perm.")
+
+    value = int(match.group(1))
+    unit = match.group(2)
+
+    now = datetime.now(timezone.utc)
+
+    if unit in {"min", "m"}:
+        return now + timedelta(minutes=value), f"{value}min"
+    if unit == "h":
+        return now + timedelta(hours=value), f"{value}h"
+    if unit == "d":
+        return now + timedelta(days=value), f"{value}d"
+
+    raise ValueError("Invalid duration format.")
 
 
 async def try_fetch_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
@@ -482,8 +610,13 @@ def get_bot_guild_avatar_url(guild_id: Optional[int]) -> Optional[str]:
     return bot.user.display_avatar.url
 
 
-def format_ts(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+async def apply_footer(embed: discord.Embed, guild_id: Optional[int]) -> discord.Embed:
+    icon_url = get_bot_guild_avatar_url(guild_id)
+    if icon_url:
+        embed.set_footer(text="made by @fntsheetz", icon_url=icon_url)
+    else:
+        embed.set_footer(text="made by @fntsheetz")
+    return embed
 
 
 async def resolve_color_for_guild(guild_id: Optional[int], *, error: bool = False) -> discord.Color:
@@ -509,8 +642,7 @@ async def base_embed(
 ) -> discord.Embed:
     color = await resolve_color_for_guild(guild_id, error=error)
     embed = discord.Embed(title=title, description=description, color=color)
-    embed.set_footer(text="made by @fntsheetz")
-    return embed
+    return await apply_footer(embed, guild_id)
 
 
 def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
@@ -519,7 +651,11 @@ def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
         description=description,
         color=hex_to_color(data.color_hex if data.color_hex else "#00FF66")
     )
-    embed.set_footer(text="made by @fntsheetz")
+    icon_url = get_bot_guild_avatar_url(data.guild_id)
+    if icon_url:
+        embed.set_footer(text="made by @fntsheetz", icon_url=icon_url)
+    else:
+        embed.set_footer(text="made by @fntsheetz")
     return embed
 
 
@@ -536,8 +672,7 @@ async def build_ticket_embed(guild_id: int, option_label: str, opener: discord.M
         ),
         color=color
     )
-    embed.set_footer(text="made by @fntsheetz")
-    return embed
+    return await apply_footer(embed, guild_id)
 
 
 async def build_closed_ticket_embed(guild_id: int, closed_by: discord.Member) -> discord.Embed:
@@ -549,8 +684,7 @@ async def build_closed_ticket_embed(guild_id: int, closed_by: discord.Member) ->
         description=f"Ticket closed by {closed_by.mention}.",
         color=color
     )
-    embed.set_footer(text="made by @fntsheetz")
-    return embed
+    return await apply_footer(embed, guild_id)
 
 
 def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.Embed:
@@ -591,7 +725,11 @@ def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.
         inline=False
     )
 
-    embed.set_footer(text="made by @fntsheetz")
+    icon_url = get_bot_guild_avatar_url(data.guild_id)
+    if icon_url:
+        embed.set_footer(text="made by @fntsheetz", icon_url=icon_url)
+    else:
+        embed.set_footer(text="made by @fntsheetz")
     return embed
 
 
@@ -681,9 +819,24 @@ async def safe_ephemeral_edit_or_followup(
         pass
 
 
-async def refresh_panel_message(message: Optional[discord.Message], guild_id: int):
-    if not message:
+async def refresh_guild_panel(guild_id: int):
+    config = await get_guild_config(guild_id)
+    if not config:
         return
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+
+    channel = guild.get_channel(config["panel_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        message = await channel.fetch_message(config["panel_message_id"])
+    except Exception:
+        return
+
     try:
         view = await TicketPanelView.build(guild_id)
         await message.edit(view=view)
@@ -713,7 +866,71 @@ async def dm_ticket_closed(
         ),
         color=color
     )
-    embed.set_footer(text="made by @fntsheetz")
+    embed = await apply_footer(embed, guild.id)
+
+    with suppress(Exception):
+        await user.send(embed=embed)
+
+
+async def dm_ticket_banned(
+    guild: discord.Guild,
+    user_id: int,
+    duration_text: str,
+    reason: str,
+    expires_at: Optional[datetime]
+):
+    user = await try_fetch_user(user_id)
+    if not user:
+        return
+
+    config = await get_guild_config(guild.id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    embed = discord.Embed(
+        title="Ticket Banned",
+        description=(
+            f"You have been banned from opening tickets in **{guild.name}**.\n\n"
+            f"Duration: {duration_text}\n"
+            f"Expires: {format_ban_expiry(expires_at)}\n"
+            f"Reason: {reason}"
+        ),
+        color=color
+    )
+    embed = await apply_footer(embed, guild.id)
+
+    with suppress(Exception):
+        await user.send(embed=embed)
+
+
+async def dm_ticket_unbanned(
+    guild: discord.Guild,
+    user_id: int,
+    *,
+    automatic: bool
+):
+    user = await try_fetch_user(user_id)
+    if not user:
+        return
+
+    config = await get_guild_config(guild.id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    description = (
+        f"You have been unbanned from opening tickets in **{guild.name}**.\n\n"
+        f"You can open tickets again."
+    )
+    if automatic:
+        description = (
+            f"Your ticket ban in **{guild.name}** has expired.\n\n"
+            f"You can open tickets again."
+        )
+
+    embed = discord.Embed(
+        title="Ticket Unbanned",
+        description=description,
+        color=color
+    )
+    embed = await apply_footer(embed, guild.id)
 
     with suppress(Exception):
         await user.send(embed=embed)
@@ -1477,7 +1694,7 @@ class SetupConfirmView(discord.ui.View):
                 embed.set_image(url=f"attachment://{banner_name}")
                 files.append(discord.File(io.BytesIO(data.banner_image.raw), filename=banner_name))
 
-            embed.set_footer(text="made by @fntsheetz", icon_url=get_bot_guild_avatar_url(guild.id))
+            embed = await apply_footer(embed, guild.id)
 
             panel_view = await TicketPanelView.build(guild.id)
             panel_message = await panel_channel.send(embed=embed, files=files, view=panel_view)
@@ -1594,6 +1811,26 @@ class TicketDropdown(discord.ui.Select):
             await safe_component_reply(
                 interaction,
                 embed=await base_embed(guild.id, "Error", "Ticket system is not configured.", error=True),
+                ephemeral=True
+            )
+            return
+
+        existing_ban = await get_active_ticket_ban(guild.id, opener.id)
+        if existing_ban:
+            expires_at = existing_ban.get("expires_at")
+            await safe_component_reply(
+                interaction,
+                embed=await base_embed(
+                    guild.id,
+                    "Ticket Banned",
+                    (
+                        f"You are banned from opening tickets in this server.\n\n"
+                        f"Duration: {existing_ban['duration_text']}\n"
+                        f"Expires: {format_ban_expiry(expires_at)}\n"
+                        f"Reason: {existing_ban['reason']}"
+                    ),
+                    error=True
+                ),
                 ephemeral=True
             )
             return
@@ -1745,6 +1982,8 @@ class TicketDropdown(discord.ui.Select):
                     embed=ticket_embed,
                     view=ticket_view
                 )
+
+                await refresh_guild_panel(guild.id)
 
                 await send_log(
                     guild,
@@ -1946,6 +2185,8 @@ class CloseTicketButton(discord.ui.Button):
                 interaction.channel.name
             )
 
+            await refresh_guild_panel(interaction.guild.id)
+
             await send_log(
                 interaction.guild,
                 "Ticket Closed",
@@ -2009,6 +2250,8 @@ class DeleteTicketButton(discord.ui.Button):
 
             await delete_ticket_record(interaction.channel.id)
 
+            await refresh_guild_panel(interaction.guild.id)
+
             with suppress(Exception):
                 await interaction.followup.send(
                     embed=await base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted."),
@@ -2033,6 +2276,37 @@ class ClosedTicketControlsView(discord.ui.View):
         self.add_item(ClaimTicketButton(disabled=True, closed_variant=True))
         self.add_item(CloseTicketButton(disabled=True, closed_variant=True))
         self.add_item(DeleteTicketButton(closed_variant=True))
+
+
+# =========================================================
+# BACKGROUND TASKS
+# =========================================================
+async def ticket_ban_expiry_loop():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            expired = await get_expired_ticket_bans()
+
+            for row in expired:
+                guild_id = row["guild_id"]
+                user_id = row["user_id"]
+
+                await deactivate_ticket_ban(guild_id, user_id, None)
+
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    await dm_ticket_unbanned(guild, user_id, automatic=True)
+                    await send_log(
+                        guild,
+                        "Ticket Ban Expired",
+                        f"User: <@{user_id}>\nBan expired automatically."
+                    )
+
+        except Exception as e:
+            log.exception("Ticket ban expiry loop failed: %s", e)
+
+        await asyncio.sleep(30)
 
 
 # =========================================================
@@ -2210,7 +2484,7 @@ async def remind(interaction: discord.Interaction, user: discord.Member, message
         ),
         color=hex_to_color(config["color_hex"]) if config else discord.Color.green()
     )
-    dm_embed.set_footer(text="made by @fntsheetz")
+    dm_embed = await apply_footer(dm_embed, interaction.guild.id)
 
     try:
         await user.send(embed=dm_embed)
@@ -2235,6 +2509,110 @@ async def remind(interaction: discord.Interaction, user: discord.Member, message
             f"By: {interaction.user.mention}\n"
             f"Message: {message}"
         )
+    )
+
+
+@bot.tree.command(name="ticketban", description="Ban a user from opening tickets")
+@app_commands.guild_only()
+async def ticketban(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    duration: str,
+    reason: str
+):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    if not await is_support_or_admin(interaction.user, interaction.guild.id):
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    try:
+        expires_at, normalized_duration = parse_duration_to_expiry(duration)
+    except ValueError as e:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id, "Invalid Duration", str(e), error=True),
+            ephemeral=True
+        )
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    await upsert_ticket_ban(
+        guild_id=interaction.guild.id,
+        user_id=user.id,
+        reason=reason,
+        duration_text=normalized_duration,
+        banned_by=interaction.user.id,
+        expires_at=expires_at
+    )
+
+    await dm_ticket_banned(interaction.guild, user.id, normalized_duration, reason, expires_at)
+
+    await send_log(
+        interaction.guild,
+        "Ticket Banned",
+        (
+            f"User: {user.mention}\n"
+            f"By: {interaction.user.mention}\n"
+            f"Duration: {normalized_duration}\n"
+            f"Expires: {format_ban_expiry(expires_at)}\n"
+            f"Reason: {reason}"
+        )
+    )
+
+    await interaction.followup.send(
+        embed=await base_embed(
+            interaction.guild.id,
+            "Ticket Banned",
+            f"{user.mention} has been banned from opening tickets.\n\nDuration: {normalized_duration}\nReason: {reason}"
+        ),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="ticketunban", description="Unban a user from opening tickets")
+@app_commands.guild_only()
+async def ticketunban(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    if not await is_support_or_admin(interaction.user, interaction.guild.id):
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    active_ban = await get_active_ticket_ban(interaction.guild.id, user.id)
+    if not active_ban:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id, "No Active Ban", f"{user.mention} is not currently ticket banned.", error=True),
+            ephemeral=True
+        )
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    await deactivate_ticket_ban(interaction.guild.id, user.id, interaction.user.id)
+    await dm_ticket_unbanned(interaction.guild, user.id, automatic=False)
+
+    await send_log(
+        interaction.guild,
+        "Ticket Unbanned",
+        f"User: {user.mention}\nBy: {interaction.user.mention}"
+    )
+
+    await interaction.followup.send(
+        embed=await base_embed(
+            interaction.guild.id,
+            "Ticket Unbanned",
+            f"{user.mention} has been unbanned from opening tickets."
+        ),
+        ephemeral=True
     )
 
 
@@ -2298,6 +2676,42 @@ async def remind_error(interaction: discord.Interaction, error: app_commands.App
         pass
 
 
+@ticketban.error
+async def ticketban_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(
+        interaction.guild.id if interaction.guild else None,
+        "Ticket Ban Failed",
+        f"{error}",
+        error=True
+    )
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+@ticketunban.error
+async def ticketunban_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(
+        interaction.guild.id if interaction.guild else None,
+        "Ticket Unban Failed",
+        f"{error}",
+        error=True
+    )
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
 # =========================================================
 # VIEW RESTORATION
 # =========================================================
@@ -2319,6 +2733,8 @@ async def restore_persistent_views():
 # =========================================================
 @bot.event
 async def on_ready():
+    global ban_expiry_task
+
     await init_db()
 
     try:
@@ -2328,6 +2744,9 @@ async def on_ready():
         log.warning("Command sync failed: %s", e)
 
     await restore_persistent_views()
+
+    if ban_expiry_task is None or ban_expiry_task.done():
+        ban_expiry_task = asyncio.create_task(ticket_ban_expiry_loop())
 
     if bot.user:
         log.info("Logged in as %s (%s)", bot.user, bot.user.id)
@@ -2358,7 +2777,14 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
 # CLEAN SHUTDOWN
 # =========================================================
 async def close_resources():
-    global db_pool
+    global db_pool, ban_expiry_task
+
+    if ban_expiry_task is not None:
+        ban_expiry_task.cancel()
+        with suppress(Exception):
+            await ban_expiry_task
+        ban_expiry_task = None
+
     if db_pool is not None:
         await db_pool.close()
         db_pool = None
