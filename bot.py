@@ -1704,205 +1704,197 @@ class SetupConfirmView(discord.ui.View):
 # PANEL VIEW
 # =========================
 class TicketDropdown(discord.ui.Select):
-    def __init__(self, guild_id: int):
-        rows = get_ticket_options(guild_id)
-        options = [
-            discord.SelectOption(label=row["label"][:100], value=str(row["option_index"]))
-            for row in rows
-        ]
+  async def callback(self, interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
 
-        super().__init__(
-            placeholder="Make a selection",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id=f"ticket_dropdown:{guild_id}"
+    guild = interaction.guild
+    opener = interaction.user
+    config = get_guild_config(guild.id)
+
+    if not config:
+        await safe_component_reply(
+            interaction,
+            embed=base_embed(guild.id, "Error", "Ticket system is not configured.", error=True),
+            ephemeral=True
         )
+        return
 
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                embed=base_embed(guild.id, "Creating Ticket", "Your ticket is being created..."),
+                ephemeral=True
+            )
+    except Exception:
+        pass
 
-        # defer directly to stop Unknown interaction
-        await safe_defer(interaction, ephemeral=True)
+    await refresh_panel_message(interaction.message, guild.id)
 
-        guild = interaction.guild
-        opener = interaction.user
-        config = get_guild_config(guild.id)
+    create_lock = get_ticket_create_lock(guild.id, opener.id)
 
-        # refresh panel message so dropdown doesn't feel stuck
-        await refresh_panel_message(interaction.message, guild.id)
+    async with create_lock:
+        existing = get_open_ticket_for_user(guild.id, opener.id)
+        if existing:
+            existing_channel = guild.get_channel(existing["channel_id"])
+            if existing_channel:
+                await safe_component_reply(
+                    interaction,
+                    embed=base_embed(
+                        guild.id,
+                        "Open Ticket Found",
+                        f"You already have an open ticket: {existing_channel.mention}"
+                    ),
+                    ephemeral=True
+                )
+                return
 
-        if not config:
+        try:
+            selected_index = int(self.values[0])
+        except Exception:
             await safe_component_reply(
                 interaction,
-                embed=base_embed(guild.id, "Error", "Ticket system is not configured.", error=True),
+                embed=base_embed(guild.id, "Error", "Invalid selection.", error=True),
                 ephemeral=True
             )
             return
 
-        create_lock = get_ticket_create_lock(guild.id, opener.id)
+        rows = get_ticket_options(guild.id)
+        selected = next((r for r in rows if r["option_index"] == selected_index), None)
 
-        async with create_lock:
-            existing = get_open_ticket_for_user(guild.id, opener.id)
-            if existing:
-                existing_channel = guild.get_channel(existing["channel_id"])
-                if existing_channel:
-                    await safe_component_reply(
-                        interaction,
-                        embed=base_embed(
-                            guild.id,
-                            "Open Ticket Found",
-                            f"You already have an open ticket: {existing_channel.mention}"
-                        ),
-                        ephemeral=True
-                    )
-                    return
-
-            try:
-                selected_index = int(self.values[0])
-            except Exception:
-                await safe_component_reply(
-                    interaction,
-                    embed=base_embed(guild.id, "Error", "Invalid selection.", error=True),
-                    ephemeral=True
-                )
-                return
-
-            rows = get_ticket_options(guild.id)
-            selected = next((r for r in rows if r["option_index"] == selected_index), None)
-
-            if not selected:
-                await safe_component_reply(
-                    interaction,
-                    embed=base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True),
-                    ephemeral=True
-                )
-                return
-
-            category = guild.get_channel(selected["category_id"])
-            if not isinstance(category, discord.CategoryChannel):
-                await safe_component_reply(
-                    interaction,
-                    embed=base_embed(guild.id, "Error", "The configured category is invalid.", error=True),
-                    ephemeral=True
-                )
-                return
-
-            support_role = guild.get_role(config["support_role_id"])
-            if not support_role:
-                await safe_component_reply(
-                    interaction,
-                    embed=base_embed(guild.id, "Error", "The support role is invalid.", error=True),
-                    ephemeral=True
-                )
-                return
-
-            me = guild.me
-            if me is None:
-                await safe_component_reply(
-                    interaction,
-                    embed=base_embed(guild.id, "Error", "Bot member could not be resolved in this server.", error=True),
-                    ephemeral=True
-                )
-                return
-
-            base_name = clean_channel_name(f"{selected['label']}-{opener.name}")
-            channel_name = base_name
-
-            existing_names = {c.name for c in guild.channels}
-            counter = 2
-            while channel_name in existing_names:
-                suffix = f"-{counter}"
-                channel_name = f"{base_name[:80-len(suffix)]}{suffix}"
-                counter += 1
-
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                opener: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    attach_files=True,
-                    embed_links=True
-                ),
-                support_role: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    attach_files=True,
-                    embed_links=True,
-                    manage_messages=True
-                ),
-                me: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    attach_files=True,
-                    embed_links=True,
-                    manage_channels=True,
-                    manage_messages=True
-                )
-            }
-
-            try:
-                ticket_channel = await guild.create_text_channel(
-                    name=channel_name,
-                    category=category,
-                    overwrites=overwrites,
-                    reason=f"Ticket created by {opener} ({opener.id})"
-                )
-            except discord.Forbidden:
-                await safe_component_reply(
-                    interaction,
-                    embed=base_embed(
-                        guild.id,
-                        "Error",
-                        "I do not have permission to create channels in that category.",
-                        error=True
-                    ),
-                    ephemeral=True
-                )
-                return
-            except discord.HTTPException as e:
-                await safe_component_reply(
-                    interaction,
-                    embed=base_embed(
-                        guild.id,
-                        "Error",
-                        f"Failed to create the ticket channel.\n`{e}`",
-                        error=True
-                    ),
-                    ephemeral=True
-                )
-                return
-
-            await create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
-
-            await ticket_channel.send(
-                content=f"{support_role.mention} {opener.mention}",
-                embed=build_ticket_embed(guild.id, selected["label"], opener),
-                view=TicketControlsView()
+        if not selected:
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True),
+                ephemeral=True
             )
+            return
 
-            await send_log(
-                guild,
-                "Ticket Opened",
-                (
-                    f"User: {opener.mention}\n"
-                    f"Channel: {ticket_channel.mention}\n"
-                    f"Type: {selected['label']}"
-                )
+        category = guild.get_channel(selected["category_id"])
+        if not isinstance(category, discord.CategoryChannel):
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(guild.id, "Error", "The configured category is invalid.", error=True),
+                ephemeral=True
             )
+            return
 
+        support_role = guild.get_role(config["support_role_id"])
+        if not support_role:
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(guild.id, "Error", "The support role is invalid.", error=True),
+                ephemeral=True
+            )
+            return
+
+        me = guild.me
+        if me is None:
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(guild.id, "Error", "Bot member could not be resolved in this server.", error=True),
+                ephemeral=True
+            )
+            return
+
+        base_name = clean_channel_name(f"{selected['label']}-{opener.name}")
+        channel_name = base_name
+
+        existing_names = {c.name for c in guild.channels}
+        counter = 2
+        while channel_name in existing_names:
+            suffix = f"-{counter}"
+            channel_name = f"{base_name[:80-len(suffix)]}{suffix}"
+            counter += 1
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            opener: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True
+            ),
+            support_role: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                manage_messages=True
+            ),
+            me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                manage_channels=True,
+                manage_messages=True
+            )
+        }
+
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Ticket created by {opener} ({opener.id})"
+            )
+        except discord.Forbidden:
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(
+                    guild.id,
+                    "Error",
+                    "I do not have permission to create channels in that category.",
+                    error=True
+                ),
+                ephemeral=True
+            )
+            return
+        except discord.HTTPException as e:
+            await safe_component_reply(
+                interaction,
+                embed=base_embed(
+                    guild.id,
+                    "Error",
+                    f"Failed to create the ticket channel.\n`{e}`",
+                    error=True
+                ),
+                ephemeral=True
+            )
+            return
+
+        await create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
+
+        await ticket_channel.send(
+            content=f"{support_role.mention} {opener.mention}",
+            embed=build_ticket_embed(guild.id, selected["label"], opener),
+            view=TicketControlsView()
+        )
+
+        await send_log(
+            guild,
+            "Ticket Opened",
+            (
+                f"User: {opener.mention}\n"
+                f"Channel: {ticket_channel.mention}\n"
+                f"Type: {selected['label']}"
+            )
+        )
+
+        try:
+            await interaction.edit_original_response(
+                embed=base_embed(guild.id, "Ticket Created", f"Your ticket has been created: {ticket_channel.mention}")
+            )
+        except Exception:
             await safe_component_reply(
                 interaction,
                 embed=base_embed(guild.id, "Ticket Created", f"Your ticket has been created: {ticket_channel.mention}"),
                 ephemeral=True
-            )
-
-
-class TicketPanelView(discord.ui.View):
+            )class TicketPanelView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=None)
         rows = get_ticket_options(guild_id)
