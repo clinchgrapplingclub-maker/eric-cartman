@@ -626,6 +626,14 @@ async def deactivate_premium_key_row(key_code: str, removed_by: int) -> Optional
     """, key_code, removed_by)
 
 
+async def delete_premium_key_row(key_code: str):
+    await db_execute("DELETE FROM premium_keys WHERE key_code = $1", key_code)
+
+
+async def delete_guild_premium_row(guild_id: int):
+    await db_execute("DELETE FROM guild_premium WHERE guild_id = $1", guild_id)
+
+
 async def list_active_unused_premium_keys() -> list[dict[str, Any]]:
     return await db_fetch("""
         SELECT key_code, duration_code, duration_label, created_by, created_at,
@@ -1421,6 +1429,8 @@ async def handle_premium_end_side_effects(
     *,
     automatic: bool
 ):
+    premium_key = premium_row.get("premium_key")
+
     await reset_guild_profile_to_default(guild.id)
 
     if automatic:
@@ -1428,15 +1438,21 @@ async def handle_premium_end_side_effects(
         await send_log(
             guild,
             "Premium Expired",
-            f"Server premium expired.\nPremium key: `{premium_row.get('premium_key') or 'Unknown'}`"
+            f"Server premium expired.
+Premium key: `{premium_key or 'Unknown'}`"
         )
     else:
         await dm_server_owner_premium_removed(guild.id, guild.name)
         await send_log(
             guild,
             "Premium Removed",
-            f"Server premium was removed.\nPremium key: `{premium_row.get('premium_key') or 'Unknown'}`"
+            f"Server premium was removed.
+Premium key: `{premium_key or 'Unknown'}`"
         )
+
+    if premium_key:
+        await delete_premium_key_row(premium_key)
+    await delete_guild_premium_row(guild.id)
 
 
 # =========================================================
@@ -3388,23 +3404,19 @@ async def activekeys(interaction: discord.Interaction):
     owner_user = await try_fetch_user(interaction.user.id)
     if owner_user:
         ordered_codes = ["1m", "3m", "6m", "12m", "perm"]
-        description_parts: list[str] = ["# **Active Tickets**
-"]
+        sections: list[str] = ["# **Active Tickets**", ""]
 
         for code in ordered_codes:
             keys = grouped.get(code, [])
-            section_title = f"**{premium_duration_label(code)} tickets:**"
+            sections.append(f"**{premium_duration_label(code)} tickets:**")
             if keys:
-                section_body = "
-".join(f"`{k}`" for k in keys)
+                sections.extend(f"`{k}`" for k in keys)
             else:
-                section_body = "No active keys."
-            description_parts.append(f"{section_title}
-{section_body}
-")
+                sections.append("No active keys.")
+            sections.append("")
 
         full_description = "
-".join(description_parts).strip()
+".join(sections).strip()
         if len(full_description) > 4000:
             full_description = full_description[:3950] + "
 
@@ -3475,11 +3487,13 @@ async def remove(interaction: discord.Interaction, key: str):
         )
         return
 
+    await delete_premium_key_row(normalized)
+
     await interaction.response.send_message(
         embed=await base_embed(
             interaction.guild.id if interaction.guild else None,
             "Key Removed",
-            f"Premium key `{display_premium_key(normalized)}` is now invalid."
+            f"Premium key `{display_premium_key(normalized)}` is now invalid and has been removed from the database."
         ),
         ephemeral=True
     )
