@@ -989,9 +989,18 @@ async def safe_delete_message(message: Optional[discord.Message]):
         await message.delete()
 
 
-def get_bot_guild_avatar_url(guild_id: Optional[int]) -> Optional[str]:
-    if guild_id is None or bot.user is None:
+def get_bot_default_avatar_url() -> Optional[str]:
+    if bot.user is None:
         return None
+    return bot.user.display_avatar.url
+
+
+def get_bot_guild_avatar_url(guild_id: Optional[int]) -> Optional[str]:
+    if bot.user is None:
+        return None
+
+    if guild_id is None:
+        return bot.user.display_avatar.url
 
     guild = bot.get_guild(guild_id)
     if guild is None:
@@ -1396,9 +1405,14 @@ async def dm_server_owner_bot_left(guild_id: int, guild_name: str):
 # =========================================================
 # PREMIUM SIDE EFFECTS
 # =========================================================
-async def reset_guild_profile_avatar_to_default(guild_id: int):
+async def reset_guild_profile_to_default(guild_id: int):
     with suppress(Exception):
-        await set_guild_profile(guild_id=guild_id, clear_avatar=True)
+        await set_guild_profile(
+            guild_id=guild_id,
+            clear_nickname=True,
+            clear_avatar=True,
+            clear_banner=True
+        )
 
 
 async def handle_premium_end_side_effects(
@@ -1407,7 +1421,7 @@ async def handle_premium_end_side_effects(
     *,
     automatic: bool
 ):
-    await reset_guild_profile_avatar_to_default(guild.id)
+    await reset_guild_profile_to_default(guild.id)
 
     if automatic:
         await dm_server_owner_premium_expired(guild.id, guild.name)
@@ -1680,12 +1694,15 @@ async def set_guild_profile(
     banner_image: Optional[ImageData] = None,
     *,
     clear_avatar: bool = False,
-    clear_banner: bool = False
+    clear_banner: bool = False,
+    clear_nickname: bool = False
 ) -> tuple[bool, str]:
     payload = {}
 
     if nickname is not None:
         payload["nick"] = nickname
+    elif clear_nickname:
+        payload["nick"] = None
 
     if avatar_image is not None:
         b64 = base64.b64encode(avatar_image.raw).decode("utf-8")
@@ -3195,9 +3212,10 @@ async def generatepremiumkey(
     owner_user = await try_fetch_user(interaction.user.id)
     if owner_user:
         embed = await base_embed(
-            interaction.guild.id if interaction.guild else None,
+            None,
             f"{label} key{'s' if amount != 1 else ''}",
-            "\n".join(f"`{display_premium_key(k)}`" for k in keys)
+            "
+".join(f"`{display_premium_key(k)}`" for k in keys)
         )
         with suppress(Exception):
             await owner_user.send(embed=embed)
@@ -3370,47 +3388,35 @@ async def activekeys(interaction: discord.Interaction):
     owner_user = await try_fetch_user(interaction.user.id)
     if owner_user:
         ordered_codes = ["1m", "3m", "6m", "12m", "perm"]
-        sent_any = False
+        description_parts: list[str] = ["# **Active Tickets**
+"]
 
         for code in ordered_codes:
             keys = grouped.get(code, [])
-            if not keys:
-                continue
+            section_title = f"**{premium_duration_label(code)} tickets:**"
+            if keys:
+                section_body = "
+".join(f"`{k}`" for k in keys)
+            else:
+                section_body = "No active keys."
+            description_parts.append(f"{section_title}
+{section_body}
+")
 
-            chunks = []
-            current = ""
-            for k in keys:
-                line = f"`{k}`\n"
-                if len(current) + len(line) > 3500:
-                    chunks.append(current)
-                    current = line
-                else:
-                    current += line
-            if current:
-                chunks.append(current)
+        full_description = "
+".join(description_parts).strip()
+        if len(full_description) > 4000:
+            full_description = full_description[:3950] + "
 
-            for index, chunk in enumerate(chunks, start=1):
-                title = f"{premium_duration_label(code)} keys"
-                if len(chunks) > 1:
-                    title += f" ({index}/{len(chunks)})"
+..."
 
-                embed = await base_embed(
-                    interaction.guild.id if interaction.guild else None,
-                    title,
-                    chunk or "No keys."
-                )
-                with suppress(Exception):
-                    await owner_user.send(embed=embed)
-                    sent_any = True
-
-        if not sent_any:
-            embed = await base_embed(
-                interaction.guild.id if interaction.guild else None,
-                "Active Keys",
-                "There are no active unused premium keys."
-            )
-            with suppress(Exception):
-                await owner_user.send(embed=embed)
+        embed = await base_embed(
+            None,
+            "Active Keys",
+            full_description or "There are no active unused premium keys."
+        )
+        with suppress(Exception):
+            await owner_user.send(embed=embed)
 
     await interaction.followup.send(
         embed=await base_embed(
@@ -3539,7 +3545,7 @@ async def premiumservers(interaction: discord.Interaction):
     if owner_user:
         if not rows:
             embed = await base_embed(
-                interaction.guild.id if interaction.guild else None,
+                None,
                 "Premium Servers",
                 "There are no active premium servers."
             )
@@ -3569,7 +3575,7 @@ async def premiumservers(interaction: discord.Interaction):
                 title = "Premium Servers"
                 if len(chunks) > 1:
                     title += f" ({index}/{len(chunks)})"
-                embed = await base_embed(interaction.guild.id if interaction.guild else None, title, chunk)
+                embed = await base_embed(None, title, chunk)
                 with suppress(Exception):
                     await owner_user.send(embed=embed)
 
