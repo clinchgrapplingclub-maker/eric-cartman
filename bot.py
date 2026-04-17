@@ -67,6 +67,15 @@ bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 SKIP_WORDS = {"skip", "none", "no", "-"}
 CANCEL_WORDS = {"cancel", "stop", "abort", "exit"}
 
+OWNER_COMMAND_NAMES = {
+    "generatepremiumkey",
+    "removepremium",
+    "activekeys",
+    "remove",
+    "leaveserver",
+    "premiumservers",
+}
+
 db_pool: Optional[asyncpg.Pool] = None
 ban_expiry_task: Optional[asyncio.Task] = None
 premium_expiry_task: Optional[asyncio.Task] = None
@@ -612,28 +621,6 @@ async def create_premium_key_row(
     """, key_code, duration_code, duration_label, created_by)
 
 
-async def deactivate_premium_key_row(key_code: str, removed_by: int) -> Optional[dict[str, Any]]:
-    return await db_fetchrow("""
-        UPDATE premium_keys
-        SET active = FALSE,
-            removed_by = $2,
-            removed_at = NOW()
-        WHERE key_code = $1
-          AND active = TRUE
-        RETURNING key_code, duration_code, duration_label, created_by, created_at,
-                  expires_at, used_by_guild_id, used_by_guild_name, used_by_user_id,
-                  used_at, active, removed_by, removed_at
-    """, key_code, removed_by)
-
-
-async def delete_premium_key_row(key_code: str):
-    await db_execute("DELETE FROM premium_keys WHERE key_code = $1", key_code)
-
-
-async def delete_guild_premium_row(guild_id: int):
-    await db_execute("DELETE FROM guild_premium WHERE guild_id = $1", guild_id)
-
-
 async def list_active_unused_premium_keys() -> list[dict[str, Any]]:
     return await db_fetch("""
         SELECT key_code, duration_code, duration_label, created_by, created_at,
@@ -654,6 +641,10 @@ async def list_active_premium_servers_db() -> list[dict[str, Any]]:
         WHERE active = TRUE
         ORDER BY activated_at ASC
     """)
+
+
+async def delete_premium_key_row(key_code: str):
+    await db_execute("DELETE FROM premium_keys WHERE key_code = $1", key_code)
 
 
 async def get_active_premium_guild_record(guild_id: int) -> Optional[dict[str, Any]]:
@@ -685,7 +676,7 @@ async def deactivate_guild_premium_record(
     removed_by: Optional[int],
     reason: str
 ) -> Optional[dict[str, Any]]:
-    return await db_fetchrow("""
+    row = await db_fetchrow("""
         UPDATE guild_premium
         SET active = FALSE,
             removed_by = $2,
@@ -696,6 +687,11 @@ async def deactivate_guild_premium_record(
         RETURNING guild_id, guild_name, premium_key, activated_by, activated_at,
                   expires_at, active, removed_by, removed_at, remove_reason
     """, guild_id, removed_by, reason)
+
+    if row and row.get("premium_key"):
+        await delete_premium_key_row(row["premium_key"])
+
+    return row
 
 
 async def get_expired_premium_servers() -> list[dict[str, Any]]:
@@ -731,6 +727,7 @@ async def redeem_premium_key_for_guild(
             if existing:
                 expires_at = existing["expires_at"]
                 if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+                    old_key = existing["premium_key"]
                     await conn.execute("""
                         UPDATE guild_premium
                         SET active = FALSE,
@@ -739,6 +736,8 @@ async def redeem_premium_key_for_guild(
                         WHERE guild_id = $1
                           AND active = TRUE
                     """, guild_id)
+                    if old_key:
+                        await conn.execute("DELETE FROM premium_keys WHERE key_code = $1", old_key)
                 else:
                     return False, "This server already has active premium.", None
 
@@ -901,7 +900,7 @@ def normalize_premium_key(key: str) -> str:
 
 def display_premium_key(key: str) -> str:
     clean = normalize_premium_key(key)
-    return "-".join(clean[i:i+4] for i in range(0, len(clean), 4))
+    return "-".join(clean[i:i + 4] for i in range(0, len(clean), 4))
 
 
 def generate_raw_premium_key() -> str:
@@ -997,16 +996,9 @@ async def safe_delete_message(message: Optional[discord.Message]):
         await message.delete()
 
 
-def get_bot_default_avatar_url() -> Optional[str]:
-    if bot.user is None:
-        return None
-    return bot.user.display_avatar.url
-
-
 def get_bot_guild_avatar_url(guild_id: Optional[int]) -> Optional[str]:
     if bot.user is None:
         return None
-
     if guild_id is None:
         return bot.user.display_avatar.url
 
@@ -1021,8 +1013,14 @@ def get_bot_guild_avatar_url(guild_id: Optional[int]) -> Optional[str]:
     return bot.user.display_avatar.url
 
 
-async def apply_footer(embed: discord.Embed, guild_id: Optional[int]) -> discord.Embed:
-    icon_url = get_bot_guild_avatar_url(guild_id)
+def get_bot_global_avatar_url() -> Optional[str]:
+    if bot.user is None:
+        return None
+    return bot.user.display_avatar.url
+
+
+async def apply_footer(embed: discord.Embed, guild_id: Optional[int], *, use_global_avatar: bool = False) -> discord.Embed:
+    icon_url = get_bot_global_avatar_url() if use_global_avatar else get_bot_guild_avatar_url(guild_id)
     if icon_url:
         embed.set_footer(text="made by @fntsheetz", icon_url=icon_url)
     else:
@@ -1049,11 +1047,12 @@ async def base_embed(
     title: str,
     description: str,
     *,
-    error: bool = False
+    error: bool = False,
+    use_global_avatar: bool = False
 ) -> discord.Embed:
     color = await resolve_color_for_guild(guild_id, error=error)
     embed = discord.Embed(title=title, description=description, color=color)
-    return await apply_footer(embed, guild_id)
+    return await apply_footer(embed, guild_id, use_global_avatar=use_global_avatar)
 
 
 def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
@@ -1298,7 +1297,7 @@ async def dm_ticket_closed(
         ),
         color=color
     )
-    embed = await apply_footer(embed, guild.id)
+    embed = await apply_footer(embed, guild.id, use_global_avatar=True)
 
     with suppress(Exception):
         await user.send(embed=embed)
@@ -1328,7 +1327,7 @@ async def dm_ticket_banned(
         ),
         color=color
     )
-    embed = await apply_footer(embed, guild.id)
+    embed = await apply_footer(embed, guild.id, use_global_avatar=True)
 
     with suppress(Exception):
         await user.send(embed=embed)
@@ -1362,7 +1361,7 @@ async def dm_ticket_unbanned(
         description=description,
         color=color
     )
-    embed = await apply_footer(embed, guild.id)
+    embed = await apply_footer(embed, guild.id, use_global_avatar=True)
 
     with suppress(Exception):
         await user.send(embed=embed)
@@ -1376,7 +1375,8 @@ async def dm_server_owner_premium_expired(guild_id: int, guild_name: str):
     embed = await base_embed(
         guild_id,
         "Premium Expired",
-        f"Your server **{guild_name}** is no longer premium because the premium time has expired."
+        f"Your server **{guild_name}** is no longer premium because the premium time has expired.",
+        use_global_avatar=True
     )
     with suppress(Exception):
         await owner.send(embed=embed)
@@ -1390,7 +1390,8 @@ async def dm_server_owner_premium_removed(guild_id: int, guild_name: str):
     embed = await base_embed(
         guild_id,
         "Premium Removed",
-        f"Your server **{guild_name}** is no longer premium."
+        f"Your server **{guild_name}** is no longer premium.",
+        use_global_avatar=True
     )
     with suppress(Exception):
         await owner.send(embed=embed)
@@ -1404,7 +1405,8 @@ async def dm_server_owner_bot_left(guild_id: int, guild_name: str):
     embed = await base_embed(
         guild_id,
         "Bot Left Server",
-        f"The bot has left your server **{guild_name}**."
+        f"The bot has left your server **{guild_name}**.",
+        use_global_avatar=True
     )
     with suppress(Exception):
         await owner.send(embed=embed)
@@ -1417,9 +1419,9 @@ async def reset_guild_profile_to_default(guild_id: int):
     with suppress(Exception):
         await set_guild_profile(
             guild_id=guild_id,
-            clear_nickname=True,
             clear_avatar=True,
-            clear_banner=True
+            clear_banner=True,
+            clear_nickname=True
         )
 
 
@@ -1429,39 +1431,22 @@ async def handle_premium_end_side_effects(
     *,
     automatic: bool
 ):
-    premium_key = premium_row.get("premium_key")
-
     await reset_guild_profile_to_default(guild.id)
-
-    expired_description = (
-        f"Server premium expired.
-"
-        f"Premium key: `{premium_key or 'Unknown'}`"
-    )
-    removed_description = (
-        f"Server premium was removed.
-"
-        f"Premium key: `{premium_key or 'Unknown'}`"
-    )
 
     if automatic:
         await dm_server_owner_premium_expired(guild.id, guild.name)
         await send_log(
             guild,
             "Premium Expired",
-            expired_description
+            f"Server premium expired.\nPremium key: `{premium_row.get('premium_key') or 'Unknown'}`"
         )
     else:
         await dm_server_owner_premium_removed(guild.id, guild.name)
         await send_log(
             guild,
             "Premium Removed",
-            removed_description
+            f"Server premium was removed.\nPremium key: `{premium_row.get('premium_key') or 'Unknown'}`"
         )
-
-    if premium_key:
-        await delete_premium_key_row(premium_key)
-    await delete_guild_premium_row(guild.id)
 
 
 # =========================================================
@@ -1720,14 +1705,14 @@ async def set_guild_profile(
     *,
     clear_avatar: bool = False,
     clear_banner: bool = False,
-    clear_nickname: bool = False
+    clear_nickname: bool = False,
 ) -> tuple[bool, str]:
     payload = {}
 
-    if nickname is not None:
-        payload["nick"] = nickname
-    elif clear_nickname:
+    if clear_nickname:
         payload["nick"] = None
+    elif nickname is not None:
+        payload["nick"] = nickname
 
     if avatar_image is not None:
         b64 = base64.b64encode(avatar_image.raw).decode("utf-8")
@@ -2719,11 +2704,6 @@ class CloseTicketButton(discord.ui.Button):
             except Exception:
                 pass
 
-            with suppress(Exception):
-                await interaction.channel.send(
-                    embed=await build_closed_ticket_embed(interaction.guild.id, interaction.user)
-                )
-
             asyncio.create_task(
                 dm_ticket_closed(
                     interaction.guild,
@@ -3071,7 +3051,7 @@ async def remind(interaction: discord.Interaction, user: discord.Member, message
         ),
         color=hex_to_color(config["color_hex"]) if config else discord.Color.green()
     )
-    dm_embed = await apply_footer(dm_embed, interaction.guild.id)
+    dm_embed = await apply_footer(dm_embed, interaction.guild.id, use_global_avatar=True)
 
     try:
         await user.send(embed=dm_embed)
@@ -3221,11 +3201,7 @@ async def generatepremiumkey(
     duration: app_commands.Choice[str]
 ):
     if not await is_bot_owner(interaction.user):
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
-            ephemeral=True
-        )
-        return
+        raise app_commands.CheckFailure("Only the bot owner can use this command.")
 
     await safe_defer(interaction, ephemeral=True, thinking=True)
 
@@ -3237,10 +3213,19 @@ async def generatepremiumkey(
     owner_user = await try_fetch_user(interaction.user.id)
     if owner_user:
         embed = await base_embed(
-            None,
+            interaction.guild.id if interaction.guild else None,
             f"{label} key{'s' if amount != 1 else ''}",
-            "
-".join(f"`{display_premium_key(k)}`" for k in keys)
+            "\n".join(f"`{display_premium_key(k)}`" for k in keys),
+            use_global_avatar=True
+        )
+        with suppress(Exception):
+            await owner_user.send(embed=embed)
+
+    await interaction.followup.send(
+        embed=await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            "Premium Keys Generated",
+            f"Generated **{amount}** premium key{'s' if amount != 1 else ''} for **{label}**.\nThey have been sent to your DMs."
         ),
         ephemeral=True
     )
@@ -3310,11 +3295,7 @@ async def premiumkey(interaction: discord.Interaction, key: str):
 @bot.tree.command(name="removepremium", description="Remove premium from a server")
 async def removepremium(interaction: discord.Interaction, server_id: str):
     if not await is_bot_owner(interaction.user):
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
-            ephemeral=True
-        )
-        return
+        raise app_commands.CheckFailure("Only the bot owner can use this command.")
 
     try:
         guild_id = int(server_id.strip())
@@ -3387,11 +3368,7 @@ async def serverstatus(interaction: discord.Interaction):
 @bot.tree.command(name="activekeys", description="Show all active premium keys")
 async def activekeys(interaction: discord.Interaction):
     if not await is_bot_owner(interaction.user):
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
-            ephemeral=True
-        )
-        return
+        raise app_commands.CheckFailure("Only the bot owner can use this command.")
 
     await safe_defer(interaction, ephemeral=True, thinking=True)
 
@@ -3404,32 +3381,45 @@ async def activekeys(interaction: discord.Interaction):
     owner_user = await try_fetch_user(interaction.user.id)
     if owner_user:
         ordered_codes = ["1m", "3m", "6m", "12m", "perm"]
-        lines: list[str] = ["# **Active Tickets**", ""]
+        if not rows:
+            embed = await base_embed(
+                interaction.guild.id if interaction.guild else None,
+                "Active Keys",
+                "There are no active unused premium keys.",
+                use_global_avatar=True
+            )
+            with suppress(Exception):
+                await owner_user.send(embed=embed)
+        else:
+            parts = ["**Active Tickets**"]
+            for code in ordered_codes:
+                keys = grouped.get(code, [])
+                if not keys:
+                    continue
+                parts.append(f"\n**{premium_duration_label(code)} tickets:**")
+                parts.extend(f"`{k}`" for k in keys)
 
-        for code in ordered_codes:
-            keys = grouped.get(code, [])
-            lines.append(f"**{premium_duration_label(code)} tickets:**")
-            if keys:
-                for key_value in keys:
-                    lines.append(f"`{key_value}`")
+            content = "\n".join(parts)
+            if len(content) <= 4000:
+                embed = await base_embed(
+                    interaction.guild.id if interaction.guild else None,
+                    "Active Keys",
+                    content,
+                    use_global_avatar=True
+                )
+                with suppress(Exception):
+                    await owner_user.send(embed=embed)
             else:
-                lines.append("No active keys.")
-            lines.append("")
-
-        full_description = "
-".join(lines).strip()
-        if len(full_description) > 4000:
-            full_description = full_description[:3950] + "
-
-..."
-
-        embed = await base_embed(
-            None,
-            "Active Keys",
-            full_description or "There are no active unused premium keys."
-        )
-        with suppress(Exception):
-            await owner_user.send(embed=embed)
+                txt = io.BytesIO(content.encode("utf-8"))
+                file = discord.File(txt, filename="activekeys.txt")
+                embed = await base_embed(
+                    interaction.guild.id if interaction.guild else None,
+                    "Active Keys",
+                    "The active key list was too long for one DM embed, so it has been attached as a text file.",
+                    use_global_avatar=True
+                )
+                with suppress(Exception):
+                    await owner_user.send(embed=embed, file=file)
 
     await interaction.followup.send(
         embed=await base_embed(
@@ -3441,26 +3431,10 @@ async def activekeys(interaction: discord.Interaction):
     )
 
 
-@activekeys.error
-async def activekeys_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Active Keys Failed", f"{error}", error=True)
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-    except Exception:
-        pass
-
-
 @bot.tree.command(name="remove", description="Remove a premium key so it can no longer be used")
 async def remove(interaction: discord.Interaction, key: str):
     if not await is_bot_owner(interaction.user):
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
-            ephemeral=True
-        )
-        return
+        raise app_commands.CheckFailure("Only the bot owner can use this command.")
 
     normalized = normalize_premium_key(key)
     if not normalized:
@@ -3492,21 +3466,13 @@ async def remove(interaction: discord.Interaction, key: str):
             )
             return
 
-    deactivated = await deactivate_premium_key_row(normalized, interaction.user.id)
-    if not deactivated:
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Key Already Removed", "That premium key is already invalid.", error=True),
-            ephemeral=True
-        )
-        return
-
     await delete_premium_key_row(normalized)
 
     await interaction.response.send_message(
         embed=await base_embed(
             interaction.guild.id if interaction.guild else None,
             "Key Removed",
-            f"Premium key `{display_premium_key(normalized)}` is now invalid and has been removed from the database."
+            f"Premium key `{display_premium_key(normalized)}` has been removed from the database and is now invalid."
         ),
         ephemeral=True
     )
@@ -3515,11 +3481,7 @@ async def remove(interaction: discord.Interaction, key: str):
 @bot.tree.command(name="leaveserver", description="Make the bot leave a server")
 async def leaveserver(interaction: discord.Interaction, serverid: str):
     if not await is_bot_owner(interaction.user):
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
-            ephemeral=True
-        )
-        return
+        raise app_commands.CheckFailure("Only the bot owner can use this command.")
 
     try:
         guild_id = int(serverid.strip())
@@ -3558,11 +3520,7 @@ async def leaveserver(interaction: discord.Interaction, serverid: str):
 @bot.tree.command(name="premiumservers", description="Show all premium servers")
 async def premiumservers(interaction: discord.Interaction):
     if not await is_bot_owner(interaction.user):
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
-            ephemeral=True
-        )
-        return
+        raise app_commands.CheckFailure("Only the bot owner can use this command.")
 
     await safe_defer(interaction, ephemeral=True, thinking=True)
 
@@ -3572,9 +3530,10 @@ async def premiumservers(interaction: discord.Interaction):
     if owner_user:
         if not rows:
             embed = await base_embed(
-                None,
+                interaction.guild.id if interaction.guild else None,
                 "Premium Servers",
-                "There are no active premium servers."
+                "There are no active premium servers.",
+                use_global_avatar=True
             )
             with suppress(Exception):
                 await owner_user.send(embed=embed)
@@ -3602,7 +3561,7 @@ async def premiumservers(interaction: discord.Interaction):
                 title = "Premium Servers"
                 if len(chunks) > 1:
                     title += f" ({index}/{len(chunks)})"
-                embed = await base_embed(None, title, chunk)
+                embed = await base_embed(interaction.guild.id if interaction.guild else None, title, chunk, use_global_avatar=True)
                 with suppress(Exception):
                     await owner_user.send(embed=embed)
 
@@ -3619,6 +3578,25 @@ async def premiumservers(interaction: discord.Interaction):
 # =========================================================
 # COMMAND ERROR HANDLERS
 # =========================================================
+async def handle_owner_visibility_error(interaction: discord.Interaction, title: str, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    embed=await base_embed(interaction.guild.id if interaction.guild else None, title, "Only the bot owner can use this command.", error=True),
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    embed=await base_embed(interaction.guild.id if interaction.guild else None, title, "Only the bot owner can use this command.", error=True),
+                    ephemeral=True
+                )
+        except Exception:
+            pass
+        return True
+    return False
+
+
 @setup.error
 async def setup_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if interaction.guild:
@@ -3714,6 +3692,8 @@ async def ticketunban_error(interaction: discord.Interaction, error: app_command
 
 @generatepremiumkey.error
 async def generatepremiumkey_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if await handle_owner_visibility_error(interaction, "Generate Premium Key Failed", error):
+        return
     embed = await base_embed(interaction.guild.id if interaction.guild else None, "Generate Premium Key Failed", f"{error}", error=True)
     try:
         if interaction.response.is_done():
@@ -3738,6 +3718,8 @@ async def premiumkey_error(interaction: discord.Interaction, error: app_commands
 
 @removepremium.error
 async def removepremium_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if await handle_owner_visibility_error(interaction, "Remove Premium Failed", error):
+        return
     embed = await base_embed(interaction.guild.id if interaction.guild else None, "Remove Premium Failed", f"{error}", error=True)
     try:
         if interaction.response.is_done():
@@ -3750,6 +3732,8 @@ async def removepremium_error(interaction: discord.Interaction, error: app_comma
 
 @activekeys.error
 async def activekeys_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if await handle_owner_visibility_error(interaction, "Active Keys Failed", error):
+        return
     embed = await base_embed(interaction.guild.id if interaction.guild else None, "Active Keys Failed", f"{error}", error=True)
     try:
         if interaction.response.is_done():
@@ -3762,6 +3746,8 @@ async def activekeys_error(interaction: discord.Interaction, error: app_commands
 
 @remove.error
 async def remove_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if await handle_owner_visibility_error(interaction, "Remove Key Failed", error):
+        return
     embed = await base_embed(interaction.guild.id if interaction.guild else None, "Remove Key Failed", f"{error}", error=True)
     try:
         if interaction.response.is_done():
@@ -3774,6 +3760,8 @@ async def remove_error(interaction: discord.Interaction, error: app_commands.App
 
 @leaveserver.error
 async def leaveserver_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if await handle_owner_visibility_error(interaction, "Leave Server Failed", error):
+        return
     embed = await base_embed(interaction.guild.id if interaction.guild else None, "Leave Server Failed", f"{error}", error=True)
     try:
         if interaction.response.is_done():
@@ -3786,6 +3774,8 @@ async def leaveserver_error(interaction: discord.Interaction, error: app_command
 
 @premiumservers.error
 async def premiumservers_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if await handle_owner_visibility_error(interaction, "Premium Servers Failed", error):
+        return
     embed = await base_embed(interaction.guild.id if interaction.guild else None, "Premium Servers Failed", f"{error}", error=True)
     try:
         if interaction.response.is_done():
@@ -3874,6 +3864,14 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
         cleanup_ticket_channel_lock(channel.id)
     except Exception:
         pass
+
+
+@bot.event
+async def setup_hook():
+    for cmd_name in OWNER_COMMAND_NAMES:
+        cmd = bot.tree.get_command(cmd_name)
+        if cmd is not None:
+            cmd.default_permissions = discord.Permissions.none()
 
 
 # =========================================================
