@@ -1433,21 +1433,30 @@ async def handle_premium_end_side_effects(
 
     await reset_guild_profile_to_default(guild.id)
 
+    expired_description = (
+        f"Server premium expired.
+"
+        f"Premium key: `{premium_key or 'Unknown'}`"
+    )
+    removed_description = (
+        f"Server premium was removed.
+"
+        f"Premium key: `{premium_key or 'Unknown'}`"
+    )
+
     if automatic:
         await dm_server_owner_premium_expired(guild.id, guild.name)
         await send_log(
             guild,
             "Premium Expired",
-            f"Server premium expired.
-Premium key: `{premium_key or 'Unknown'}`"
+            expired_description
         )
     else:
         await dm_server_owner_premium_removed(guild.id, guild.name)
         await send_log(
             guild,
             "Premium Removed",
-            f"Server premium was removed.
-Premium key: `{premium_key or 'Unknown'}`"
+            removed_description
         )
 
     if premium_key:
@@ -3232,15 +3241,6 @@ async def generatepremiumkey(
             f"{label} key{'s' if amount != 1 else ''}",
             "
 ".join(f"`{display_premium_key(k)}`" for k in keys)
-        )
-        with suppress(Exception):
-            await owner_user.send(embed=embed)
-
-    await interaction.followup.send(
-        embed=await base_embed(
-            interaction.guild.id if interaction.guild else None,
-            "Premium Keys Generated",
-            f"Generated **{amount}** premium key{'s' if amount != 1 else ''} for **{label}**.\nThey have been sent to your DMs."
         ),
         ephemeral=True
     )
@@ -3404,19 +3404,20 @@ async def activekeys(interaction: discord.Interaction):
     owner_user = await try_fetch_user(interaction.user.id)
     if owner_user:
         ordered_codes = ["1m", "3m", "6m", "12m", "perm"]
-        sections: list[str] = ["# **Active Tickets**", ""]
+        lines: list[str] = ["# **Active Tickets**", ""]
 
         for code in ordered_codes:
             keys = grouped.get(code, [])
-            sections.append(f"**{premium_duration_label(code)} tickets:**")
+            lines.append(f"**{premium_duration_label(code)} tickets:**")
             if keys:
-                sections.extend(f"`{k}`" for k in keys)
+                for key_value in keys:
+                    lines.append(f"`{key_value}`")
             else:
-                sections.append("No active keys.")
-            sections.append("")
+                lines.append("No active keys.")
+            lines.append("")
 
         full_description = "
-".join(sections).strip()
+".join(lines).strip()
         if len(full_description) > 4000:
             full_description = full_description[:3950] + "
 
@@ -3438,6 +3439,18 @@ async def activekeys(interaction: discord.Interaction):
         ),
         ephemeral=True
     )
+
+
+@activekeys.error
+async def activekeys_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Active Keys Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
 
 
 @bot.tree.command(name="remove", description="Remove a premium key so it can no longer be used")
