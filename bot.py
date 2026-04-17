@@ -6,7 +6,10 @@ import io
 import logging
 import os
 import re
+import secrets
+import string
 import zipfile
+from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -30,10 +33,24 @@ if not TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set in environment variables.")
 
+
+class IgnoreDiscordNoise(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        noisy = (
+            "PyNaCl is not installed, voice will NOT be supported",
+            "davey is not installed, voice will NOT be supported",
+        )
+        return not any(text in message for text in noisy)
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s"
 )
+
+logging.getLogger("discord.client").addFilter(IgnoreDiscordNoise())
+
 log = logging.getLogger("ticketbot")
 
 
@@ -52,6 +69,7 @@ CANCEL_WORDS = {"cancel", "stop", "abort", "exit"}
 
 db_pool: Optional[asyncpg.Pool] = None
 ban_expiry_task: Optional[asyncio.Task] = None
+premium_expiry_task: Optional[asyncio.Task] = None
 
 db_init_lock = asyncio.Lock()
 active_setup_guilds: set[int] = set()
@@ -65,6 +83,15 @@ ticket_options_cache: dict[int, list[dict[str, Any]]] = {}
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60)
 startup_ready_done = False
+bot_owner_ids: set[int] = set()
+
+PREMIUM_DURATION_LABELS = {
+    "1m": "1 month",
+    "3m": "3 months",
+    "6m": "6 months",
+    "12m": "12 months",
+    "perm": "Permanent",
+}
 
 
 # =========================================================
@@ -227,6 +254,39 @@ async def init_db():
             """)
 
             await conn.execute("""
+                CREATE TABLE IF NOT EXISTS premium_keys (
+                    key_code TEXT PRIMARY KEY,
+                    duration_code TEXT NOT NULL,
+                    duration_label TEXT NOT NULL,
+                    created_by BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ,
+                    used_by_guild_id BIGINT,
+                    used_by_guild_name TEXT,
+                    used_by_user_id BIGINT,
+                    used_at TIMESTAMPTZ,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    removed_by BIGINT,
+                    removed_at TIMESTAMPTZ
+                )
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS guild_premium (
+                    guild_id BIGINT PRIMARY KEY,
+                    guild_name TEXT NOT NULL,
+                    premium_key TEXT,
+                    activated_by BIGINT NOT NULL,
+                    activated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    removed_by BIGINT,
+                    removed_at TIMESTAMPTZ,
+                    remove_reason TEXT
+                )
+            """)
+
+            await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tickets_guild_opener_status
                 ON tickets(guild_id, opener_id, status)
             """)
@@ -249,6 +309,16 @@ async def init_db():
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_ticket_bans_active_expires
                 ON ticket_bans(active, expires_at)
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_premium_keys_active_unused
+                ON premium_keys(active, used_by_guild_id, duration_code)
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_guild_premium_active_expires
+                ON guild_premium(active, expires_at)
             """)
 
         log.info("Database initialized.")
@@ -274,6 +344,9 @@ async def db_execute(query: str, *args):
         return await conn.execute(query, *args)
 
 
+# =========================================================
+# CONFIG / TICKET DB HELPERS
+# =========================================================
 async def get_guild_config(guild_id: int) -> Optional[dict[str, Any]]:
     cached = guild_config_cache.get(guild_id)
     if cached is not None:
@@ -436,6 +509,9 @@ async def get_all_panel_rows() -> list[dict[str, Any]]:
     """)
 
 
+# =========================================================
+# TICKET BAN DB HELPERS
+# =========================================================
 async def get_active_ticket_ban(guild_id: int, user_id: int) -> Optional[dict[str, Any]]:
     row = await db_fetchrow("""
         SELECT guild_id, user_id, reason, duration_text, banned_by, banned_at,
@@ -508,6 +584,211 @@ async def get_expired_ticket_bans() -> list[dict[str, Any]]:
 
 
 # =========================================================
+# PREMIUM DB HELPERS
+# =========================================================
+async def get_premium_key_row(key_code: str) -> Optional[dict[str, Any]]:
+    return await db_fetchrow("""
+        SELECT key_code, duration_code, duration_label, created_by, created_at,
+               expires_at, used_by_guild_id, used_by_guild_name, used_by_user_id,
+               used_at, active, removed_by, removed_at
+        FROM premium_keys
+        WHERE key_code = $1
+    """, key_code)
+
+
+async def create_premium_key_row(
+    key_code: str,
+    duration_code: str,
+    duration_label: str,
+    created_by: int
+):
+    await db_execute("""
+        INSERT INTO premium_keys (
+            key_code, duration_code, duration_label, created_by, created_at,
+            expires_at, used_by_guild_id, used_by_guild_name, used_by_user_id,
+            used_at, active, removed_by, removed_at
+        )
+        VALUES ($1,$2,$3,$4,NOW(),NULL,NULL,NULL,NULL,NULL,TRUE,NULL,NULL)
+    """, key_code, duration_code, duration_label, created_by)
+
+
+async def deactivate_premium_key_row(key_code: str, removed_by: int) -> Optional[dict[str, Any]]:
+    return await db_fetchrow("""
+        UPDATE premium_keys
+        SET active = FALSE,
+            removed_by = $2,
+            removed_at = NOW()
+        WHERE key_code = $1
+          AND active = TRUE
+        RETURNING key_code, duration_code, duration_label, created_by, created_at,
+                  expires_at, used_by_guild_id, used_by_guild_name, used_by_user_id,
+                  used_at, active, removed_by, removed_at
+    """, key_code, removed_by)
+
+
+async def list_active_unused_premium_keys() -> list[dict[str, Any]]:
+    return await db_fetch("""
+        SELECT key_code, duration_code, duration_label, created_by, created_at,
+               expires_at, used_by_guild_id, used_by_guild_name, used_by_user_id,
+               used_at, active, removed_by, removed_at
+        FROM premium_keys
+        WHERE active = TRUE
+          AND used_by_guild_id IS NULL
+        ORDER BY duration_code ASC, created_at ASC
+    """)
+
+
+async def list_active_premium_servers_db() -> list[dict[str, Any]]:
+    return await db_fetch("""
+        SELECT guild_id, guild_name, premium_key, activated_by, activated_at,
+               expires_at, active, removed_by, removed_at, remove_reason
+        FROM guild_premium
+        WHERE active = TRUE
+        ORDER BY activated_at ASC
+    """)
+
+
+async def get_active_premium_guild_record(guild_id: int) -> Optional[dict[str, Any]]:
+    row = await db_fetchrow("""
+        SELECT guild_id, guild_name, premium_key, activated_by, activated_at,
+               expires_at, active, removed_by, removed_at, remove_reason
+        FROM guild_premium
+        WHERE guild_id = $1
+          AND active = TRUE
+    """, guild_id)
+
+    if not row:
+        return None
+
+    expires_at = row.get("expires_at")
+    if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+        deactivated = await deactivate_guild_premium_record(guild_id, None, "expired")
+        if deactivated:
+            guild = bot.get_guild(guild_id)
+            if guild:
+                await handle_premium_end_side_effects(guild, deactivated, automatic=True)
+        return None
+
+    return row
+
+
+async def deactivate_guild_premium_record(
+    guild_id: int,
+    removed_by: Optional[int],
+    reason: str
+) -> Optional[dict[str, Any]]:
+    return await db_fetchrow("""
+        UPDATE guild_premium
+        SET active = FALSE,
+            removed_by = $2,
+            removed_at = NOW(),
+            remove_reason = $3
+        WHERE guild_id = $1
+          AND active = TRUE
+        RETURNING guild_id, guild_name, premium_key, activated_by, activated_at,
+                  expires_at, active, removed_by, removed_at, remove_reason
+    """, guild_id, removed_by, reason)
+
+
+async def get_expired_premium_servers() -> list[dict[str, Any]]:
+    return await db_fetch("""
+        SELECT guild_id, guild_name, premium_key, activated_by, activated_at,
+               expires_at, active, removed_by, removed_at, remove_reason
+        FROM guild_premium
+        WHERE active = TRUE
+          AND expires_at IS NOT NULL
+          AND expires_at <= NOW()
+    """)
+
+
+async def redeem_premium_key_for_guild(
+    guild_id: int,
+    guild_name: str,
+    activated_by: int,
+    key_code: str
+) -> tuple[bool, str, Optional[dict[str, Any]]]:
+    assert db_pool is not None
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            existing = await conn.fetchrow("""
+                SELECT guild_id, guild_name, premium_key, activated_by, activated_at,
+                       expires_at, active, removed_by, removed_at, remove_reason
+                FROM guild_premium
+                WHERE guild_id = $1
+                  AND active = TRUE
+                FOR UPDATE
+            """, guild_id)
+
+            if existing:
+                expires_at = existing["expires_at"]
+                if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+                    await conn.execute("""
+                        UPDATE guild_premium
+                        SET active = FALSE,
+                            removed_at = NOW(),
+                            remove_reason = 'expired'
+                        WHERE guild_id = $1
+                          AND active = TRUE
+                    """, guild_id)
+                else:
+                    return False, "This server already has active premium.", None
+
+            key_row = await conn.fetchrow("""
+                SELECT key_code, duration_code, duration_label, created_by, created_at,
+                       expires_at, used_by_guild_id, used_by_guild_name, used_by_user_id,
+                       used_at, active, removed_by, removed_at
+                FROM premium_keys
+                WHERE key_code = $1
+                FOR UPDATE
+            """, key_code)
+
+            if not key_row:
+                return False, "That premium key does not exist.", None
+
+            if not key_row["active"]:
+                return False, "That premium key is invalid.", None
+
+            if key_row["used_by_guild_id"] is not None:
+                return False, "That premium key has already been used.", None
+
+            expires_at = premium_expiry_for_code(key_row["duration_code"])
+
+            await conn.execute("""
+                UPDATE premium_keys
+                SET used_by_guild_id = $2,
+                    used_by_guild_name = $3,
+                    used_by_user_id = $4,
+                    used_at = NOW(),
+                    expires_at = $5
+                WHERE key_code = $1
+            """, key_code, guild_id, guild_name, activated_by, expires_at)
+
+            row = await conn.fetchrow("""
+                INSERT INTO guild_premium (
+                    guild_id, guild_name, premium_key, activated_by, activated_at,
+                    expires_at, active, removed_by, removed_at, remove_reason
+                )
+                VALUES ($1,$2,$3,$4,NOW(),$5,TRUE,NULL,NULL,NULL)
+                ON CONFLICT (guild_id)
+                DO UPDATE SET
+                    guild_name = EXCLUDED.guild_name,
+                    premium_key = EXCLUDED.premium_key,
+                    activated_by = EXCLUDED.activated_by,
+                    activated_at = NOW(),
+                    expires_at = EXCLUDED.expires_at,
+                    active = TRUE,
+                    removed_by = NULL,
+                    removed_at = NULL,
+                    remove_reason = NULL
+                RETURNING guild_id, guild_name, premium_key, activated_by, activated_at,
+                          expires_at, active, removed_by, removed_at, remove_reason
+            """, guild_id, guild_name, key_code, activated_by, expires_at)
+
+            return True, "Premium activated successfully.", dict(row)
+
+
+# =========================================================
 # GENERAL HELPERS
 # =========================================================
 def normalize_hex(value: str) -> str:
@@ -554,6 +835,12 @@ def format_ban_expiry(expires_at: Optional[datetime]) -> str:
     return format_ts(expires_at)
 
 
+def format_premium_expiry(expires_at: Optional[datetime]) -> str:
+    if expires_at is None:
+        return "Never (Permanent)"
+    return format_ts(expires_at)
+
+
 def parse_duration_to_expiry(duration_text: str) -> tuple[Optional[datetime], str]:
     clean = duration_text.strip().lower()
 
@@ -579,6 +866,61 @@ def parse_duration_to_expiry(duration_text: str) -> tuple[Optional[datetime], st
     raise ValueError("Invalid duration format.")
 
 
+def premium_expiry_for_code(duration_code: str) -> Optional[datetime]:
+    now = datetime.now(timezone.utc)
+
+    if duration_code == "1m":
+        return now + timedelta(days=30)
+    if duration_code == "3m":
+        return now + timedelta(days=90)
+    if duration_code == "6m":
+        return now + timedelta(days=180)
+    if duration_code == "12m":
+        return now + timedelta(days=365)
+    if duration_code == "perm":
+        return None
+
+    raise ValueError("Invalid premium duration code.")
+
+
+def premium_duration_label(duration_code: str) -> str:
+    return PREMIUM_DURATION_LABELS.get(duration_code, duration_code)
+
+
+def normalize_premium_key(key: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", key.upper())
+
+
+def display_premium_key(key: str) -> str:
+    clean = normalize_premium_key(key)
+    return "-".join(clean[i:i+4] for i in range(0, len(clean), 4))
+
+
+def generate_raw_premium_key() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(20))
+
+
+async def generate_unique_premium_keys(amount: int, duration_code: str, created_by: int) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    while len(keys) < amount:
+        raw = generate_raw_premium_key()
+        if raw in seen:
+            continue
+
+        existing = await get_premium_key_row(raw)
+        if existing:
+            continue
+
+        seen.add(raw)
+        await create_premium_key_row(raw, duration_code, premium_duration_label(duration_code), created_by)
+        keys.append(raw)
+
+    return keys
+
+
 async def try_fetch_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
     member = guild.get_member(user_id)
     if member:
@@ -595,6 +937,49 @@ async def try_fetch_user(user_id: int) -> Optional[discord.User]:
     with suppress(Exception):
         return await bot.fetch_user(user_id)
     return None
+
+
+async def try_fetch_guild_owner_user(guild_id: int) -> Optional[discord.User]:
+    guild = bot.get_guild(guild_id)
+    owner_id: Optional[int] = None
+
+    if guild is not None:
+        if guild.owner is not None:
+            return guild.owner
+        owner_id = guild.owner_id
+
+    if owner_id is None:
+        with suppress(Exception):
+            fetched_guild = await bot.fetch_guild(guild_id)
+            owner_id = fetched_guild.owner_id
+
+    if owner_id is None:
+        return None
+
+    return await try_fetch_user(owner_id)
+
+
+async def refresh_bot_owner_ids():
+    global bot_owner_ids
+    try:
+        app_info = await bot.application_info()
+        ids: set[int] = set()
+
+        if app_info.team is not None:
+            for member in app_info.team.members:
+                ids.add(member.id)
+        elif app_info.owner is not None:
+            ids.add(app_info.owner.id)
+
+        bot_owner_ids = ids
+    except Exception as e:
+        log.warning("Failed to resolve bot owner ids: %s", e)
+
+
+async def is_bot_owner(user: discord.abc.User) -> bool:
+    if not bot_owner_ids:
+        await refresh_bot_owner_ids()
+    return user.id in bot_owner_ids
 
 
 async def safe_delete_message(message: Optional[discord.Message]):
@@ -775,6 +1160,8 @@ async def send_log(
             await log_channel.send(embed=embed, file=file)
         else:
             await log_channel.send(embed=embed)
+    except (discord.NotFound, discord.Forbidden):
+        return
     except Exception as e:
         log.warning("Failed to send log in guild %s: %s", guild.id, e)
 
@@ -832,6 +1219,18 @@ async def safe_ephemeral_edit_or_followup(
     return False
 
 
+async def safe_non_ephemeral_followup(
+    interaction: discord.Interaction,
+    *,
+    embed: discord.Embed
+):
+    try:
+        await interaction.followup.send(embed=embed, ephemeral=False)
+        return True
+    except Exception:
+        return False
+
+
 async def refresh_guild_panel(guild_id: int):
     config = await get_guild_config(guild_id)
     if not config:
@@ -857,6 +1256,9 @@ async def refresh_guild_panel(guild_id: int):
         pass
 
 
+# =========================================================
+# DM HELPERS
+# =========================================================
 async def dm_ticket_closed(
     guild: discord.Guild,
     opener_id: int,
@@ -949,6 +1351,80 @@ async def dm_ticket_unbanned(
         await user.send(embed=embed)
 
 
+async def dm_server_owner_premium_expired(guild_id: int, guild_name: str):
+    owner = await try_fetch_guild_owner_user(guild_id)
+    if not owner:
+        return
+
+    embed = await base_embed(
+        guild_id,
+        "Premium Expired",
+        f"Your server **{guild_name}** is no longer premium because the premium time has expired."
+    )
+    with suppress(Exception):
+        await owner.send(embed=embed)
+
+
+async def dm_server_owner_premium_removed(guild_id: int, guild_name: str):
+    owner = await try_fetch_guild_owner_user(guild_id)
+    if not owner:
+        return
+
+    embed = await base_embed(
+        guild_id,
+        "Premium Removed",
+        f"Your server **{guild_name}** is no longer premium."
+    )
+    with suppress(Exception):
+        await owner.send(embed=embed)
+
+
+async def dm_server_owner_bot_left(guild_id: int, guild_name: str):
+    owner = await try_fetch_guild_owner_user(guild_id)
+    if not owner:
+        return
+
+    embed = await base_embed(
+        guild_id,
+        "Bot Left Server",
+        f"The bot has left your server **{guild_name}**."
+    )
+    with suppress(Exception):
+        await owner.send(embed=embed)
+
+
+# =========================================================
+# PREMIUM SIDE EFFECTS
+# =========================================================
+async def reset_guild_profile_avatar_to_default(guild_id: int):
+    with suppress(Exception):
+        await set_guild_profile(guild_id=guild_id, clear_avatar=True)
+
+
+async def handle_premium_end_side_effects(
+    guild: discord.Guild,
+    premium_row: dict[str, Any],
+    *,
+    automatic: bool
+):
+    await reset_guild_profile_avatar_to_default(guild.id)
+
+    if automatic:
+        await dm_server_owner_premium_expired(guild.id, guild.name)
+        await send_log(
+            guild,
+            "Premium Expired",
+            f"Server premium expired.\nPremium key: `{premium_row.get('premium_key') or 'Unknown'}`"
+        )
+    else:
+        await dm_server_owner_premium_removed(guild.id, guild.name)
+        await send_log(
+            guild,
+            "Premium Removed",
+            f"Server premium was removed.\nPremium key: `{premium_row.get('premium_key') or 'Unknown'}`"
+        )
+
+
 # =========================================================
 # TRANSCRIPT
 # =========================================================
@@ -991,7 +1467,7 @@ async def build_transcript_html(channel: discord.TextChannel) -> str:
             attachment_html = f"""
                 <div class="attachments">
                     <strong>Attachments</strong>
-                    <ul>{"".join(attachment_links)}</ul>
+                    <ul>{''.join(attachment_links)}</ul>
                 </div>
             """
 
@@ -1201,7 +1677,10 @@ async def set_guild_profile(
     guild_id: int,
     nickname: Optional[str] = None,
     avatar_image: Optional[ImageData] = None,
-    banner_image: Optional[ImageData] = None
+    banner_image: Optional[ImageData] = None,
+    *,
+    clear_avatar: bool = False,
+    clear_banner: bool = False
 ) -> tuple[bool, str]:
     payload = {}
 
@@ -1211,10 +1690,14 @@ async def set_guild_profile(
     if avatar_image is not None:
         b64 = base64.b64encode(avatar_image.raw).decode("utf-8")
         payload["avatar"] = f"data:{avatar_image.mime_type};base64,{b64}"
+    elif clear_avatar:
+        payload["avatar"] = None
 
     if banner_image is not None:
         b64 = base64.b64encode(banner_image.raw).decode("utf-8")
         payload["banner"] = f"data:{banner_image.mime_type};base64,{b64}"
+    elif clear_banner:
+        payload["banner"] = None
 
     if not payload:
         return False, "Nothing to update."
@@ -1985,7 +2468,6 @@ class TicketDropdown(discord.ui.Select):
                     )
                     return
 
-                # Direkt när kanalen finns, uppdatera användaren först
                 await safe_ephemeral_edit_or_followup(
                     interaction,
                     embed=await base_embed(
@@ -1995,17 +2477,17 @@ class TicketDropdown(discord.ui.Select):
                     )
                 )
 
-                # Sedan resten
                 await create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
 
                 ticket_view = TicketControlsView()
                 ticket_embed = await build_ticket_embed(guild.id, selected["label"], opener)
 
-                await ticket_channel.send(
-                    content=f"{support_role.mention} {opener.mention}",
-                    embed=ticket_embed,
-                    view=ticket_view
-                )
+                with suppress(Exception):
+                    await ticket_channel.send(
+                        content=f"{support_role.mention} {opener.mention}",
+                        embed=ticket_embed,
+                        view=ticket_view
+                    )
 
                 asyncio.create_task(refresh_guild_panel(guild.id))
                 asyncio.create_task(
@@ -2069,28 +2551,32 @@ class ClaimTicketButton(discord.ui.Button):
         async with lock:
             ticket = await get_ticket_by_channel(interaction.channel.id)
             if not ticket:
-                await interaction.followup.send(
+                await safe_component_reply(
+                    interaction,
                     embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
                     ephemeral=True
                 )
                 return
 
             if ticket["status"] == "closed":
-                await interaction.followup.send(
+                await safe_component_reply(
+                    interaction,
                     embed=await base_embed(interaction.guild.id, "Ticket Closed", "This ticket is already closed."),
                     ephemeral=True
                 )
                 return
 
             if not await is_support_or_admin(interaction.user, interaction.guild.id):
-                await interaction.followup.send(
+                await safe_component_reply(
+                    interaction,
                     embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can claim tickets.", error=True),
                     ephemeral=True
                 )
                 return
 
             if ticket["claimed_by"] == interaction.user.id:
-                await interaction.followup.send(
+                await safe_component_reply(
+                    interaction,
                     embed=await base_embed(interaction.guild.id, "Already Claimed", "You already claimed this ticket."),
                     ephemeral=True
                 )
@@ -2098,9 +2584,9 @@ class ClaimTicketButton(discord.ui.Button):
 
             await set_ticket_claimed(interaction.channel.id, interaction.user.id)
 
-            await interaction.followup.send(
-                embed=await base_embed(interaction.guild.id, "Ticket Claimed", f"Ticket claimed by {interaction.user.mention}."),
-                ephemeral=False
+            await safe_non_ephemeral_followup(
+                interaction,
+                embed=await base_embed(interaction.guild.id, "Ticket Claimed", f"Ticket claimed by {interaction.user.mention}.")
             )
 
             await send_log(
@@ -2126,7 +2612,6 @@ class CloseTicketButton(discord.ui.Button):
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        # Ingen ephemeral defer här, annars skapas "bara du kan se detta"-responsen
         try:
             if not interaction.response.is_done():
                 await interaction.response.defer()
@@ -2137,22 +2622,17 @@ class CloseTicketButton(discord.ui.Button):
         async with lock:
             ticket = await get_ticket_by_channel(interaction.channel.id)
             if not ticket:
-                with suppress(Exception):
-                    await interaction.followup.send(
-                        embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
-                        ephemeral=True
-                    )
                 return
 
             if ticket["status"] == "closed":
                 return
 
             if not await is_support_or_admin(interaction.user, interaction.guild.id):
-                with suppress(Exception):
-                    await interaction.followup.send(
-                        embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True),
-                        ephemeral=True
-                    )
+                await safe_component_reply(
+                    interaction,
+                    embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True),
+                    ephemeral=True
+                )
                 return
 
             config = await get_guild_config(interaction.guild.id)
@@ -2163,11 +2643,11 @@ class CloseTicketButton(discord.ui.Button):
                 if opener_member:
                     await interaction.channel.set_permissions(opener_member, view_channel=False)
             except discord.Forbidden:
-                with suppress(Exception):
-                    await interaction.followup.send(
-                        embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
-                        ephemeral=True
-                    )
+                await safe_component_reply(
+                    interaction,
+                    embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
+                    ephemeral=True
+                )
                 return
 
             if support_role:
@@ -2182,11 +2662,11 @@ class CloseTicketButton(discord.ui.Button):
                         manage_messages=True
                     )
                 except discord.Forbidden:
-                    with suppress(Exception):
-                        await interaction.followup.send(
-                            embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update support role permissions.", error=True),
-                            ephemeral=True
-                        )
+                    await safe_component_reply(
+                        interaction,
+                        embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update support role permissions.", error=True),
+                        ephemeral=True
+                    )
                     return
 
             await close_ticket_record(interaction.channel.id, interaction.user.id)
@@ -2197,9 +2677,10 @@ class CloseTicketButton(discord.ui.Button):
             except Exception:
                 pass
 
-            await interaction.channel.send(
-                embed=await build_closed_ticket_embed(interaction.guild.id, interaction.user)
-            )
+            with suppress(Exception):
+                await interaction.channel.send(
+                    embed=await build_closed_ticket_embed(interaction.guild.id, interaction.user)
+                )
 
             asyncio.create_task(
                 dm_ticket_closed(
@@ -2245,16 +2726,16 @@ class DeleteTicketButton(discord.ui.Button):
         async with lock:
             ticket = await get_ticket_by_channel(channel.id)
             if not ticket:
-                await interaction.followup.send(
-                    embed=await base_embed(guild.id, "Error", "This is not a tracked ticket channel.", error=True),
-                    ephemeral=True
+                await safe_ephemeral_edit_or_followup(
+                    interaction,
+                    embed=await base_embed(guild.id, "Error", "This is not a tracked ticket channel.", error=True)
                 )
                 return
 
             if not await is_support_or_admin(deleter, guild.id):
-                await interaction.followup.send(
-                    embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True),
-                    ephemeral=True
+                await safe_ephemeral_edit_or_followup(
+                    interaction,
+                    embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True)
                 )
                 return
 
@@ -2277,12 +2758,10 @@ class DeleteTicketButton(discord.ui.Button):
 
             await delete_ticket_record(channel_id)
 
-            with suppress(Exception):
-                await interaction.edit_original_response(
-                    embed=await base_embed(guild.id, "Deleting Ticket", "The ticket is being deleted."),
-                    content=None,
-                    view=None
-                )
+            await safe_ephemeral_edit_or_followup(
+                interaction,
+                embed=await base_embed(guild.id, "Deleting Ticket", "The ticket is being deleted.")
+            )
 
             asyncio.create_task(refresh_guild_panel(guild.id))
 
@@ -2335,6 +2814,29 @@ async def ticket_ban_expiry_loop():
 
         except Exception as e:
             log.exception("Ticket ban expiry loop failed: %s", e)
+
+        await asyncio.sleep(30)
+
+
+async def premium_expiry_loop_task():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            expired_rows = await get_expired_premium_servers()
+
+            for row in expired_rows:
+                guild_id = row["guild_id"]
+                deactivated = await deactivate_guild_premium_record(guild_id, None, "expired")
+                if not deactivated:
+                    continue
+
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    await handle_premium_end_side_effects(guild, deactivated, automatic=True)
+
+        except Exception as e:
+            log.exception("Premium expiry loop failed: %s", e)
 
         await asyncio.sleep(30)
 
@@ -2396,6 +2898,19 @@ async def setprofile(
         )
         return
 
+    premium_row = await get_active_premium_guild_record(interaction.guild.id)
+    if not premium_row:
+        await interaction.response.send_message(
+            embed=await base_embed(
+                interaction.guild.id,
+                "Premium Required",
+                "This command is only available in premium servers.",
+                error=True
+            ),
+            ephemeral=True
+        )
+        return
+
     if avatar is not None and not is_image_attachment(avatar):
         await interaction.response.send_message(
             embed=await base_embed(None, "Update Failed", "Avatar attachment must be an image.", error=True),
@@ -2451,7 +2966,7 @@ async def setprofile(
                 embed=await base_embed(
                     interaction.guild.id,
                     "Server Profile Updated",
-                    "The bot profile was updated for this server."
+                    "The bot profile was updated for this premium server."
                 ),
                 ephemeral=True
             )
@@ -2647,6 +3162,428 @@ async def ticketunban(interaction: discord.Interaction, user: discord.Member):
 
 
 # =========================================================
+# PREMIUM COMMANDS
+# =========================================================
+@bot.tree.command(name="generatepremiumkey", description="Generate premium keys")
+@app_commands.describe(amount="How many keys to generate", duration="Premium duration")
+@app_commands.choices(duration=[
+    app_commands.Choice(name="1 month", value="1m"),
+    app_commands.Choice(name="3 months", value="3m"),
+    app_commands.Choice(name="6 months", value="6m"),
+    app_commands.Choice(name="12 months", value="12m"),
+    app_commands.Choice(name="perm", value="perm"),
+])
+async def generatepremiumkey(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 100],
+    duration: app_commands.Choice[str]
+):
+    if not await is_bot_owner(interaction.user):
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    duration_code = duration.value
+    label = premium_duration_label(duration_code)
+
+    keys = await generate_unique_premium_keys(amount, duration_code, interaction.user.id)
+
+    owner_user = await try_fetch_user(interaction.user.id)
+    if owner_user:
+        embed = await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            f"{label} key{'s' if amount != 1 else ''}",
+            "\n".join(f"`{display_premium_key(k)}`" for k in keys)
+        )
+        with suppress(Exception):
+            await owner_user.send(embed=embed)
+
+    await interaction.followup.send(
+        embed=await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            "Premium Keys Generated",
+            f"Generated **{amount}** premium key{'s' if amount != 1 else ''} for **{label}**.\nThey have been sent to your DMs."
+        ),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="premiumkey", description="Activate premium for this server using a premium key")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def premiumkey(interaction: discord.Interaction, key: str):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id, "Access Denied", "Only administrators can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    normalized = normalize_premium_key(key)
+    if not normalized:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id, "Invalid Key", "That premium key is invalid.", error=True),
+            ephemeral=True
+        )
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    success, message, premium_row = await redeem_premium_key_for_guild(
+        guild_id=interaction.guild.id,
+        guild_name=interaction.guild.name,
+        activated_by=interaction.user.id,
+        key_code=normalized
+    )
+
+    if not success or premium_row is None:
+        await interaction.followup.send(
+            embed=await base_embed(interaction.guild.id, "Premium Activation Failed", message, error=True),
+            ephemeral=True
+        )
+        return
+
+    await send_log(
+        interaction.guild,
+        "Premium Activated",
+        (
+            f"Activated by: {interaction.user.mention}\n"
+            f"Premium key: `{display_premium_key(normalized)}`\n"
+            f"Expires: {format_premium_expiry(premium_row['expires_at'])}"
+        )
+    )
+
+    await interaction.followup.send(
+        embed=await base_embed(
+            interaction.guild.id,
+            "Premium Activated",
+            (
+                "Your server is now premium.\n\n"
+                f"Premium expires: {format_premium_expiry(premium_row['expires_at'])}"
+            )
+        ),
+        ephemeral=False
+    )
+
+
+@bot.tree.command(name="removepremium", description="Remove premium from a server")
+async def removepremium(interaction: discord.Interaction, server_id: str):
+    if not await is_bot_owner(interaction.user):
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    try:
+        guild_id = int(server_id.strip())
+    except Exception:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Invalid Server ID", "Server ID must be a valid number.", error=True),
+            ephemeral=True
+        )
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    deactivated = await deactivate_guild_premium_record(guild_id, interaction.user.id, "removed_by_owner")
+    if not deactivated:
+        await interaction.followup.send(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "No Active Premium", "That server does not currently have premium.", error=True),
+            ephemeral=True
+        )
+        return
+
+    guild = bot.get_guild(guild_id)
+    guild_name = guild.name if guild else deactivated["guild_name"]
+
+    if guild:
+        await handle_premium_end_side_effects(guild, deactivated, automatic=False)
+    else:
+        await dm_server_owner_premium_removed(guild_id, guild_name)
+
+    await interaction.followup.send(
+        embed=await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            "Premium Removed",
+            f"Premium has been removed from **{guild_name}** (`{guild_id}`)."
+        ),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="serverstatus", description="Check whether this server is free or premium")
+@app_commands.guild_only()
+async def serverstatus(interaction: discord.Interaction):
+    if not interaction.guild:
+        return
+
+    premium_row = await get_active_premium_guild_record(interaction.guild.id)
+    if premium_row:
+        await interaction.response.send_message(
+            embed=await base_embed(
+                interaction.guild.id,
+                "Server Status",
+                (
+                    "Status: **Premium Version**\n"
+                    f"Premium expires: **{format_premium_expiry(premium_row['expires_at'])}**"
+                )
+            ),
+            ephemeral=False
+        )
+        return
+
+    await interaction.response.send_message(
+        embed=await base_embed(
+            interaction.guild.id,
+            "Server Status",
+            "Status: **Free Version**"
+        ),
+        ephemeral=False
+    )
+
+
+@bot.tree.command(name="activekeys", description="Show all active premium keys")
+async def activekeys(interaction: discord.Interaction):
+    if not await is_bot_owner(interaction.user):
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    rows = await list_active_unused_premium_keys()
+    grouped: dict[str, list[str]] = defaultdict(list)
+
+    for row in rows:
+        grouped[row["duration_code"]].append(display_premium_key(row["key_code"]))
+
+    owner_user = await try_fetch_user(interaction.user.id)
+    if owner_user:
+        ordered_codes = ["1m", "3m", "6m", "12m", "perm"]
+        sent_any = False
+
+        for code in ordered_codes:
+            keys = grouped.get(code, [])
+            if not keys:
+                continue
+
+            chunks = []
+            current = ""
+            for k in keys:
+                line = f"`{k}`\n"
+                if len(current) + len(line) > 3500:
+                    chunks.append(current)
+                    current = line
+                else:
+                    current += line
+            if current:
+                chunks.append(current)
+
+            for index, chunk in enumerate(chunks, start=1):
+                title = f"{premium_duration_label(code)} keys"
+                if len(chunks) > 1:
+                    title += f" ({index}/{len(chunks)})"
+
+                embed = await base_embed(
+                    interaction.guild.id if interaction.guild else None,
+                    title,
+                    chunk or "No keys."
+                )
+                with suppress(Exception):
+                    await owner_user.send(embed=embed)
+                    sent_any = True
+
+        if not sent_any:
+            embed = await base_embed(
+                interaction.guild.id if interaction.guild else None,
+                "Active Keys",
+                "There are no active unused premium keys."
+            )
+            with suppress(Exception):
+                await owner_user.send(embed=embed)
+
+    await interaction.followup.send(
+        embed=await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            "Active Keys Sent",
+            "The list of active keys has been sent to your DMs."
+        ),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="remove", description="Remove a premium key so it can no longer be used")
+async def remove(interaction: discord.Interaction, key: str):
+    if not await is_bot_owner(interaction.user):
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    normalized = normalize_premium_key(key)
+    if not normalized:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Invalid Key", "That premium key is invalid.", error=True),
+            ephemeral=True
+        )
+        return
+
+    row = await get_premium_key_row(normalized)
+    if not row:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Key Not Found", "That premium key does not exist.", error=True),
+            ephemeral=True
+        )
+        return
+
+    if row["used_by_guild_id"] is not None:
+        active_premium = await get_active_premium_guild_record(row["used_by_guild_id"])
+        if active_premium:
+            await interaction.response.send_message(
+                embed=await base_embed(
+                    interaction.guild.id if interaction.guild else None,
+                    "Key In Use",
+                    "That key is already being used by an active premium server. Use `/removepremium` instead.",
+                    error=True
+                ),
+                ephemeral=True
+            )
+            return
+
+    deactivated = await deactivate_premium_key_row(normalized, interaction.user.id)
+    if not deactivated:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Key Already Removed", "That premium key is already invalid.", error=True),
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        embed=await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            "Key Removed",
+            f"Premium key `{display_premium_key(normalized)}` is now invalid."
+        ),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="leaveserver", description="Make the bot leave a server")
+async def leaveserver(interaction: discord.Interaction, serverid: str):
+    if not await is_bot_owner(interaction.user):
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    try:
+        guild_id = int(serverid.strip())
+    except Exception:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Invalid Server ID", "Server ID must be a valid number.", error=True),
+            ephemeral=True
+        )
+        return
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Server Not Found", "The bot is not in that server.", error=True),
+            ephemeral=True
+        )
+        return
+
+    guild_name = guild.name
+
+    await interaction.response.send_message(
+        embed=await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            "Leaving Server",
+            f"Leaving **{guild_name}** (`{guild_id}`)."
+        ),
+        ephemeral=True
+    )
+
+    await dm_server_owner_bot_left(guild_id, guild_name)
+
+    with suppress(Exception):
+        await guild.leave()
+
+
+@bot.tree.command(name="premiumservers", description="Show all premium servers")
+async def premiumservers(interaction: discord.Interaction):
+    if not await is_bot_owner(interaction.user):
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id if interaction.guild else None, "Access Denied", "Only the bot owner can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    rows = await list_active_premium_servers_db()
+    owner_user = await try_fetch_user(interaction.user.id)
+
+    if owner_user:
+        if not rows:
+            embed = await base_embed(
+                interaction.guild.id if interaction.guild else None,
+                "Premium Servers",
+                "There are no active premium servers."
+            )
+            with suppress(Exception):
+                await owner_user.send(embed=embed)
+        else:
+            lines = []
+            for row in rows:
+                lines.append(
+                    f"**{row['guild_name']}**\n"
+                    f"ID: `{row['guild_id']}`\n"
+                    f"Expires: {format_premium_expiry(row['expires_at'])}\n"
+                )
+
+            current = ""
+            chunks: list[str] = []
+            for block in lines:
+                if len(current) + len(block) > 3500:
+                    chunks.append(current)
+                    current = block
+                else:
+                    current += block + "\n"
+            if current:
+                chunks.append(current)
+
+            for index, chunk in enumerate(chunks, start=1):
+                title = "Premium Servers"
+                if len(chunks) > 1:
+                    title += f" ({index}/{len(chunks)})"
+                embed = await base_embed(interaction.guild.id if interaction.guild else None, title, chunk)
+                with suppress(Exception):
+                    await owner_user.send(embed=embed)
+
+    await interaction.followup.send(
+        embed=await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            "Premium Servers Sent",
+            "The premium server list has been sent to your DMs."
+        ),
+        ephemeral=True
+    )
+
+
+# =========================================================
 # COMMAND ERROR HANDLERS
 # =========================================================
 @setup.error
@@ -2742,6 +3679,102 @@ async def ticketunban_error(interaction: discord.Interaction, error: app_command
         pass
 
 
+@generatepremiumkey.error
+async def generatepremiumkey_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Generate Premium Key Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+@premiumkey.error
+async def premiumkey_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Premium Activation Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+@removepremium.error
+async def removepremium_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Remove Premium Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+@activekeys.error
+async def activekeys_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Active Keys Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+@remove.error
+async def remove_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Remove Key Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+@leaveserver.error
+async def leaveserver_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Leave Server Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+@premiumservers.error
+async def premiumservers_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Premium Servers Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
+@serverstatus.error
+async def serverstatus_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = await base_embed(interaction.guild.id if interaction.guild else None, "Server Status Failed", f"{error}", error=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
 # =========================================================
 # VIEW RESTORATION
 # =========================================================
@@ -2763,9 +3796,10 @@ async def restore_persistent_views():
 # =========================================================
 @bot.event
 async def on_ready():
-    global ban_expiry_task, startup_ready_done
+    global ban_expiry_task, premium_expiry_task, startup_ready_done
 
     await init_db()
+    await refresh_bot_owner_ids()
 
     if not startup_ready_done:
         try:
@@ -2778,6 +3812,9 @@ async def on_ready():
 
         if ban_expiry_task is None or ban_expiry_task.done():
             ban_expiry_task = asyncio.create_task(ticket_ban_expiry_loop())
+
+        if premium_expiry_task is None or premium_expiry_task.done():
+            premium_expiry_task = asyncio.create_task(premium_expiry_loop_task())
 
         startup_ready_done = True
 
@@ -2810,13 +3847,19 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
 # CLEAN SHUTDOWN
 # =========================================================
 async def close_resources():
-    global db_pool, ban_expiry_task
+    global db_pool, ban_expiry_task, premium_expiry_task
 
     if ban_expiry_task is not None:
         ban_expiry_task.cancel()
         with suppress(Exception):
             await ban_expiry_task
         ban_expiry_task = None
+
+    if premium_expiry_task is not None:
+        premium_expiry_task.cancel()
+        with suppress(Exception):
+            await premium_expiry_task
+        premium_expiry_task = None
 
     if db_pool is not None:
         await db_pool.close()
