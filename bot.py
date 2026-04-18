@@ -2840,7 +2840,7 @@ class DeleteTicketButton(discord.ui.Button):
             # 🔥 DISABLE BUTTONS (keep message, nicer UX)
             try:
                 if interaction.message:
-                    await interaction.message.edit(view=ClosedTicketControlsView())
+                    await interaction.message.edit(view=DeletingTicketControlsView())
             except Exception:
                 pass
 
@@ -2903,6 +2903,18 @@ class ClosedTicketControlsView(discord.ui.View):
         self.add_item(CloseTicketButton(disabled=True, closed_variant=True))
         self.add_item(DeleteTicketButton(closed_variant=True))
 
+
+class DeletingTicketControlsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(ClaimTicketButton(disabled=True, closed_variant=True))
+        self.add_item(CloseTicketButton(disabled=True, closed_variant=True))
+        self.add_item(DeleteTicketButton(disabled=True, closed_variant=True))
+
+
+# =========================================================
+# BACKGROUND TASKS
+# =========================================================
 # =========================================================
 # BACKGROUND TASKS
 # =========================================================
