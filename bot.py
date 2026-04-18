@@ -71,7 +71,7 @@ OWNER_COMMAND_NAMES = {
     "generatepremiumkey",
     "removepremium",
     "activekeys",
-    "remove",
+    "removekey",
     "leaveserver",
     "premiumservers",
 }
@@ -86,11 +86,12 @@ setup_sessions: dict[tuple[int, int], "SetupData"] = {}
 
 ticket_channel_locks: dict[int, asyncio.Lock] = {}
 ticket_create_locks: dict[tuple[int, int], asyncio.Lock] = {}
+profile_update_locks: dict[int, asyncio.Lock] = {}
 
 guild_config_cache: dict[int, dict[str, Any]] = {}
 ticket_options_cache: dict[int, list[dict[str, Any]]] = {}
 
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
 startup_ready_done = False
 bot_owner_ids: set[int] = set()
 
@@ -123,12 +124,26 @@ def get_ticket_create_lock(guild_id: int, user_id: int) -> asyncio.Lock:
     return lock
 
 
+def get_profile_update_lock(guild_id: int) -> asyncio.Lock:
+    lock = profile_update_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        profile_update_locks[guild_id] = lock
+    return lock
+
+
 def cleanup_ticket_channel_lock(channel_id: int):
     ticket_channel_locks.pop(channel_id, None)
 
 
 def cleanup_ticket_create_lock(guild_id: int, user_id: int):
     ticket_create_locks.pop((guild_id, user_id), None)
+
+
+def cleanup_profile_update_lock(guild_id: int):
+    lock = profile_update_locks.get(guild_id)
+    if lock is not None and not lock.locked():
+        profile_update_locks.pop(guild_id, None)
 
 
 # =========================================================
@@ -908,6 +923,36 @@ def generate_raw_premium_key() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(20))
 
 
+def format_discord_api_error(text: str) -> str:
+    if not text:
+        return "Discord returned an unknown error while updating the profile."
+
+    lowered = text.lower()
+
+    if "rate limit" in lowered or "too many requests" in lowered or '"retry_after"' in lowered:
+        return (
+            "The server profile was updated too recently.\n\n"
+            "Please wait a little moment and try `/setprofile` again."
+        )
+
+    if "missing permissions" in lowered or "forbidden" in lowered:
+        return (
+            "The bot does not have permission to update its server profile here.\n\n"
+            "Make sure the bot can manage its own server profile."
+        )
+
+    if "image" in lowered or "avatar" in lowered or "banner" in lowered:
+        return (
+            "Discord rejected one of the images.\n\n"
+            "Try another PNG, JPG or WEBP image with a normal size."
+        )
+
+    return (
+        "Discord rejected the profile update.\n\n"
+        "Please try again in a moment. If it keeps happening, try different images."
+    )
+
+
 async def generate_unique_premium_keys(amount: int, duration_code: str, created_by: int) -> list[str]:
     keys: list[str] = []
     seen: set[str] = set()
@@ -1092,6 +1137,21 @@ async def build_closed_ticket_embed(guild_id: int, closed_by: discord.Member) ->
     embed = discord.Embed(
         title="Ticket Closed",
         description=f"Ticket closed by {closed_by.mention}.",
+        color=color
+    )
+    return await apply_footer(embed, guild_id)
+
+
+async def build_delete_countdown_embed(guild_id: int, seconds_left: int, deleted_by: discord.Member) -> discord.Embed:
+    config = await get_guild_config(guild_id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    embed = discord.Embed(
+        title="Deleting Ticket",
+        description=(
+            f"Deleting ticket in **{seconds_left}**...\n\n"
+            f"Requested by: {deleted_by.mention}"
+        ),
         color=color
     )
     return await apply_footer(embed, guild_id)
@@ -1663,7 +1723,7 @@ async def build_transcript_zip(channel: discord.TextChannel) -> discord.File:
 # =========================================================
 # GUILD PROFILE HELPERS
 # =========================================================
-async def patch_guild_profile_with_retry(guild_id: int, payload: dict, max_attempts: int = 5) -> tuple[bool, str]:
+async def patch_guild_profile_with_retry(guild_id: int, payload: dict, max_attempts: int = 3) -> tuple[bool, str]:
     headers = {
         "Authorization": f"Bot {TOKEN}",
         "Content-Type": "application/json"
@@ -1677,24 +1737,30 @@ async def patch_guild_profile_with_retry(guild_id: int, payload: dict, max_attem
                     if 200 <= resp.status < 300:
                         return True, "Guild profile updated successfully."
 
+                    text = await resp.text()
+
                     if resp.status == 429:
                         try:
                             data = await resp.json()
-                            retry_after = float(data.get("retry_after", 1.5))
+                            retry_after = float(data.get("retry_after", 1.2))
                         except Exception:
-                            retry_after = 1.5
-                        await asyncio.sleep(retry_after + 0.25)
-                        continue
+                            retry_after = 1.2
 
-                    text = await resp.text()
-                    return False, f"Discord API error {resp.status}: {text}"
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(retry_after + 0.15)
+                            continue
+
+                        return False, format_discord_api_error(text)
+
+                    return False, format_discord_api_error(text)
+
             except aiohttp.ClientError:
                 if attempt < max_attempts - 1:
-                    await asyncio.sleep(1.0 + attempt)
+                    await asyncio.sleep(0.8 + (attempt * 0.4))
                     continue
-                return False, "Discord API connection error."
+                return False, "Could not connect to Discord while updating the server profile."
 
-    return False, "Discord API rate-limited too many times. Try again."
+    return False, "Discord did not accept the profile update. Please try again."
 
 
 async def set_guild_profile(
@@ -2639,19 +2705,25 @@ class CloseTicketButton(discord.ui.Button):
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.defer()
-        except Exception:
-            pass
+        await safe_defer(interaction, ephemeral=False, thinking=False)
 
         lock = get_ticket_channel_lock(interaction.channel.id)
         async with lock:
             ticket = await get_ticket_by_channel(interaction.channel.id)
             if not ticket:
+                await safe_component_reply(
+                    interaction,
+                    embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
+                    ephemeral=True
+                )
                 return
 
             if ticket["status"] == "closed":
+                await safe_component_reply(
+                    interaction,
+                    embed=await base_embed(interaction.guild.id, "Ticket Closed", "This ticket is already closed."),
+                    ephemeral=True
+                )
                 return
 
             if not await is_support_or_admin(interaction.user, interaction.guild.id):
@@ -2697,6 +2769,10 @@ class CloseTicketButton(discord.ui.Button):
                     return
 
             await close_ticket_record(interaction.channel.id, interaction.user.id)
+
+            closed_embed = await build_closed_ticket_embed(interaction.guild.id, interaction.user)
+            with suppress(Exception):
+                await interaction.channel.send(embed=closed_embed)
 
             try:
                 if interaction.message:
@@ -2761,6 +2837,28 @@ class DeleteTicketButton(discord.ui.Button):
                 )
                 return
 
+            await safe_ephemeral_edit_or_followup(
+                interaction,
+                embed=await base_embed(guild.id, "Delete Started", "The ticket delete countdown has started.")
+            )
+
+            countdown_message: Optional[discord.Message] = None
+
+            try:
+                countdown_embed = await build_delete_countdown_embed(guild.id, 3, deleter)
+                countdown_message = await channel.send(embed=countdown_embed)
+
+                for seconds_left in (2, 1):
+                    await asyncio.sleep(1)
+                    with suppress(Exception):
+                        await countdown_message.edit(
+                            embed=await build_delete_countdown_embed(guild.id, seconds_left, deleter)
+                        )
+
+                await asyncio.sleep(1)
+            except Exception:
+                pass
+
             transcript_file = await build_transcript_zip(channel)
             opener_text = f"<@{ticket['opener_id']}>"
             channel_name = channel.name
@@ -2779,11 +2877,6 @@ class DeleteTicketButton(discord.ui.Button):
             )
 
             await delete_ticket_record(channel_id)
-
-            await safe_ephemeral_edit_or_followup(
-                interaction,
-                embed=await base_embed(guild.id, "Deleting Ticket", "The ticket is being deleted.")
-            )
 
             asyncio.create_task(refresh_guild_panel(guild.id))
 
@@ -2954,62 +3047,107 @@ async def setprofile(
         )
         return
 
+    guild_lock = get_profile_update_lock(interaction.guild.id)
+    if guild_lock.locked():
+        await interaction.response.send_message(
+            embed=await base_embed(
+                interaction.guild.id,
+                "Profile Update Running",
+                "A server profile update is already running right now.\n\nPlease wait a moment and try again.",
+                error=True
+            ),
+            ephemeral=True
+        )
+        return
+
     await safe_defer(interaction, ephemeral=True, thinking=True)
 
     avatar_image = None
     banner_image = None
 
-    try:
-        if avatar is not None:
-            avatar_raw = await avatar.read()
-            avatar_image = ImageData(
-                filename=avatar.filename,
-                mime_type=avatar.content_type or "image/png",
-                raw=avatar_raw
+    async with guild_lock:
+        try:
+            if avatar is not None and banner is not None:
+                avatar_raw, banner_raw = await asyncio.gather(avatar.read(), banner.read())
+                avatar_image = ImageData(
+                    filename=avatar.filename,
+                    mime_type=avatar.content_type or "image/png",
+                    raw=avatar_raw
+                )
+                banner_image = ImageData(
+                    filename=banner.filename,
+                    mime_type=banner.content_type or "image/png",
+                    raw=banner_raw
+                )
+            elif avatar is not None:
+                avatar_raw = await avatar.read()
+                avatar_image = ImageData(
+                    filename=avatar.filename,
+                    mime_type=avatar.content_type or "image/png",
+                    raw=avatar_raw
+                )
+            elif banner is not None:
+                banner_raw = await banner.read()
+                banner_image = ImageData(
+                    filename=banner.filename,
+                    mime_type=banner.content_type or "image/png",
+                    raw=banner_raw
+                )
+
+            success, message = await set_guild_profile(
+                guild_id=interaction.guild.id,
+                nickname=nickname,
+                avatar_image=avatar_image,
+                banner_image=banner_image
             )
 
-        if banner is not None:
-            banner_raw = await banner.read()
-            banner_image = ImageData(
-                filename=banner.filename,
-                mime_type=banner.content_type or "image/png",
-                raw=banner_raw
-            )
+            if success:
+                await interaction.followup.send(
+                    embed=await base_embed(
+                        interaction.guild.id,
+                        "Server Profile Updated",
+                        "The bot profile was updated for this premium server."
+                    ),
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    embed=await base_embed(interaction.guild.id, "Update Failed", message, error=True),
+                    ephemeral=True
+                )
 
-        success, message = await set_guild_profile(
-            guild_id=interaction.guild.id,
-            nickname=nickname,
-            avatar_image=avatar_image,
-            banner_image=banner_image
-        )
-
-        if success:
+        except Exception as e:
+            log.exception("Setprofile command failed in guild %s", interaction.guild.id)
             await interaction.followup.send(
                 embed=await base_embed(
                     interaction.guild.id,
-                    "Server Profile Updated",
-                    "The bot profile was updated for this premium server."
+                    "Update Failed",
+                    "Something went wrong while updating the server profile.\n\nPlease try again in a moment.",
+                    error=True
                 ),
                 ephemeral=True
             )
-        else:
-            await interaction.followup.send(
-                embed=await base_embed(interaction.guild.id, "Update Failed", message, error=True),
-                ephemeral=True
-            )
-
-    except Exception as e:
-        log.exception("Setprofile command failed in guild %s", interaction.guild.id)
-        await interaction.followup.send(
-            embed=await base_embed(interaction.guild.id, "Update Failed", f"An error happened:\n`{e}`", error=True),
-            ephemeral=True
-        )
+        finally:
+            cleanup_profile_update_lock(interaction.guild.id)
 
 
 @bot.tree.command(name="remind", description="DM a user to reply in their ticket")
 @app_commands.guild_only()
 async def remind(interaction: discord.Interaction, user: discord.Member, message: str):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    premium_row = await get_active_premium_guild_record(interaction.guild.id)
+    if not premium_row:
+        await interaction.response.send_message(
+            embed=await base_embed(
+                interaction.guild.id,
+                "Premium Required",
+                "This command is only available in premium servers.",
+                error=True
+            ),
+            ephemeral=True
+        )
         return
 
     if not isinstance(interaction.channel, discord.TextChannel):
@@ -3431,8 +3569,8 @@ async def activekeys(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="remove", description="Remove a premium key so it can no longer be used")
-async def remove(interaction: discord.Interaction, key: str):
+@bot.tree.command(name="removekey", description="Remove a premium key so it can no longer be used")
+async def removekey(interaction: discord.Interaction, key: str):
     if not await is_bot_owner(interaction.user):
         raise app_commands.CheckFailure("Only the bot owner can use this command.")
 
@@ -3744,8 +3882,8 @@ async def activekeys_error(interaction: discord.Interaction, error: app_commands
         pass
 
 
-@remove.error
-async def remove_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+@removekey.error
+async def removekey_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if await handle_owner_visibility_error(interaction, "Remove Key Failed", error):
         return
     embed = await base_embed(interaction.guild.id if interaction.guild else None, "Remove Key Failed", f"{error}", error=True)
@@ -3850,6 +3988,7 @@ async def on_guild_remove(guild: discord.Guild):
     guild_config_cache.pop(guild.id, None)
     ticket_options_cache.pop(guild.id, None)
     active_setup_guilds.discard(guild.id)
+    cleanup_profile_update_lock(guild.id)
 
 
 @bot.event
