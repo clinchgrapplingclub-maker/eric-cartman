@@ -2836,10 +2836,10 @@ class DeleteTicketButton(discord.ui.Button):
                     embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True)
                 )
                 return
-            # 🔥 DISABLE BUTTONS (anti-spam)
+            # 🔥 DISABLE BUTTONS (keep message, nicer UX)
             try:
                 if interaction.message:
-                    await interaction.message.edit(view=None)
+                    await interaction.message.edit(view=ClosedTicketControlsView())
             except Exception:
                 pass
 
