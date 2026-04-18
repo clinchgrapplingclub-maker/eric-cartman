@@ -2830,20 +2830,14 @@ class DeleteTicketButton(discord.ui.Button):
                 )
                 return
 
-            if not await is_support_or_admin(deleter, guild.id):
-                await safe_ephemeral_edit_or_followup(
-                    interaction,
-                    embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True)
-                )
-                return
+           if not await is_support_or_admin(deleter, guild.id):
+    await safe_ephemeral_edit_or_followup(
+        interaction,
+        embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True)
+    )
+    return
 
-            await safe_ephemeral_edit_or_followup(
-                interaction,
-                embed=await base_embed(guild.id, "Delete Started", "The ticket delete countdown has started.")
-            )
-
-            countdown_message: Optional[discord.Message] = None
-
+countdown_message: Optional[discord.Message] = None
             try:
                 countdown_embed = await build_delete_countdown_embed(guild.id, 3, deleter)
                 countdown_message = await channel.send(embed=countdown_embed)
