@@ -35,9 +35,6 @@ if not TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set in environment variables.")
 
-if not DEEPSEEK_API_KEY:
-    log.warning("DEEPSEEK_API_KEY is not set. AI assistant features will be disabled.")
-
 
 class IgnoreDiscordNoise(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -111,6 +108,7 @@ PREMIUM_DURATION_LABELS = {
 
 # AI Assistant conversation tracking
 ai_conversations: dict[int, dict[str, Any]] = {}
+ai_processing_locks: dict[int, asyncio.Lock] = {}
 
 
 # =========================================================
@@ -141,9 +139,18 @@ def get_profile_update_lock(guild_id: int) -> asyncio.Lock:
     return lock
 
 
+def get_ai_processing_lock(channel_id: int) -> asyncio.Lock:
+    lock = ai_processing_locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        ai_processing_locks[channel_id] = lock
+    return lock
+
+
 def cleanup_ticket_channel_lock(channel_id: int):
     ticket_channel_locks.pop(channel_id, None)
     ai_conversations.pop(channel_id, None)
+    ai_processing_locks.pop(channel_id, None)
 
 
 def cleanup_ticket_create_lock(guild_id: int, user_id: int):
@@ -327,6 +334,17 @@ async def init_db():
                     alert_channel_id BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            # Create ai_alert_messages table properly
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ai_alert_messages (
+                    ticket_channel_id BIGINT PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    alert_message_id BIGINT NOT NULL,
+                    alert_channel_id BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
 
@@ -603,17 +621,6 @@ async def set_ai_assistant_config(guild_id: int, enabled: bool, alert_channel_id
 
 async def save_alert_message(guild_id: int, ticket_channel_id: int, alert_message_id: int, alert_channel_id: int):
     await db_execute("""
-        CREATE TABLE IF NOT EXISTS ai_alert_messages (
-            guild_id BIGINT NOT NULL,
-            ticket_channel_id BIGINT NOT NULL,
-            alert_message_id BIGINT NOT NULL,
-            alert_channel_id BIGINT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (ticket_channel_id)
-        )
-    """)
-
-    await db_execute("""
         INSERT INTO ai_alert_messages (guild_id, ticket_channel_id, alert_message_id, alert_channel_id)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (ticket_channel_id)
@@ -624,15 +631,21 @@ async def save_alert_message(guild_id: int, ticket_channel_id: int, alert_messag
 
 
 async def get_alert_message(ticket_channel_id: int) -> Optional[dict[str, Any]]:
-    return await db_fetchrow("""
-        SELECT guild_id, ticket_channel_id, alert_message_id, alert_channel_id
-        FROM ai_alert_messages
-        WHERE ticket_channel_id = $1
-    """, ticket_channel_id)
+    try:
+        return await db_fetchrow("""
+            SELECT guild_id, ticket_channel_id, alert_message_id, alert_channel_id
+            FROM ai_alert_messages
+            WHERE ticket_channel_id = $1
+        """, ticket_channel_id)
+    except Exception:
+        return None
 
 
 async def delete_alert_message(ticket_channel_id: int):
-    await db_execute("DELETE FROM ai_alert_messages WHERE ticket_channel_id = $1", ticket_channel_id)
+    try:
+        await db_execute("DELETE FROM ai_alert_messages WHERE ticket_channel_id = $1", ticket_channel_id)
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -1447,9 +1460,9 @@ async def refresh_guild_panel(guild_id: int):
 
 
 # =========================================================
-# AI ASSISTANT
+# ADVANCED AI ASSISTANT
 # =========================================================
-async def call_deepseek_api(messages: list[dict], max_tokens: int = 300) -> Optional[str]:
+async def call_deepseek_api(messages: list[dict], max_tokens: int = 500) -> Optional[str]:
     if not DEEPSEEK_API_KEY:
         return None
 
@@ -1465,7 +1478,7 @@ async def call_deepseek_api(messages: list[dict], max_tokens: int = 300) -> Opti
         "temperature": 0.7
     }
 
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         try:
             async with session.post(
                 "https://api.deepseek.com/v1/chat/completions",
@@ -1484,118 +1497,105 @@ async def call_deepseek_api(messages: list[dict], max_tokens: int = 300) -> Opti
             return None
 
 
-async def ai_analyze_ticket(
-    ticket_channel: discord.TextChannel,
-    opener: discord.Member,
-    option_label: str,
-    ticket_options: list[dict],
-    message_content: str
-) -> tuple[str, Optional[str], Optional[str]]:
+async def ai_analyze_conversation(
+    conversation_history: list[str],
+    ticket_category: str,
+    available_categories: list[str],
+    opener_name: str
+) -> dict:
     """
-    Returns: (response_text, suggested_category, summary_for_alert)
+    Advanced AI analysis of the entire conversation.
+    Returns a dict with: response, should_close, needs_staff, staff_summary, suggested_category, should_rename, new_name
     """
-    options_text = "\n".join([f"- {opt['label']}" for opt in ticket_options])
+    if not DEEPSEEK_API_KEY:
+        return {
+            "response": None,
+            "should_close": False,
+            "needs_staff": False,
+            "staff_summary": None,
+            "suggested_category": None,
+            "should_rename": False,
+            "new_name": None
+        }
 
-    system_prompt = f"""You are a helpful ticket assistant bot. You help users in a Discord ticket system.
+    conversation_text = "\n".join(conversation_history[-10:])  # Last 10 messages for context
 
-The available ticket categories are:
-{options_text}
+    categories_text = ", ".join(available_categories)
 
-The user opened a ticket in the "{option_label}" category.
+    system_prompt = f"""You are an advanced AI ticket assistant for a Discord support system. Your name is Ticket Assistant.
+
+Current ticket category: {ticket_category}
+Available categories: {categories_text}
+User's name: {opener_name}
 
 Your role:
-1. Greet the user and ask how you can help.
-2. If the user asks about something that belongs in a different category, politely tell them and suggest the correct category.
-3. Answer questions if you can, but for complex requests (purchases, donations, technical issues requiring staff), you should say you'll get a staff member.
-4. Be concise and friendly. Use short sentences.
-5. If the user indicates they're done (says "no", "that's all", "thanks", etc.), you should respond indicating the ticket will be closed. Use the phrase "[CLOSE_TICKET]" at the end of your response if you think the ticket should be closed.
-6. If the user needs staff help, include "[NEEDS_STAFF]" and then a very brief summary of what they need (e.g., "[NEEDS_STAFF] purchase turf" or "[NEEDS_STAFF] donate $50").
+1. Analyze the conversation carefully and determine what the user needs.
+2. If the user is asking about something that belongs in a different category, suggest the correct category.
+3. If the user clearly indicates they are done (saying things like "no", "that's all", "thanks, bye", "nothing else", "I'm good", "all set"), you MUST respond with a friendly closing message and mark for closure.
+4. If the user needs human staff help (complex issues, purchases, donations, technical problems you can't solve), mark for staff escalation and provide a VERY short summary (2-4 words max, e.g., "purchase turf", "donate $50", "bug report").
+5. If you escalate to staff, also suggest a short channel name (max 30 chars, lowercase, hyphens instead of spaces) that summarizes the issue.
+6. Keep responses friendly, professional, and under 400 characters.
 
-Always respond in English. Keep responses under 300 characters."""
+IMPORTANT: You MUST output your response in this exact JSON format:
+{{
+    "response": "Your response message to the user",
+    "should_close": true/false,
+    "needs_staff": true/false,
+    "staff_summary": "short summary if needs_staff, else null",
+    "suggested_category": "category name if wrong category, else null",
+    "should_rename": true/false,
+    "new_name": "new-channel-name if should_rename, else null"
+}}"""
 
-    user_message = f"User {opener.display_name} says: {message_content}"
+    user_message = f"Conversation history:\n{conversation_text}\n\nAnalyze and respond in the required JSON format."
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message}
     ]
 
-    response = await call_deepseek_api(messages, max_tokens=200)
+    response = await call_deepseek_api(messages, max_tokens=600)
 
     if not response:
-        return (
-            "Hello! How can I help you today? Please describe what you need assistance with.",
-            None,
-            None
-        )
+        return {
+            "response": None,
+            "should_close": False,
+            "needs_staff": False,
+            "staff_summary": None,
+            "suggested_category": None,
+            "should_rename": False,
+            "new_name": None
+        }
 
-    suggested_category = None
-    for opt in ticket_options:
-        if opt["label"].lower() in response.lower():
-            suggested_category = opt["label"]
-            break
+    # Parse JSON response
+    try:
+        # Clean up response - sometimes AI adds extra text
+        json_start = response.find("{")
+        json_end = response.rfind("}") + 1
+        if json_start != -1 and json_end > json_start:
+            json_str = response[json_start:json_end]
+            data = json.loads(json_str)
+            return {
+                "response": data.get("response"),
+                "should_close": data.get("should_close", False),
+                "needs_staff": data.get("needs_staff", False),
+                "staff_summary": data.get("staff_summary"),
+                "suggested_category": data.get("suggested_category"),
+                "should_rename": data.get("should_rename", False),
+                "new_name": data.get("new_name")
+            }
+    except json.JSONDecodeError:
+        log.warning("Failed to parse AI JSON response: %s", response[:200])
 
-    needs_staff = False
-    summary = None
-
-    if "[NEEDS_STAFF]" in response:
-        needs_staff = True
-        parts = response.split("[NEEDS_STAFF]")
-        response = parts[0].strip()
-        if len(parts) > 1:
-            summary = parts[1].strip()[:100]
-
-    if "[CLOSE_TICKET]" in response:
-        response = response.replace("[CLOSE_TICKET]", "").strip()
-        response += "\n\n*This ticket will be closed. If you need further assistance, please open a new ticket.*"
-
-    return response, suggested_category, summary
-
-
-async def ai_check_if_done(messages_history: list[dict], last_user_message: str) -> bool:
-    """Check if the user indicated they're done and ticket can be closed."""
-    if not DEEPSEEK_API_KEY:
-        return False
-
-    lower_msg = last_user_message.lower().strip()
-
-    done_phrases = ["no", "nope", "that's all", "that's it", "thanks", "thank you", "no thanks", "i'm good", "im good", "all good", "nothing else", "that's everything"]
-
-    for phrase in done_phrases:
-        if lower_msg == phrase or lower_msg.startswith(phrase + " ") or lower_msg.endswith(" " + phrase):
-            return True
-
-    return False
-
-
-async def ai_get_ticket_summary(messages: list[str]) -> str:
-    """Get a short summary for the ticket name."""
-    if not DEEPSEEK_API_KEY:
-        return "support"
-
-    conversation = "\n".join(messages[-5:])
-
-    system_prompt = """You are a helpful assistant. Based on the conversation, create a VERY short ticket title (2-4 words max) that summarizes what the user needs.
-Examples:
-- "purchase turf"
-- "donate $50"
-- "refund request"
-- "bug report"
-- "question about roles"
-
-Return ONLY the short title, nothing else. Keep it under 30 characters."""
-
-    messages_payload = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Conversation:\n{conversation}\n\nShort title:"}
-    ]
-
-    response = await call_deepseek_api(messages_payload, max_tokens=30)
-
-    if response:
-        return clean_channel_name(response.strip())[:30]
-
-    return "support-needed"
+    return {
+        "response": None,
+        "should_close": False,
+        "needs_staff": False,
+        "staff_summary": None,
+        "suggested_category": None,
+        "should_rename": False,
+        "new_name": None
+    }
 
 
 async def send_staff_alert(
@@ -1622,7 +1622,8 @@ async def send_staff_alert(
         description=(
             f"**User:** {opener.mention} ({opener.display_name})\n"
             f"**Ticket:** {ticket_channel.mention}\n"
-            f"**Request:** {summary}"
+            f"**Request:** {summary}\n\n"
+            f"*This message will be removed when a staff member claims the ticket.*"
         ),
         color=color
     )
@@ -1643,17 +1644,21 @@ async def remove_staff_alert(ticket_channel_id: int):
 
     guild = bot.get_guild(alert_data["guild_id"])
     if not guild:
+        await delete_alert_message(ticket_channel_id)
         return
 
     alert_channel = guild.get_channel(alert_data["alert_channel_id"])
     if not isinstance(alert_channel, discord.TextChannel):
+        await delete_alert_message(ticket_channel_id)
         return
 
     try:
         message = await alert_channel.fetch_message(alert_data["alert_message_id"])
         await message.delete()
-    except Exception:
+    except discord.NotFound:
         pass
+    except Exception as e:
+        log.warning("Failed to delete alert message: %s", e)
 
     await delete_alert_message(ticket_channel_id)
 
@@ -1700,87 +1705,106 @@ async def handle_ai_assistant_message(message: discord.Message):
     if not config:
         return
 
-    # Initialize conversation history
-    if channel.id not in ai_conversations:
-        ai_conversations[channel.id] = {
-            "messages": [],
-            "needs_staff": False,
-            "staff_alerted": False
-        }
-
-    conv = ai_conversations[channel.id]
-
-    if conv.get("staff_alerted"):
+    # Use a lock to prevent multiple AI responses at once
+    ai_lock = get_ai_processing_lock(channel.id)
+    if ai_lock.locked():
         return
 
-    user_message = message.content
+    async with ai_lock:
+        # Initialize conversation history if needed
+        if channel.id not in ai_conversations:
+            ai_conversations[channel.id] = {
+                "messages": [],
+                "staff_alerted": False,
+                "staff_summary": None
+            }
 
-    conv["messages"].append(f"User: {user_message}")
+        conv = ai_conversations[channel.id]
 
-    ticket_options = await get_ticket_options(guild.id)
+        # Don't process if staff was already alerted
+        if conv.get("staff_alerted"):
+            return
 
-    response, suggested_category, needs_staff_summary = await ai_analyze_ticket(
-        channel,
-        message.author,
-        ticket["option_label"],
-        ticket_options,
-        user_message
-    )
+        # Add user message to history
+        conv["messages"].append(f"{message.author.display_name}: {message.content}")
 
-    if needs_staff_summary and not conv.get("staff_alerted"):
-        conv["needs_staff"] = True
-        conv["staff_alerted"] = True
-        conv["staff_summary"] = needs_staff_summary
+        # Get available categories
+        ticket_options = await get_ticket_options(guild.id)
+        available_categories = [opt["label"] for opt in ticket_options]
 
-        new_name = await ai_get_ticket_summary(conv["messages"])
-        try:
-            await channel.edit(name=new_name[:50])
-        except Exception:
-            pass
-
-        await send_staff_alert(
-            guild,
-            channel,
-            message.author,
-            needs_staff_summary,
-            config["support_role_id"],
-            ai_config["alert_channel_id"]
+        # Analyze conversation
+        analysis = await ai_analyze_conversation(
+            conv["messages"],
+            ticket["option_label"],
+            available_categories,
+            message.author.display_name
         )
 
-        await channel.send(
-            embed=await base_embed(
-                guild.id,
-                "Staff Notified",
-                "I'll get you a staff member to help you with this. Please wait for assistance."
+        # Check for wrong category
+        if analysis["suggested_category"] and analysis["suggested_category"] != ticket["option_label"]:
+            response = f"You've opened the wrong kind of ticket. Please open a **{analysis['suggested_category']}** ticket instead for this type of request."
+            await channel.send(response)
+            return
+
+        # Check if staff needed
+        if analysis["needs_staff"] and not conv.get("staff_alerted"):
+            conv["staff_alerted"] = True
+            conv["staff_summary"] = analysis["staff_summary"]
+
+            # Rename channel if suggested
+            if analysis["should_rename"] and analysis["new_name"]:
+                try:
+                    clean_name = clean_channel_name(analysis["new_name"])
+                    if clean_name:
+                        await channel.edit(name=clean_name[:50])
+                except Exception:
+                    pass
+
+            # Send staff alert
+            await send_staff_alert(
+                guild,
+                channel,
+                message.author,
+                analysis["staff_summary"] or "Needs assistance",
+                config["support_role_id"],
+                ai_config["alert_channel_id"]
             )
-        )
-        return
 
-    if suggested_category and suggested_category != ticket["option_label"]:
-        response = f"You've opened the wrong kind of ticket. Please open a **{suggested_category}** ticket instead."
+            # Send response to user
+            if analysis["response"]:
+                await channel.send(analysis["response"])
+            else:
+                await channel.send("I'll get you a staff member to help you with this. Please wait for assistance.")
+            return
 
-    await channel.send(response)
+        # Send AI response
+        if analysis["response"]:
+            await channel.send(analysis["response"])
+            conv["messages"].append(f"Ticket Assistant: {analysis['response']}")
 
-    is_done = await ai_check_if_done(conv["messages"], user_message)
-    if is_done and not conv.get("staff_alerted"):
-        await close_ticket_record(channel.id, bot.user.id)
+        # Check if should close
+        if analysis["should_close"] and not conv.get("staff_alerted"):
+            await close_ticket_record(channel.id, bot.user.id)
 
-        closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
-        await channel.send(embed=closed_embed)
+            closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
+            await channel.send(embed=closed_embed)
 
-        try:
-            await channel.edit(name=f"closed-{channel.name}")
-        except Exception:
-            pass
+            try:
+                await channel.edit(name=f"closed-{channel.name[:40]}")
+            except Exception:
+                pass
 
-        view = ClosedTicketControlsView()
-        await channel.send(view=view)
+            view = ClosedTicketControlsView()
+            await channel.send(view=view)
 
-        await send_log(
-            guild,
-            "Ticket Auto-Closed",
-            f"Channel: {channel.mention}\nClosed automatically by AI assistant."
-        )
+            await send_log(
+                guild,
+                "Ticket Auto-Closed",
+                f"Channel: {channel.mention}\nClosed automatically by AI assistant."
+            )
+
+            # Clean up
+            cleanup_ticket_channel_lock(channel.id)
 
 
 # =========================================================
@@ -3033,17 +3057,17 @@ class TicketDropdown(discord.ui.Select):
                         view=ticket_view
                     )
 
-                # AI Assistant greeting
+                # Initialize AI conversation but DON'T send greeting - wait for user
                 ai_config = await get_ai_assistant_config(guild.id)
                 premium_row = await get_active_premium_guild_record(guild.id)
 
                 if ai_config and ai_config["enabled"] and premium_row and DEEPSEEK_API_KEY:
                     ai_conversations[ticket_channel.id] = {
                         "messages": [],
-                        "needs_staff": False,
-                        "staff_alerted": False
+                        "staff_alerted": False,
+                        "staff_summary": None
                     }
-                    await ticket_channel.send("Hello! How can I help you today?")
+                    # NO greeting - wait for user to speak first
 
                 asyncio.create_task(refresh_guild_panel(guild.id))
                 asyncio.create_task(
@@ -3144,9 +3168,17 @@ class ClaimTicketButton(discord.ui.Button):
             await remove_staff_alert(interaction.channel.id)
             ai_conversations.pop(interaction.channel.id, None)
 
+            # Send claim confirmation
+            claim_embed = await base_embed(
+                interaction.guild.id,
+                "Ticket Claimed",
+                f"Ticket claimed by {interaction.user.mention}.\n\nAI Assistant has been disabled."
+            )
+            await interaction.channel.send(embed=claim_embed)
+
             await safe_non_ephemeral_followup(
                 interaction,
-                embed=await base_embed(interaction.guild.id, "Ticket Claimed", f"Ticket claimed by {interaction.user.mention}.")
+                embed=await base_embed(interaction.guild.id, "Ticket Claimed", f"You have claimed this ticket.")
             )
 
             await send_log(
@@ -3373,7 +3405,7 @@ class DeleteTicketButton(discord.ui.Button):
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        await safe_defer(interaction, ephemeral=True, thinking=False)
+        await safe_defer(interaction, ephemeral=True, thinking=True)
 
         channel = interaction.channel
         guild = interaction.guild
@@ -3419,6 +3451,7 @@ class DeleteTicketButton(discord.ui.Button):
             except Exception:
                 pass
 
+            # Generate transcript
             transcript_file = await build_transcript_zip(channel)
             opener_text = f"<@{ticket['opener_id']}>"
             channel_name = channel.name
@@ -4785,6 +4818,7 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # Process AI assistant
     await handle_ai_assistant_message(message)
 
 
