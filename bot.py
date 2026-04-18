@@ -2901,7 +2901,7 @@ class ClosedTicketControlsView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(ClaimTicketButton(disabled=True, closed_variant=True))
         self.add_item(CloseTicketButton(disabled=True, closed_variant=True))
-        self.add_item(DeleteTicketButton(closed_variant=True, disabled=True))
+        self.add_item(DeleteTicketButton(closed_variant=True))
 
 # =========================================================
 # BACKGROUND TASKS
