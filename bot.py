@@ -93,8 +93,9 @@ profile_update_locks: dict[int, asyncio.Lock] = {}
 guild_config_cache: dict[int, dict[str, Any]] = {}
 ticket_options_cache: dict[int, list[dict[str, Any]]] = {}
 ai_assistant_config_cache: dict[int, dict[str, Any]] = {}
+custom_prompts_cache: dict[int, str] = {}
 
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
 startup_ready_done = False
 bot_owner_ids: set[int] = set()
 
@@ -106,9 +107,9 @@ PREMIUM_DURATION_LABELS = {
     "perm": "Permanent",
 }
 
-# AI Assistant conversation tracking
+# AI Assistant tracking
 ai_conversations: dict[int, dict[str, Any]] = {}
-ai_processing_locks: dict[int, asyncio.Lock] = {}
+ai_processing: set[int] = set()
 
 
 # =========================================================
@@ -139,18 +140,10 @@ def get_profile_update_lock(guild_id: int) -> asyncio.Lock:
     return lock
 
 
-def get_ai_processing_lock(channel_id: int) -> asyncio.Lock:
-    lock = ai_processing_locks.get(channel_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        ai_processing_locks[channel_id] = lock
-    return lock
-
-
 def cleanup_ticket_channel_lock(channel_id: int):
     ticket_channel_locks.pop(channel_id, None)
     ai_conversations.pop(channel_id, None)
-    ai_processing_locks.pop(channel_id, None)
+    ai_processing.discard(channel_id)
 
 
 def cleanup_ticket_create_lock(guild_id: int, user_id: int):
@@ -332,12 +325,13 @@ async def init_db():
                     guild_id BIGINT PRIMARY KEY,
                     enabled BOOLEAN NOT NULL DEFAULT FALSE,
                     alert_channel_id BIGINT,
+                    prompt_channel_id BIGINT,
+                    custom_prompt TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
 
-            # Create ai_alert_messages table properly
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS ai_alert_messages (
                     ticket_channel_id BIGINT PRIMARY KEY,
@@ -591,32 +585,42 @@ async def get_ai_assistant_config(guild_id: int) -> Optional[dict[str, Any]]:
         return cached
 
     row = await db_fetchrow("""
-        SELECT guild_id, enabled, alert_channel_id, created_at, updated_at
+        SELECT guild_id, enabled, alert_channel_id, prompt_channel_id, custom_prompt
         FROM ai_assistant_config
         WHERE guild_id = $1
     """, guild_id)
 
     if row:
         ai_assistant_config_cache[guild_id] = row
+        if row.get("custom_prompt"):
+            custom_prompts_cache[guild_id] = row["custom_prompt"]
     return row
 
 
-async def set_ai_assistant_config(guild_id: int, enabled: bool, alert_channel_id: Optional[int] = None):
+async def set_ai_assistant_config(guild_id: int, enabled: bool, alert_channel_id: Optional[int] = None, prompt_channel_id: Optional[int] = None):
     await db_execute("""
-        INSERT INTO ai_assistant_config (guild_id, enabled, alert_channel_id, created_at, updated_at)
-        VALUES ($1, $2, $3, NOW(), NOW())
+        INSERT INTO ai_assistant_config (guild_id, enabled, alert_channel_id, prompt_channel_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, NOW(), NOW())
         ON CONFLICT (guild_id)
         DO UPDATE SET
             enabled = EXCLUDED.enabled,
             alert_channel_id = EXCLUDED.alert_channel_id,
+            prompt_channel_id = EXCLUDED.prompt_channel_id,
             updated_at = NOW()
-    """, guild_id, enabled, alert_channel_id)
+    """, guild_id, enabled, alert_channel_id, prompt_channel_id)
 
-    ai_assistant_config_cache[guild_id] = {
-        "guild_id": guild_id,
-        "enabled": enabled,
-        "alert_channel_id": alert_channel_id,
-    }
+    ai_assistant_config_cache.pop(guild_id, None)
+
+
+async def update_custom_prompt(guild_id: int, custom_prompt: str):
+    await db_execute("""
+        UPDATE ai_assistant_config
+        SET custom_prompt = $1, updated_at = NOW()
+        WHERE guild_id = $2
+    """, custom_prompt, guild_id)
+    
+    ai_assistant_config_cache.pop(guild_id, None)
+    custom_prompts_cache[guild_id] = custom_prompt
 
 
 async def save_alert_message(guild_id: int, ticket_channel_id: int, alert_message_id: int, alert_channel_id: int):
@@ -1460,9 +1464,42 @@ async def refresh_guild_panel(guild_id: int):
 
 
 # =========================================================
-# ADVANCED AI ASSISTANT
+# CUSTOM PROMPT LOADER
 # =========================================================
-async def call_deepseek_api(messages: list[dict], max_tokens: int = 500) -> Optional[str]:
+async def load_custom_prompts():
+    """Load all custom prompts from prompt channels into cache"""
+    rows = await db_fetch("""
+        SELECT guild_id, prompt_channel_id, custom_prompt 
+        FROM ai_assistant_config 
+        WHERE enabled = TRUE AND prompt_channel_id IS NOT NULL
+    """)
+    
+    for row in rows:
+        if row["custom_prompt"]:
+            custom_prompts_cache[row["guild_id"]] = row["custom_prompt"]
+
+
+async def fetch_prompt_from_channel(channel_id: int) -> Optional[str]:
+    """Fetch the latest prompt message from the prompt channel"""
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    
+    try:
+        async for message in channel.history(limit=50):
+            if message.content and not message.author.bot:
+                return message.content
+    except Exception:
+        pass
+    
+    return None
+
+
+# =========================================================
+# FAST AI ASSISTANT
+# =========================================================
+async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 150) -> Optional[str]:
+    """Fast API call with short timeout"""
     if not DEEPSEEK_API_KEY:
         return None
 
@@ -1478,7 +1515,7 @@ async def call_deepseek_api(messages: list[dict], max_tokens: int = 500) -> Opti
         "temperature": 0.7
     }
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
         try:
             async with session.post(
                 "https://api.deepseek.com/v1/chat/completions",
@@ -1488,183 +1525,82 @@ async def call_deepseek_api(messages: list[dict], max_tokens: int = 500) -> Opti
                 if resp.status == 200:
                     data = await resp.json()
                     return data["choices"][0]["message"]["content"]
-                else:
-                    text = await resp.text()
-                    log.warning("DeepSeek API error: %s - %s", resp.status, text)
-                    return None
-        except Exception as e:
-            log.warning("DeepSeek API call failed: %s", e)
+                return None
+        except Exception:
             return None
 
 
-async def ai_analyze_conversation(
-    conversation_history: list[str],
+async def get_ai_response(
+    guild_id: int,
+    conversation: list[str],
+    user_message: str,
+    opener_name: str,
     ticket_category: str,
-    available_categories: list[str],
-    opener_name: str
-) -> dict:
+    available_categories: list[str]
+) -> tuple[str, bool, Optional[str]]:
     """
-    Advanced AI analysis of the entire conversation.
-    Returns a dict with: response, should_close, needs_staff, staff_summary, suggested_category, should_rename, new_name
+    Returns: (response_text, should_close, suggested_category)
     """
-    if not DEEPSEEK_API_KEY:
-        return {
-            "response": None,
-            "should_close": False,
-            "needs_staff": False,
-            "staff_summary": None,
-            "suggested_category": None,
-            "should_rename": False,
-            "new_name": None
-        }
-
-    conversation_text = "\n".join(conversation_history[-10:])  # Last 10 messages for context
-
+    custom_prompt = custom_prompts_cache.get(guild_id, "")
+    
     categories_text = ", ".join(available_categories)
-
-    system_prompt = f"""You are an advanced AI ticket assistant for a Discord support system. Your name is Ticket Assistant.
+    
+    system_prompt = f"""You are a helpful ticket assistant. Be concise and direct.
 
 Current ticket category: {ticket_category}
 Available categories: {categories_text}
 User's name: {opener_name}
 
-Your role:
-1. Analyze the conversation carefully and determine what the user needs.
-2. If the user is asking about something that belongs in a different category, suggest the correct category.
-3. If the user clearly indicates they are done (saying things like "no", "that's all", "thanks, bye", "nothing else", "I'm good", "all set"), you MUST respond with a friendly closing message and mark for closure.
-4. If the user needs human staff help (complex issues, purchases, donations, technical problems you can't solve), mark for staff escalation and provide a VERY short summary (2-4 words max, e.g., "purchase turf", "donate $50", "bug report").
-5. If you escalate to staff, also suggest a short channel name (max 30 chars, lowercase, hyphens instead of spaces) that summarizes the issue.
-6. Keep responses friendly, professional, and under 400 characters.
+Rules:
+1. If user is in wrong category, tell them to open the correct one and say "I'll close this ticket now."
+2. If user says "ok", "okay", "thanks", "thank you", "no", "nope", "that's all", "nothing else" - respond briefly and CLOSE the ticket.
+3. Never repeat yourself. If you already said something, don't say it again.
+4. Keep responses under 100 characters.
+5. If you can't help, say "I'll get a staff member" and use [NEEDS_STAFF].
 
-IMPORTANT: You MUST output your response in this exact JSON format:
-{{
-    "response": "Your response message to the user",
-    "should_close": true/false,
-    "needs_staff": true/false,
-    "staff_summary": "short summary if needs_staff, else null",
-    "suggested_category": "category name if wrong category, else null",
-    "should_rename": true/false,
-    "new_name": "new-channel-name if should_rename, else null"
-}}"""
+{custom_prompt}
 
-    user_message = f"Conversation history:\n{conversation_text}\n\nAnalyze and respond in the required JSON format."
+IMPORTANT: If you want to close the ticket, end your response with [CLOSE]. If you need staff, end with [NEEDS_STAFF: short summary]."""
 
+    recent_convo = "\n".join(conversation[-6:])
+    
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message}
+        {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nUser: {user_message}\n\nRespond briefly:"}
     ]
 
-    response = await call_deepseek_api(messages, max_tokens=600)
-
+    response = await call_deepseek_api_fast(messages, max_tokens=100)
+    
     if not response:
-        return {
-            "response": None,
-            "should_close": False,
-            "needs_staff": False,
-            "staff_summary": None,
-            "suggested_category": None,
-            "should_rename": False,
-            "new_name": None
-        }
-
-    # Parse JSON response
-    try:
-        # Clean up response - sometimes AI adds extra text
-        json_start = response.find("{")
-        json_end = response.rfind("}") + 1
-        if json_start != -1 and json_end > json_start:
-            json_str = response[json_start:json_end]
-            data = json.loads(json_str)
-            return {
-                "response": data.get("response"),
-                "should_close": data.get("should_close", False),
-                "needs_staff": data.get("needs_staff", False),
-                "staff_summary": data.get("staff_summary"),
-                "suggested_category": data.get("suggested_category"),
-                "should_rename": data.get("should_rename", False),
-                "new_name": data.get("new_name")
-            }
-    except json.JSONDecodeError:
-        log.warning("Failed to parse AI JSON response: %s", response[:200])
-
-    return {
-        "response": None,
-        "should_close": False,
-        "needs_staff": False,
-        "staff_summary": None,
-        "suggested_category": None,
-        "should_rename": False,
-        "new_name": None
-    }
-
-
-async def send_staff_alert(
-    guild: discord.Guild,
-    ticket_channel: discord.TextChannel,
-    opener: discord.Member,
-    summary: str,
-    support_role_id: int,
-    alert_channel_id: int
-):
-    """Send an alert to the alert channel pinging support team."""
-    alert_channel = guild.get_channel(alert_channel_id)
-    if not isinstance(alert_channel, discord.TextChannel):
-        return
-
-    support_role = guild.get_role(support_role_id)
-    role_mention = support_role.mention if support_role else "@Support Team"
-
-    config = await get_guild_config(guild.id)
-    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
-
-    embed = discord.Embed(
-        title="🚨 Staff Assistance Needed",
-        description=(
-            f"**User:** {opener.mention} ({opener.display_name})\n"
-            f"**Ticket:** {ticket_channel.mention}\n"
-            f"**Request:** {summary}\n\n"
-            f"*This message will be removed when a staff member claims the ticket.*"
-        ),
-        color=color
-    )
-    embed = await apply_footer(embed, guild.id)
-
-    try:
-        alert_msg = await alert_channel.send(content=role_mention, embed=embed)
-        await save_alert_message(guild.id, ticket_channel.id, alert_msg.id, alert_channel_id)
-    except Exception as e:
-        log.warning("Failed to send staff alert: %s", e)
-
-
-async def remove_staff_alert(ticket_channel_id: int):
-    """Remove the staff alert message when ticket is claimed."""
-    alert_data = await get_alert_message(ticket_channel_id)
-    if not alert_data:
-        return
-
-    guild = bot.get_guild(alert_data["guild_id"])
-    if not guild:
-        await delete_alert_message(ticket_channel_id)
-        return
-
-    alert_channel = guild.get_channel(alert_data["alert_channel_id"])
-    if not isinstance(alert_channel, discord.TextChannel):
-        await delete_alert_message(ticket_channel_id)
-        return
-
-    try:
-        message = await alert_channel.fetch_message(alert_data["alert_message_id"])
-        await message.delete()
-    except discord.NotFound:
-        pass
-    except Exception as e:
-        log.warning("Failed to delete alert message: %s", e)
-
-    await delete_alert_message(ticket_channel_id)
+        return (None, False, None)
+    
+    # Parse special flags
+    should_close = "[CLOSE]" in response
+    needs_staff = "[NEEDS_STAFF" in response
+    staff_summary = None
+    suggested_category = None
+    
+    # Extract staff summary
+    if needs_staff:
+        match = re.search(r'\[NEEDS_STAFF:\s*([^\]]+)\]', response)
+        if match:
+            staff_summary = match.group(1).strip()[:50]
+        response = re.sub(r'\[NEEDS_STAFF[^\]]*\]', '', response).strip()
+    
+    # Check for category suggestion
+    for cat in available_categories:
+        if cat.lower() in response.lower() and cat != ticket_category:
+            suggested_category = cat
+            break
+    
+    # Remove close flag
+    response = response.replace("[CLOSE]", "").strip()
+    
+    return (response, should_close or needs_staff, suggested_category)
 
 
 async def handle_ai_assistant_message(message: discord.Message):
-    """Handle AI assistant responses in ticket channels."""
+    """Fast AI assistant handler"""
     if not DEEPSEEK_API_KEY:
         return
 
@@ -1683,6 +1619,10 @@ async def handle_ai_assistant_message(message: discord.Message):
 
     channel = message.channel
 
+    # Check if already processing
+    if channel.id in ai_processing:
+        return
+    
     ticket = await get_ticket_by_channel(channel.id)
     if not ticket:
         return
@@ -1705,106 +1645,155 @@ async def handle_ai_assistant_message(message: discord.Message):
     if not config:
         return
 
-    # Use a lock to prevent multiple AI responses at once
-    ai_lock = get_ai_processing_lock(channel.id)
-    if ai_lock.locked():
-        return
-
-    async with ai_lock:
-        # Initialize conversation history if needed
+    # Mark as processing
+    ai_processing.add(channel.id)
+    
+    try:
+        # Initialize conversation
         if channel.id not in ai_conversations:
             ai_conversations[channel.id] = {
                 "messages": [],
                 "staff_alerted": False,
-                "staff_summary": None
+                "last_response": None
             }
 
         conv = ai_conversations[channel.id]
 
-        # Don't process if staff was already alerted
         if conv.get("staff_alerted"):
             return
 
-        # Add user message to history
-        conv["messages"].append(f"{message.author.display_name}: {message.content}")
+        user_msg = message.content.lower().strip()
+        conv["messages"].append(f"User: {user_msg}")
+
+        # Quick check for immediate close (user says ok/thanks after bot suggested closing)
+        last_bot_msg = conv.get("last_response", "").lower()
+        if ("wrong" in last_bot_msg or "close" in last_bot_msg) and user_msg in ["ok", "okay", "thanks", "thank you", "alright"]:
+            await close_ticket_record(channel.id, bot.user.id)
+            closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
+            await channel.send(embed=closed_embed)
+            try:
+                await channel.edit(name=f"closed-{channel.name[:40]}")
+            except:
+                pass
+            view = ClosedTicketControlsView()
+            await channel.send(view=view)
+            await send_log(guild, "Ticket Auto-Closed", f"Channel: {channel.mention}\nClosed by AI assistant.")
+            cleanup_ticket_channel_lock(channel.id)
+            return
 
         # Get available categories
         ticket_options = await get_ticket_options(guild.id)
         available_categories = [opt["label"] for opt in ticket_options]
 
-        # Analyze conversation
-        analysis = await ai_analyze_conversation(
+        # Get AI response
+        response, should_close, suggested_category = await get_ai_response(
+            guild.id,
             conv["messages"],
+            message.content,
+            message.author.display_name,
             ticket["option_label"],
-            available_categories,
-            message.author.display_name
+            available_categories
         )
 
-        # Check for wrong category
-        if analysis["suggested_category"] and analysis["suggested_category"] != ticket["option_label"]:
-            response = f"You've opened the wrong kind of ticket. Please open a **{analysis['suggested_category']}** ticket instead for this type of request."
+        if response:
+            # Send response immediately
             await channel.send(response)
-            return
+            conv["messages"].append(f"Bot: {response}")
+            conv["last_response"] = response
 
-        # Check if staff needed
-        if analysis["needs_staff"] and not conv.get("staff_alerted"):
-            conv["staff_alerted"] = True
-            conv["staff_summary"] = analysis["staff_summary"]
-
-            # Rename channel if suggested
-            if analysis["should_rename"] and analysis["new_name"]:
+            # Handle wrong category
+            if suggested_category and suggested_category != ticket["option_label"]:
+                await asyncio.sleep(1)
+                await close_ticket_record(channel.id, bot.user.id)
+                closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
+                await channel.send(embed=closed_embed)
                 try:
-                    clean_name = clean_channel_name(analysis["new_name"])
-                    if clean_name:
-                        await channel.edit(name=clean_name[:50])
-                except Exception:
+                    await channel.edit(name=f"closed-{channel.name[:40]}")
+                except:
                     pass
+                view = ClosedTicketControlsView()
+                await channel.send(view=view)
+                cleanup_ticket_channel_lock(channel.id)
+                return
 
-            # Send staff alert
-            await send_staff_alert(
-                guild,
-                channel,
-                message.author,
-                analysis["staff_summary"] or "Needs assistance",
-                config["support_role_id"],
-                ai_config["alert_channel_id"]
-            )
+            # Handle close
+            if should_close and not conv.get("staff_alerted"):
+                await asyncio.sleep(0.5)
+                await close_ticket_record(channel.id, bot.user.id)
+                closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
+                await channel.send(embed=closed_embed)
+                try:
+                    await channel.edit(name=f"closed-{channel.name[:40]}")
+                except:
+                    pass
+                view = ClosedTicketControlsView()
+                await channel.send(view=view)
+                await send_log(guild, "Ticket Auto-Closed", f"Channel: {channel.mention}\nClosed by AI assistant.")
+                cleanup_ticket_channel_lock(channel.id)
 
-            # Send response to user
-            if analysis["response"]:
-                await channel.send(analysis["response"])
-            else:
-                await channel.send("I'll get you a staff member to help you with this. Please wait for assistance.")
-            return
+    finally:
+        ai_processing.discard(channel.id)
 
-        # Send AI response
-        if analysis["response"]:
-            await channel.send(analysis["response"])
-            conv["messages"].append(f"Ticket Assistant: {analysis['response']}")
 
-        # Check if should close
-        if analysis["should_close"] and not conv.get("staff_alerted"):
-            await close_ticket_record(channel.id, bot.user.id)
+async def send_staff_alert(
+    guild: discord.Guild,
+    ticket_channel: discord.TextChannel,
+    opener: discord.Member,
+    summary: str,
+    support_role_id: int,
+    alert_channel_id: int
+):
+    alert_channel = guild.get_channel(alert_channel_id)
+    if not isinstance(alert_channel, discord.TextChannel):
+        return
 
-            closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
-            await channel.send(embed=closed_embed)
+    support_role = guild.get_role(support_role_id)
+    role_mention = support_role.mention if support_role else "@Support Team"
 
-            try:
-                await channel.edit(name=f"closed-{channel.name[:40]}")
-            except Exception:
-                pass
+    config = await get_guild_config(guild.id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
 
-            view = ClosedTicketControlsView()
-            await channel.send(view=view)
+    embed = discord.Embed(
+        title="🚨 Staff Assistance Needed",
+        description=(
+            f"**User:** {opener.mention} ({opener.display_name})\n"
+            f"**Ticket:** {ticket_channel.mention}\n"
+            f"**Request:** {summary}\n\n"
+            f"*This message will be removed when claimed.*"
+        ),
+        color=color
+    )
+    embed = await apply_footer(embed, guild.id)
 
-            await send_log(
-                guild,
-                "Ticket Auto-Closed",
-                f"Channel: {channel.mention}\nClosed automatically by AI assistant."
-            )
+    try:
+        alert_msg = await alert_channel.send(content=role_mention, embed=embed)
+        await save_alert_message(guild.id, ticket_channel.id, alert_msg.id, alert_channel_id)
+    except Exception as e:
+        log.warning("Failed to send staff alert: %s", e)
 
-            # Clean up
-            cleanup_ticket_channel_lock(channel.id)
+
+async def remove_staff_alert(ticket_channel_id: int):
+    alert_data = await get_alert_message(ticket_channel_id)
+    if not alert_data:
+        return
+
+    guild = bot.get_guild(alert_data["guild_id"])
+    if not guild:
+        await delete_alert_message(ticket_channel_id)
+        return
+
+    alert_channel = guild.get_channel(alert_data["alert_channel_id"])
+    if not isinstance(alert_channel, discord.TextChannel):
+        await delete_alert_message(ticket_channel_id)
+        return
+
+    try:
+        message = await alert_channel.fetch_message(alert_data["alert_message_id"])
+        await message.delete()
+    except:
+        pass
+
+    await delete_alert_message(ticket_channel_id)
 
 
 # =========================================================
@@ -3065,9 +3054,8 @@ class TicketDropdown(discord.ui.Select):
                     ai_conversations[ticket_channel.id] = {
                         "messages": [],
                         "staff_alerted": False,
-                        "staff_summary": None
+                        "last_response": None
                     }
-                    # NO greeting - wait for user to speak first
 
                 asyncio.create_task(refresh_guild_panel(guild.id))
                 asyncio.create_task(
@@ -3154,10 +3142,10 @@ class ClaimTicketButton(discord.ui.Button):
                 )
                 return
 
-            if ticket["claimed_by"] == interaction.user.id:
+            if ticket["claimed_by"] is not None:
                 await safe_component_reply(
                     interaction,
-                    embed=await base_embed(interaction.guild.id, "Already Claimed", "You already claimed this ticket."),
+                    embed=await base_embed(interaction.guild.id, "Already Claimed", "This ticket has already been claimed."),
                     ephemeral=True
                 )
                 return
@@ -3168,18 +3156,35 @@ class ClaimTicketButton(discord.ui.Button):
             await remove_staff_alert(interaction.channel.id)
             ai_conversations.pop(interaction.channel.id, None)
 
-            # Send claim confirmation
+            # Check if server has premium for AI disabled message
+            premium_row = await get_active_premium_guild_record(interaction.guild.id)
+            ai_config = await get_ai_assistant_config(interaction.guild.id)
+            
+            if premium_row and ai_config and ai_config["enabled"]:
+                claim_text = f"Ticket claimed by {interaction.user.mention}.\n\n*AI Assistant has been disabled.*"
+            else:
+                claim_text = f"Ticket claimed by {interaction.user.mention}."
+
             claim_embed = await base_embed(
                 interaction.guild.id,
                 "Ticket Claimed",
-                f"Ticket claimed by {interaction.user.mention}.\n\nAI Assistant has been disabled."
+                claim_text
             )
             await interaction.channel.send(embed=claim_embed)
 
-            await safe_non_ephemeral_followup(
-                interaction,
-                embed=await base_embed(interaction.guild.id, "Ticket Claimed", f"You have claimed this ticket.")
-            )
+            # Update the view to disable the claim button
+            try:
+                if interaction.message:
+                    # Create a new view with claim button disabled
+                    new_view = TicketControlsView()
+                    # Disable the claim button in the new view
+                    for child in new_view.children:
+                        if isinstance(child, ClaimTicketButton):
+                            child.disabled = True
+                            break
+                    await interaction.message.edit(view=new_view)
+            except Exception:
+                pass
 
             await send_log(
                 interaction.guild,
@@ -3276,9 +3281,13 @@ class CloseTicketButton(discord.ui.Button):
             with suppress(Exception):
                 await interaction.channel.send(embed=closed_embed)
 
+            # Send the closed controls view
+            closed_view = ClosedTicketControlsView()
+            await interaction.channel.send(view=closed_view)
+
             try:
                 if interaction.message:
-                    await interaction.message.edit(view=ClosedTicketControlsView())
+                    await interaction.message.edit(view=None)
             except Exception:
                 pass
 
@@ -3346,7 +3355,6 @@ class ReopenTicketButton(discord.ui.Button):
                 )
                 return
 
-            config = await get_guild_config(interaction.guild.id)
             opener_member = await try_fetch_member(interaction.guild, ticket["opener_id"])
 
             try:
@@ -3373,9 +3381,13 @@ class ReopenTicketButton(discord.ui.Button):
             with suppress(Exception):
                 await interaction.channel.send(embed=reopened_embed)
 
+            # Send new ticket controls view
+            new_view = TicketControlsView()
+            await interaction.channel.send(view=new_view)
+
             try:
                 if interaction.message:
-                    await interaction.message.edit(view=TicketControlsView())
+                    await interaction.message.edit(view=None)
             except Exception:
                 pass
 
@@ -3415,16 +3427,16 @@ class DeleteTicketButton(discord.ui.Button):
         async with lock:
             ticket = await get_ticket_by_channel(channel.id)
             if not ticket:
-                await safe_ephemeral_edit_or_followup(
-                    interaction,
-                    embed=await base_embed(guild.id, "Error", "This is not a tracked ticket channel.", error=True)
+                await interaction.followup.send(
+                    embed=await base_embed(guild.id, "Error", "This is not a tracked ticket channel.", error=True),
+                    ephemeral=True
                 )
                 return
 
             if not await is_support_or_admin(deleter, guild.id):
-                await safe_ephemeral_edit_or_followup(
-                    interaction,
-                    embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True)
+                await interaction.followup.send(
+                    embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True),
+                    ephemeral=True
                 )
                 return
 
@@ -3979,7 +3991,7 @@ async def renameticket(interaction: discord.Interaction, name: str):
 @bot.tree.command(name="enableticketassistant", description="Enable AI ticket assistant (Premium only)")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-async def enableticketassistant(interaction: discord.Interaction, alert_channel: discord.TextChannel):
+async def enableticketassistant(interaction: discord.Interaction, alert_channel: discord.TextChannel, prompt_channel: discord.TextChannel):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return
 
@@ -4015,13 +4027,18 @@ async def enableticketassistant(interaction: discord.Interaction, alert_channel:
         )
         return
 
-    await set_ai_assistant_config(interaction.guild.id, True, alert_channel.id)
+    await set_ai_assistant_config(interaction.guild.id, True, alert_channel.id, prompt_channel.id)
+    
+    # Fetch and save custom prompt
+    custom_prompt = await fetch_prompt_from_channel(prompt_channel.id)
+    if custom_prompt:
+        await update_custom_prompt(interaction.guild.id, custom_prompt)
 
     await interaction.response.send_message(
         embed=await base_embed(
             interaction.guild.id,
             "AI Assistant Enabled",
-            f"Ticket assistant has been activated.\nAlert channel: {alert_channel.mention}"
+            f"Ticket assistant has been activated.\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
         ),
         ephemeral=False
     )
@@ -4029,7 +4046,7 @@ async def enableticketassistant(interaction: discord.Interaction, alert_channel:
     await send_log(
         interaction.guild,
         "AI Assistant Enabled",
-        f"Enabled by: {interaction.user.mention}\nAlert channel: {alert_channel.mention}"
+        f"Enabled by: {interaction.user.mention}\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
     )
 
 
@@ -4047,8 +4064,9 @@ async def disableticketassistant(interaction: discord.Interaction):
         )
         return
 
-    await set_ai_assistant_config(interaction.guild.id, False, None)
+    await set_ai_assistant_config(interaction.guild.id, False, None, None)
     ai_assistant_config_cache.pop(interaction.guild.id, None)
+    custom_prompts_cache.pop(interaction.guild.id, None)
 
     await interaction.response.send_message(
         embed=await base_embed(
@@ -4767,6 +4785,7 @@ async def on_ready():
 
     await init_db()
     await refresh_bot_owner_ids()
+    await load_custom_prompts()
 
     if not startup_ready_done:
         try:
@@ -4794,6 +4813,7 @@ async def on_guild_remove(guild: discord.Guild):
     guild_config_cache.pop(guild.id, None)
     ticket_options_cache.pop(guild.id, None)
     ai_assistant_config_cache.pop(guild.id, None)
+    custom_prompts_cache.pop(guild.id, None)
     active_setup_guilds.discard(guild.id)
     cleanup_profile_update_lock(guild.id)
 
