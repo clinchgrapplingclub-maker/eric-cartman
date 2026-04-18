@@ -2837,10 +2837,7 @@ class DeleteTicketButton(discord.ui.Button):
                 )
                 return
 
-            await safe_ephemeral_edit_or_followup(
-                interaction,
-                embed=await base_embed(guild.id, "Delete Started", "The ticket delete countdown has started.")
-            )
+           
 
             countdown_message: Optional[discord.Message] = None
 
