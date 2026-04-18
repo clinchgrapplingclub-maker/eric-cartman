@@ -2836,8 +2836,12 @@ class DeleteTicketButton(discord.ui.Button):
                     embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True)
                 )
                 return
-
-           
+            # 🔥 DISABLE BUTTONS (anti-spam)
+            try:
+                if interaction.message:
+                    await interaction.message.edit(view=None)
+            except Exception:
+                pass
 
             countdown_message: Optional[discord.Message] = None
 
