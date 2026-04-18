@@ -2800,11 +2800,12 @@ class CloseTicketButton(discord.ui.Button):
 
 
 class DeleteTicketButton(discord.ui.Button):
-    def __init__(self, *, closed_variant: bool = False):
+    def __init__(self, disabled: bool = False, *, closed_variant: bool = False):
         super().__init__(
             label="Delete Ticket",
             style=discord.ButtonStyle.danger,
-            custom_id="ticket_delete_button_closed" if closed_variant else "ticket_delete_button"
+            custom_id="ticket_delete_button_closed" if closed_variant else "ticket_delete_button",
+            disabled=disabled
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -2900,8 +2901,7 @@ class ClosedTicketControlsView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(ClaimTicketButton(disabled=True, closed_variant=True))
         self.add_item(CloseTicketButton(disabled=True, closed_variant=True))
-        self.add_item(DeleteTicketButton(closed_variant=True))
-
+        self.add_item(DeleteTicketButton(closed_variant=True, disabled=True))
 
 # =========================================================
 # BACKGROUND TASKS
