@@ -52,7 +52,6 @@ logging.basicConfig(
 )
 
 logging.getLogger("discord.client").addFilter(IgnoreDiscordNoise())
-
 log = logging.getLogger("ticketbot")
 
 
@@ -110,6 +109,21 @@ PREMIUM_DURATION_LABELS = {
 # AI Assistant tracking
 ai_conversations: dict[int, dict[str, Any]] = {}
 ai_processing: set[int] = set()
+
+# Extra AI stability / routing helpers
+AI_CLOSE_WORDS = {
+    "ok", "okay", "thanks", "thank you", "ty", "thx",
+    "no", "nope", "nah", "that's all", "thats all",
+    "nothing else", "all good", "im good", "i'm good",
+    "done", "resolved", "fixed", "never mind", "nvm"
+}
+
+AI_STAFF_HINTS = {
+    "buy", "purchase", "payment", "pay", "paid", "refund",
+    "billing", "invoice", "donate", "donation", "appeal",
+    "ban", "account", "rank", "staff", "admin", "owner",
+    "vip", "premium", "turf", "store", "shop", "order"
+}
 
 
 # =========================================================
@@ -618,7 +632,7 @@ async def update_custom_prompt(guild_id: int, custom_prompt: str):
         SET custom_prompt = $1, updated_at = NOW()
         WHERE guild_id = $2
     """, custom_prompt, guild_id)
-    
+
     ai_assistant_config_cache.pop(guild_id, None)
     custom_prompts_cache[guild_id] = custom_prompt
 
@@ -946,10 +960,17 @@ def hex_to_color(value: str) -> discord.Color:
 
 def clean_channel_name(text: str) -> str:
     text = text.lower()
-    text = re.sub(r"[^a-z0-9\- ]", "", text)
-    text = re.sub(r"\s+", "-", text).strip("-")
+    text = re.sub(r"[^a-z0-9\\- ]", "", text)
+    text = re.sub(r"\\s+", "-", text).strip("-")
     text = re.sub(r"-{2,}", "-", text)
     return text[:80] if text else "ticket"
+
+
+def clean_short_ticket_topic(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\\s-]", "", text)
+    text = re.sub(r"\\s+", " ", text).strip()
+    return text[:40] if text else "ticket"
 
 
 def safe_attachment_name(filename: str, fallback: str) -> str:
@@ -988,13 +1009,12 @@ def parse_duration_to_expiry(duration_text: str) -> tuple[Optional[datetime], st
     if clean in {"perm", "permanent", "forever"}:
         return None, "perm"
 
-    match = re.fullmatch(r"(\d+)\s*(min|m|h|d)", clean)
+    match = re.fullmatch(r"(\\d+)\\s*(min|m|h|d)", clean)
     if not match:
         raise ValueError("Invalid duration format. Use 1min, 5m, 1h, 1d or perm.")
 
     value = int(match.group(1))
     unit = match.group(2)
-
     now = datetime.now(timezone.utc)
 
     if unit in {"min", "m"}:
@@ -1070,6 +1090,90 @@ def format_discord_api_error(text: str) -> str:
         "Discord rejected the profile update.\n\n"
         "Please try again in a moment. If it keeps happening, try different images."
     )
+
+
+def extract_json_object(text: str) -> Optional[dict]:
+    if not text:
+        return None
+
+    text = text.strip()
+
+    with suppress(Exception):
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+
+    match = re.search(r"\\{.*\\}", text, re.DOTALL)
+    if match:
+        with suppress(Exception):
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+
+    return None
+
+
+def infer_short_topic_from_text(text: str) -> str:
+    lower = text.lower()
+
+    amount_match = re.search(r"(\\d+[kKmM]?)", lower)
+
+    if any(word in lower for word in ["donate", "donation"]):
+        if amount_match:
+            return f"donate {amount_match.group(1)}"
+        return "donation"
+
+    if any(word in lower for word in ["buy", "purchase", "payment", "price", "cost", "turf", "vip", "premium"]):
+        if "turf" in lower:
+            return "purchase turf"
+        if "vip" in lower:
+            return "purchase vip"
+        if "premium" in lower:
+            return "purchase premium"
+        return "purchase"
+
+    if any(word in lower for word in ["bug", "error", "issue", "problem", "glitch"]):
+        return "bug report"
+
+    if any(word in lower for word in ["appeal", "unban", "ban appeal"]):
+        return "ban appeal"
+
+    words = re.findall(r"[a-z0-9]+", lower)
+    if not words:
+        return "ticket"
+
+    return clean_short_ticket_topic(" ".join(words[:3]))
+
+
+def find_best_category_from_text(user_text: str, current_category: str, available_categories: list[str]) -> Optional[str]:
+    lower_text = user_text.lower()
+    current_lower = current_category.lower()
+
+    if any(word in lower_text for word in AI_STAFF_HINTS):
+        for category in available_categories:
+            cat_lower = category.lower()
+            if category == current_category:
+                continue
+            if any(key in cat_lower for key in ["buy", "purchase", "shop", "store", "payment", "donate", "billing"]):
+                if not any(key in current_lower for key in ["buy", "purchase", "shop", "store", "payment", "donate", "billing"]):
+                    return category
+
+    words = set(re.findall(r"[a-z0-9]+", lower_text))
+    ranked: list[tuple[int, str]] = []
+
+    for category in available_categories:
+        if category == current_category:
+            continue
+        category_words = set(re.findall(r"[a-z0-9]+", category.lower()))
+        score = len(words & category_words)
+        if score > 0:
+            ranked.append((score, category))
+
+    if ranked:
+        ranked.sort(reverse=True, key=lambda x: x[0])
+        return ranked[0][1]
+
+    return None
 
 
 async def generate_unique_premium_keys(amount: int, duration_code: str, created_by: int) -> list[str]:
@@ -1217,9 +1321,7 @@ async def base_embed(
     color = await resolve_color_for_guild(guild_id, error=error)
     embed = discord.Embed(title=title, description=description, color=color)
     return await apply_footer(embed, guild_id, use_global_avatar=use_global_avatar)
-
-
-def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
+    def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
     embed = discord.Embed(
         title=title,
         description=description,
@@ -1334,172 +1436,596 @@ def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.
     return embed
 
 
-async def is_support_or_admin(member: discord.Member, guild_id: int) -> bool:
-    if member.guild_permissions.administrator:
-        return True
-
-    config = await get_guild_config(guild_id)
-    if not config:
-        return False
-
-    role = member.guild.get_role(config["support_role_id"])
-    return role in member.roles if role else False
+async def wait_for_user_message(channel: discord.TextChannel, user: discord.Member, timeout: int = 300) -> discord.Message:
+    def check(m: discord.Message):
+        return (
+            m.author.id == user.id
+            and m.channel.id == channel.id
+            and not m.author.bot
+        )
+    return await bot.wait_for("message", check=check, timeout=timeout)
 
 
-async def send_log(
-    guild: discord.Guild,
+async def ask_text(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    embed_builder,
     title: str,
     description: str,
-    file: Optional[discord.File] = None
-):
-    config = await get_guild_config(guild.id)
-    if not config:
-        return
-
-    log_channel = guild.get_channel(config["log_channel_id"])
-    if not isinstance(log_channel, discord.TextChannel):
-        return
-
-    embed = await base_embed(guild.id, title, description)
-
-    try:
-        if file:
-            await log_channel.send(embed=embed, file=file)
-        else:
-            await log_channel.send(embed=embed)
-    except (discord.NotFound, discord.Forbidden):
-        return
-    except Exception as e:
-        log.warning("Failed to send log in guild %s: %s", guild.id, e)
-
-
-async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = False, thinking: bool = False) -> bool:
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
-            return True
-    except Exception:
-        return False
-    return False
-
-
-async def safe_component_reply(
-    interaction: discord.Interaction,
     *,
-    embed: Optional[discord.Embed] = None,
-    content: Optional[str] = None,
-    ephemeral: bool = False
-):
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
-            return True
-    except Exception:
-        pass
+    optional: bool = False,
+    delete_reply: bool = True,
+) -> Optional[str]:
+    prompt = await channel.send(embed=embed_builder(title, description))
+    reply: Optional[discord.Message] = None
 
     try:
-        await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
-        return True
-    except Exception:
-        pass
+        reply = await wait_for_user_message(channel, user)
+        content = reply.content.strip()
 
-    return False
+        if content.lower() in CANCEL_WORDS:
+            raise SetupCancelled()
+
+        if optional and content.lower() in SKIP_WORDS:
+            return None
+
+        if not content:
+            if optional:
+                return None
+            raise ValueError("Empty answer.")
+
+        return content
+    finally:
+        await safe_delete_message(prompt)
+        if delete_reply and reply is not None:
+            await safe_delete_message(reply)
 
 
-async def safe_ephemeral_edit_or_followup(
-    interaction: discord.Interaction,
-    *,
-    embed: discord.Embed
-):
+async def ask_image(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    embed_builder,
+    title: str,
+    description: str,
+) -> ImageData:
+    while True:
+        prompt = await channel.send(embed=embed_builder(title, description))
+        reply: Optional[discord.Message] = None
+
+        try:
+            reply = await wait_for_user_message(channel, user)
+
+            if reply.content.strip().lower() in CANCEL_WORDS:
+                raise SetupCancelled()
+
+            if not reply.attachments:
+                await channel.send(
+                    embed=embed_builder("No Image Found", "You need to upload an image in your reply."),
+                    delete_after=8
+                )
+                continue
+
+            attachment = reply.attachments[0]
+            if not is_image_attachment(attachment):
+                await channel.send(
+                    embed=embed_builder("Invalid Image", "Attachment must be an image."),
+                    delete_after=8
+                )
+                continue
+
+            raw = await attachment.read()
+            return ImageData(
+                filename=attachment.filename,
+                mime_type=attachment.content_type or "image/png",
+                raw=raw
+            )
+        finally:
+            await safe_delete_message(prompt)
+            if reply is not None:
+                await safe_delete_message(reply)
+
+
+async def ask_channel_select(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+) -> discord.TextChannel:
+    view = discord.ui.View(timeout=300)
+    select = discord.ui.ChannelSelect(
+        placeholder="Choose a text channel",
+        min_values=1,
+        max_values=1,
+        channel_types=[discord.ChannelType.text]
+    )
+    view.add_item(select)
+
+    prompt = await channel.send(embed=setup_embed(data, title, description), view=view)
+
     try:
-        await interaction.edit_original_response(embed=embed, content=None, view=None)
-        return True
-    except Exception:
-        pass
+        while True:
+            interaction = await bot.wait_for(
+                "interaction",
+                check=lambda i: (
+                    i.type == discord.InteractionType.component
+                    and i.user.id == user.id
+                    and i.channel_id == channel.id
+                    and i.message is not None
+                    and i.message.id == prompt.id
+                ),
+                timeout=300
+            )
+
+            values = (interaction.data or {}).get("values", [])
+            if not values:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a text channel."),
+                    ephemeral=True
+                )
+                continue
+
+            channel_id = int(values[0])
+            selected_channel = channel.guild.get_channel(channel_id)
+
+            if not isinstance(selected_channel, discord.TextChannel):
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "That is not a valid text channel."),
+                    ephemeral=True
+                )
+                continue
+
+            await interaction.response.edit_message(view=None)
+            return selected_channel
+    finally:
+        with suppress(Exception):
+            await prompt.edit(view=None)
+
+
+async def ask_role_select(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+) -> discord.Role:
+    view = discord.ui.View(timeout=300)
+    select = discord.ui.RoleSelect(
+        placeholder="Choose a support role",
+        min_values=1,
+        max_values=1
+    )
+    view.add_item(select)
+
+    prompt = await channel.send(embed=setup_embed(data, title, description), view=view)
 
     try:
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return True
-    except Exception:
-        pass
+        while True:
+            interaction = await bot.wait_for(
+                "interaction",
+                check=lambda i: (
+                    i.type == discord.InteractionType.component
+                    and i.user.id == user.id
+                    and i.channel_id == channel.id
+                    and i.message is not None
+                    and i.message.id == prompt.id
+                ),
+                timeout=300
+            )
 
-    return False
+            values = (interaction.data or {}).get("values", [])
+            if not values:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a role."),
+                    ephemeral=True
+                )
+                continue
+
+            role_id = int(values[0])
+            selected_role = channel.guild.get_role(role_id)
+
+            if not isinstance(selected_role, discord.Role):
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "That is not a valid role."),
+                    ephemeral=True
+                )
+                continue
+
+            await interaction.response.edit_message(view=None)
+            return selected_role
+    finally:
+        with suppress(Exception):
+            await prompt.edit(view=None)
 
 
-async def safe_non_ephemeral_followup(
-    interaction: discord.Interaction,
-    *,
-    embed: discord.Embed
-):
+async def ask_category_select(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+) -> discord.CategoryChannel:
+    view = discord.ui.View(timeout=300)
+    select = discord.ui.ChannelSelect(
+        placeholder="Choose a category",
+        min_values=1,
+        max_values=1,
+        channel_types=[discord.ChannelType.category]
+    )
+    view.add_item(select)
+
+    prompt = await channel.send(embed=setup_embed(data, title, description), view=view)
+
     try:
-        await interaction.followup.send(embed=embed, ephemeral=False)
-        return True
-    except Exception:
-        return False
+        while True:
+            interaction = await bot.wait_for(
+                "interaction",
+                check=lambda i: (
+                    i.type == discord.InteractionType.component
+                    and i.user.id == user.id
+                    and i.channel_id == channel.id
+                    and i.message is not None
+                    and i.message.id == prompt.id
+                ),
+                timeout=300
+            )
+
+            values = (interaction.data or {}).get("values", [])
+            if not values:
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "Please choose a category."),
+                    ephemeral=True
+                )
+                continue
+
+            category_id = int(values[0])
+            category = channel.guild.get_channel(category_id)
+
+            if not isinstance(category, discord.CategoryChannel):
+                await interaction.response.send_message(
+                    embed=setup_embed(data, "Invalid Selection", "That is not a valid category."),
+                    ephemeral=True
+                )
+                continue
+
+            await interaction.response.edit_message(view=None)
+            return category
+    finally:
+        with suppress(Exception):
+            await prompt.edit(view=None)
 
 
-async def refresh_guild_panel(guild_id: int):
-    config = await get_guild_config(guild_id)
-    if not config:
+async def run_setup_wizard(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return
 
-    guild = bot.get_guild(guild_id)
-    if guild is None:
-        return
+    guild = interaction.guild
+    user = interaction.user
+    channel = interaction.channel
 
-    channel = guild.get_channel(config["panel_channel_id"])
     if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send(
+            embed=await base_embed(guild.id, "Setup Failed", "Setup must be run in a text channel.", error=True),
+            ephemeral=True
+        )
         return
 
-    try:
-        message = await channel.fetch_message(config["panel_message_id"])
-    except Exception:
-        return
+    data = SetupData(guild.id, user.id, channel.id)
+    setup_sessions[(guild.id, user.id)] = data
+    embed_builder = lambda t, d: setup_embed(data, t, d)
 
     try:
-        view = await TicketPanelView.build(guild_id)
-        await message.edit(view=view)
-    except Exception:
-        pass
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Ticket Setup Started",
+                "I will ask you one question at a time.\n\n"
+                "Reply in this channel.\n"
+                "Type `cancel` anytime to stop the setup.\n"
+                "Type `skip` on optional questions."
+            )
+        )
+
+        data.title = await ask_text(channel, user, embed_builder, "Title", "Send the ticket panel title.")
+        data.description = await ask_text(channel, user, embed_builder, "Description", "Send the ticket panel description.")
+
+        color_raw = await ask_text(
+            channel, user, embed_builder,
+            "Embed Color",
+            "Send the embed hex color.\nExample: `#00FF66`\n\nType `skip` to use the default color.",
+            optional=True
+        )
+        if color_raw:
+            try:
+                data.color_hex = normalize_hex(color_raw)
+            except ValueError:
+                await channel.send(
+                    embed=await base_embed(None, "Invalid Color", "Invalid hex color. Default color `#00FF66` will be used.", error=True),
+                    delete_after=8
+                )
+                data.color_hex = "#00FF66"
+
+        panel_channel = await ask_channel_select(
+            channel, user, data,
+            "Panel Channel",
+            "Choose the channel where the ticket panel should be posted."
+        )
+        data.panel_channel_id = panel_channel.id
+
+        support_role = await ask_role_select(
+            channel, user, data,
+            "Support Team Role",
+            "Choose the support team role."
+        )
+        data.support_role_id = support_role.id
+
+        data.option_1_name = await ask_text(
+            channel, user, embed_builder,
+            "Ticket Option 1 Name",
+            "Send the name for the first ticket option.\nExample: `Support Ticket`"
+        )
+
+        option_1_category = await ask_category_select(
+            channel, user, data,
+            "Ticket Option 1 Category",
+            "Choose the category for ticket option 1."
+        )
+        data.option_1_category_id = option_1_category.id
+
+        data.option_2_name = await ask_text(
+            channel, user, embed_builder,
+            "Ticket Option 2 Name",
+            "Send the name for the second ticket option, or type `skip`.",
+            optional=True
+        )
+
+        if data.option_2_name:
+            option_2_category = await ask_category_select(
+                channel, user, data,
+                "Ticket Option 2 Category",
+                "Choose the category for ticket option 2."
+            )
+            data.option_2_category_id = option_2_category.id
+
+        data.option_3_name = await ask_text(
+            channel, user, embed_builder,
+            "Ticket Option 3 Name",
+            "Send the name for the third ticket option, or type `skip`.",
+            optional=True
+        )
+
+        if data.option_3_name:
+            option_3_category = await ask_category_select(
+                channel, user, data,
+                "Ticket Option 3 Category",
+                "Choose the category for ticket option 3."
+            )
+            data.option_3_category_id = option_3_category.id
+
+        log_channel = await ask_channel_select(
+            channel, user, data,
+            "Log Channel",
+            "Choose the log channel."
+        )
+        data.log_channel_id = log_channel.id
+
+        data.banner_image = await ask_image(
+            channel, user, embed_builder,
+            "Banner",
+            "Reply with the banner image uploaded as an attachment."
+        )
+
+        data.thumbnail_image = await ask_image(
+            channel, user, embed_builder,
+            "Server PFP / Small Picture",
+            "Reply with the small picture image uploaded as an attachment."
+        )
+
+        await channel.send(
+            embed=build_setup_preview_embed(guild, data),
+            view=SetupConfirmView(data)
+        )
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Setup Ready",
+                "Review the preview above and click **Publish** or **Cancel**."
+            ),
+            delete_after=20
+        )
+
+    except SetupCancelled:
+        await channel.send(embed=setup_embed(data, "Setup Cancelled", "The ticket setup was cancelled."))
+        cleanup_setup(guild.id, user.id)
+
+    except Exception as e:
+        log.exception("Setup wizard failed in guild %s", guild.id)
+        await channel.send(
+            embed=await base_embed(guild.id, "Setup Failed", f"An error happened during setup:\n`{e}`", error=True)
+        )
+        cleanup_setup(guild.id, user.id)
 
 
-# =========================================================
-# CUSTOM PROMPT LOADER
-# =========================================================
+class SetupConfirmView(discord.ui.View):
+    def __init__(self, data: SetupData):
+        super().__init__(timeout=900)
+        self.data = data
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.data.user_id:
+            await interaction.response.send_message(
+                embed=await base_embed(
+                    interaction.guild.id if interaction.guild else None,
+                    "Access Denied",
+                    "This setup is not yours.",
+                    error=True
+                ),
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Publish", style=discord.ButtonStyle.success)
+    async def publish_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+
+        await safe_defer(interaction, ephemeral=True, thinking=True)
+
+        data = self.data
+        guild = interaction.guild
+
+        try:
+            await clear_ticket_options(guild.id)
+            await save_ticket_option(guild.id, 1, data.option_1_name, data.option_1_category_id)
+
+            if data.option_2_name and data.option_2_category_id:
+                await save_ticket_option(guild.id, 2, data.option_2_name, data.option_2_category_id)
+
+            if data.option_3_name and data.option_3_category_id:
+                await save_ticket_option(guild.id, 3, data.option_3_name, data.option_3_category_id)
+
+            panel_channel = guild.get_channel(data.panel_channel_id)
+            if not isinstance(panel_channel, discord.TextChannel):
+                await interaction.followup.send(
+                    embed=await base_embed(guild.id, "Publish Failed", "Panel channel is invalid.", error=True),
+                    ephemeral=True
+                )
+                return
+
+            embed = discord.Embed(
+                title=data.title,
+                description=data.description,
+                color=hex_to_color(data.color_hex)
+            )
+
+            files: list[discord.File] = []
+
+            if data.thumbnail_image:
+                thumb_name = safe_attachment_name(data.thumbnail_image.filename, "thumbnail.png")
+                embed.set_thumbnail(url=f"attachment://{thumb_name}")
+                files.append(discord.File(io.BytesIO(data.thumbnail_image.raw), filename=thumb_name))
+
+            if data.banner_image:
+                banner_name = safe_attachment_name(data.banner_image.filename, "banner.png")
+                embed.set_image(url=f"attachment://{banner_name}")
+                files.append(discord.File(io.BytesIO(data.banner_image.raw), filename=banner_name))
+
+            embed = await apply_footer(embed, guild.id)
+
+            panel_view = await TicketPanelView.build(guild.id)
+            panel_message = await panel_channel.send(embed=embed, files=files, view=panel_view)
+
+            banner_url = None
+            thumbnail_url = None
+            for att in panel_message.attachments:
+                low = att.filename.lower()
+                if thumbnail_url is None and ("thumb" in low or "icon" in low or "pfp" in low):
+                    thumbnail_url = att.url
+                elif banner_url is None:
+                    banner_url = att.url
+
+            if data.banner_image and banner_url is None and panel_message.attachments:
+                banner_url = panel_message.attachments[0].url
+            if data.thumbnail_image and thumbnail_url is None:
+                if len(panel_message.attachments) >= 2:
+                    thumbnail_url = panel_message.attachments[1].url
+                elif len(panel_message.attachments) == 1 and not data.banner_image:
+                    thumbnail_url = panel_message.attachments[0].url
+
+            await save_guild_config(
+                guild_id=guild.id,
+                panel_channel_id=data.panel_channel_id,
+                panel_message_id=panel_message.id,
+                title=data.title,
+                description=data.description,
+                color_hex=data.color_hex,
+                banner_url=banner_url,
+                thumbnail_url=thumbnail_url,
+                support_role_id=data.support_role_id,
+                log_channel_id=data.log_channel_id
+            )
+
+            bot.add_view(await TicketPanelView.build(guild.id), message_id=panel_message.id)
+
+            with suppress(Exception):
+                if interaction.message:
+                    await interaction.message.edit(
+                        embed=await base_embed(guild.id, "Setup Complete", f"Ticket panel created in {panel_channel.mention}."),
+                        view=None
+                    )
+
+            await interaction.followup.send(
+                embed=await base_embed(guild.id, "Setup Complete", f"Ticket panel created in {panel_channel.mention}."),
+                ephemeral=True
+            )
+
+            cleanup_setup(guild.id, interaction.user.id)
+
+        except Exception as e:
+            log.exception("Failed to publish setup in guild %s", guild.id)
+            await interaction.followup.send(
+                embed=await base_embed(guild.id, "Publish Failed", f"An error happened:\n`{e}`", error=True),
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_defer(interaction, ephemeral=True, thinking=False)
+
+        with suppress(Exception):
+            if interaction.message:
+                await interaction.message.edit(
+                    embed=await base_embed(
+                        interaction.guild.id if interaction.guild else None,
+                        "Setup Cancelled",
+                        "The setup was cancelled."
+                    ),
+                    view=None
+                )
+
+        if interaction.guild:
+            cleanup_setup(interaction.guild.id, interaction.user.id)
+
+        await interaction.followup.send(
+            embed=await base_embed(
+                interaction.guild.id if interaction.guild else None,
+                "Setup Cancelled",
+                "The setup was cancelled."
+            ),
+            ephemeral=True
+        )
+
+
 async def load_custom_prompts():
-    """Load all custom prompts from prompt channels into cache"""
     rows = await db_fetch("""
         SELECT guild_id, prompt_channel_id, custom_prompt 
         FROM ai_assistant_config 
         WHERE enabled = TRUE AND prompt_channel_id IS NOT NULL
     """)
-    
+
     for row in rows:
         if row["custom_prompt"]:
             custom_prompts_cache[row["guild_id"]] = row["custom_prompt"]
 
 
 async def fetch_prompt_from_channel(channel_id: int) -> Optional[str]:
-    """Fetch the latest prompt message from the prompt channel"""
     channel = bot.get_channel(channel_id)
     if not isinstance(channel, discord.TextChannel):
         return None
-    
+
     try:
         async for message in channel.history(limit=50):
             if message.content and not message.author.bot:
                 return message.content
     except Exception:
         pass
-    
+
     return None
 
 
-# =========================================================
-# FAST AI ASSISTANT
-# =========================================================
-async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 150) -> Optional[str]:
-    """Fast API call with short timeout"""
+async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 240) -> Optional[str]:
     if not DEEPSEEK_API_KEY:
         return None
 
@@ -1512,10 +2038,10 @@ async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 150) ->
         "model": "deepseek-chat",
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.7
+        "temperature": 0.35
     }
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         try:
             async with session.post(
                 "https://api.deepseek.com/v1/chat/completions",
@@ -1537,70 +2063,148 @@ async def get_ai_response(
     opener_name: str,
     ticket_category: str,
     available_categories: list[str]
-) -> tuple[str, bool, Optional[str]]:
-    """
-    Returns: (response_text, should_close, suggested_category)
-    """
+) -> Optional[dict[str, Any]]:
     custom_prompt = custom_prompts_cache.get(guild_id, "")
-    
     categories_text = ", ".join(available_categories)
-    
-    system_prompt = f"""You are a helpful ticket assistant. Be concise and direct.
+
+    system_prompt = f"""You are a very smart Discord ticket assistant helping users before staff claim the ticket.
 
 Current ticket category: {ticket_category}
 Available categories: {categories_text}
 User's name: {opener_name}
 
+Return ONLY valid JSON.
+
+Format:
+{{
+  "reply": "short reply to user",
+  "close_ticket": false,
+  "needs_staff": false,
+  "staff_summary": "",
+  "suggested_category": "",
+  "rename_to": ""
+}}
+
 Rules:
-1. If user is in wrong category, tell them to open the correct one and say "I'll close this ticket now."
-2. If user says "ok", "okay", "thanks", "thank you", "no", "nope", "that's all", "nothing else" - respond briefly and CLOSE the ticket.
-3. Never repeat yourself. If you already said something, don't say it again.
-4. Keep responses under 100 characters.
-5. If you can't help, say "I'll get a staff member" and use [NEEDS_STAFF].
+1. Keep replies short, clear and human.
+2. If user opened the wrong category, say so briefly, suggest the correct category, and set close_ticket=true.
+3. If user is done, thanked you, or says they need nothing else, set close_ticket=true.
+4. If user needs staff, purchase help, donation help, payment help, rank help, account-specific help, or anything AI should not handle alone, set needs_staff=true.
+5. If needs_staff=true, also fill staff_summary and rename_to with a short topic.
+6. Never delete. Only close_ticket can be true.
+7. If unsure, escalate to staff.
+8. If asking about buying, donating, premium, turf, price, or payment, strongly prefer needs_staff=true unless custom prompt clearly covers it.
 
+Custom instructions:
 {custom_prompt}
+"""
 
-IMPORTANT: If you want to close the ticket, end your response with [CLOSE]. If you need staff, end with [NEEDS_STAFF: short summary]."""
+    recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
 
-    recent_convo = "\n".join(conversation[-6:])
-    
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nUser: {user_message}\n\nRespond briefly:"}
+        {
+            "role": "user",
+            "content": (
+                f"Recent conversation:\n{recent_convo}\n\n"
+                f"Newest user message:\n{user_message}"
+            )
+        }
     ]
 
-    response = await call_deepseek_api_fast(messages, max_tokens=100)
-    
-    if not response:
-        return (None, False, None)
-    
-    # Parse special flags
-    should_close = "[CLOSE]" in response
-    needs_staff = "[NEEDS_STAFF" in response
-    staff_summary = None
-    suggested_category = None
-    
-    # Extract staff summary
-    if needs_staff:
-        match = re.search(r'\[NEEDS_STAFF:\s*([^\]]+)\]', response)
-        if match:
-            staff_summary = match.group(1).strip()[:50]
-        response = re.sub(r'\[NEEDS_STAFF[^\]]*\]', '', response).strip()
-    
-    # Check for category suggestion
-    for cat in available_categories:
-        if cat.lower() in response.lower() and cat != ticket_category:
-            suggested_category = cat
-            break
-    
-    # Remove close flag
-    response = response.replace("[CLOSE]", "").strip()
-    
-    return (response, should_close or needs_staff, suggested_category)
+    response = await call_deepseek_api_fast(messages, max_tokens=220)
+    parsed = extract_json_object(response or "")
+    if not parsed:
+        return None
+
+    reply = str(parsed.get("reply", "")).strip()[:350]
+    close_ticket = bool(parsed.get("close_ticket", False))
+    needs_staff = bool(parsed.get("needs_staff", False))
+    staff_summary = str(parsed.get("staff_summary", "")).strip()[:200]
+    suggested_category = str(parsed.get("suggested_category", "")).strip()[:100]
+    rename_to = str(parsed.get("rename_to", "")).strip()[:60]
+
+    lower_msg = user_message.strip().lower()
+
+    if lower_msg in AI_CLOSE_WORDS:
+        close_ticket = True
+        needs_staff = False
+        suggested_category = ""
+        if not reply:
+            reply = "Alright, I'll close this ticket now."
+
+    if any(word in lower_msg for word in AI_STAFF_HINTS):
+        current_lower = ticket_category.lower()
+        if any(word in lower_msg for word in ["buy", "purchase", "payment", "pay", "refund", "donate", "donation", "premium", "vip", "turf", "price", "cost"]):
+            if not needs_staff:
+                needs_staff = True
+            if not staff_summary:
+                staff_summary = "User needs help with a purchase/payment-related request."
+            if not rename_to:
+                rename_to = infer_short_topic_from_text(user_message)
+
+        best_cat = find_best_category_from_text(user_message, ticket_category, available_categories)
+        if best_cat and best_cat != ticket_category and not needs_staff:
+            suggested_category = best_cat
+            close_ticket = True
+            if not reply:
+                reply = f"You opened the wrong ticket type. Please open a {best_cat} ticket instead."
+
+    if needs_staff and not reply:
+        reply = "I'll get you a staff member to help you with this."
+
+    if close_ticket and not reply:
+        reply = "Alright, I'll close this ticket now."
+
+    return {
+        "reply": reply,
+        "close_ticket": close_ticket,
+        "needs_staff": needs_staff,
+        "staff_summary": staff_summary,
+        "suggested_category": suggested_category,
+        "rename_to": rename_to
+    }
+
+
+async def maybe_rename_ticket_from_ai(channel: discord.TextChannel, new_name: str):
+    clean = clean_channel_name(new_name)
+    if not clean:
+        return
+    if channel.name == clean:
+        return
+    with suppress(Exception):
+        await channel.edit(name=clean, reason="AI assistant renamed ticket topic")
+
+
+async def auto_close_ticket_by_ai(channel: discord.TextChannel, guild: discord.Guild, reason_text: str):
+    ticket = await get_ticket_by_channel(channel.id)
+    if not ticket or ticket["status"] == "closed":
+        return
+
+    await close_ticket_record(channel.id, bot.user.id if bot.user else None)
+    await remove_staff_alert(channel.id)
+    ai_conversations.pop(channel.id, None)
+
+    with suppress(Exception):
+        if not channel.name.startswith("closed-"):
+            await channel.edit(name=f"closed-{channel.name}"[:95])
+
+    if guild.me:
+        closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
+        with suppress(Exception):
+            await channel.send(embed=closed_embed)
+
+    with suppress(Exception):
+        await channel.send(view=ClosedTicketControlsView())
+
+    await send_log(
+        guild,
+        "Ticket Auto-Closed",
+        f"Channel: {channel.mention}\nClosed by AI assistant.\nReason: {reason_text}"
+    )
 
 
 async def handle_ai_assistant_message(message: discord.Message):
-    """Fast AI assistant handler"""
     if not DEEPSEEK_API_KEY:
         return
 
@@ -1619,10 +2223,9 @@ async def handle_ai_assistant_message(message: discord.Message):
 
     channel = message.channel
 
-    # Check if already processing
     if channel.id in ai_processing:
         return
-    
+
     ticket = await get_ticket_by_channel(channel.id)
     if not ticket:
         return
@@ -1645,158 +2248,354 @@ async def handle_ai_assistant_message(message: discord.Message):
     if not config:
         return
 
-    # Mark as processing
     ai_processing.add(channel.id)
-    
+
     try:
-        # Initialize conversation
-        if channel.id not in ai_conversations:
-            ai_conversations[channel.id] = {
-                "messages": [],
-                "staff_alerted": False,
-                "last_response": None
-            }
+        state = ai_conversations.setdefault(channel.id, {
+            "messages": [],
+            "staff_alerted": False,
+            "last_response": None,
+            "greeted": True
+        })
 
-        conv = ai_conversations[channel.id]
-
-        if conv.get("staff_alerted"):
+        if state.get("staff_alerted"):
             return
 
-        user_msg = message.content.lower().strip()
-        conv["messages"].append(f"User: {user_msg}")
+        state["messages"].append(f"User: {message.content.strip()}")
 
-        # Quick check for immediate close (user says ok/thanks after bot suggested closing)
-        last_bot_msg = conv.get("last_response", "").lower()
-        if ("wrong" in last_bot_msg or "close" in last_bot_msg) and user_msg in ["ok", "okay", "thanks", "thank you", "alright"]:
-            await close_ticket_record(channel.id, bot.user.id)
-            closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
-            await channel.send(embed=closed_embed)
-            try:
-                await channel.edit(name=f"closed-{channel.name[:40]}")
-            except:
-                pass
-            view = ClosedTicketControlsView()
-            await channel.send(view=view)
-            await send_log(guild, "Ticket Auto-Closed", f"Channel: {channel.mention}\nClosed by AI assistant.")
-            cleanup_ticket_channel_lock(channel.id)
-            return
-
-        # Get available categories
         ticket_options = await get_ticket_options(guild.id)
         available_categories = [opt["label"] for opt in ticket_options]
 
-        # Get AI response
-        response, should_close, suggested_category = await get_ai_response(
+        ai_data = await get_ai_response(
             guild.id,
-            conv["messages"],
+            state["messages"],
             message.content,
             message.author.display_name,
             ticket["option_label"],
             available_categories
         )
 
-        if response:
-            # Send response immediately
-            await channel.send(response)
-            conv["messages"].append(f"Bot: {response}")
-            conv["last_response"] = response
-
-            # Handle wrong category
-            if suggested_category and suggested_category != ticket["option_label"]:
-                await asyncio.sleep(1)
-                await close_ticket_record(channel.id, bot.user.id)
-                closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
-                await channel.send(embed=closed_embed)
-                try:
-                    await channel.edit(name=f"closed-{channel.name[:40]}")
-                except:
-                    pass
-                view = ClosedTicketControlsView()
-                await channel.send(view=view)
+        if not ai_data:
+            lower_msg = message.content.lower().strip()
+            if lower_msg in AI_CLOSE_WORDS:
+                await channel.send("Alright, I'll close this ticket now.")
+                await auto_close_ticket_by_ai(channel, guild, "User indicated the conversation is finished.")
                 cleanup_ticket_channel_lock(channel.id)
-                return
+            return
 
-            # Handle close
-            if should_close and not conv.get("staff_alerted"):
-                await asyncio.sleep(0.5)
-                await close_ticket_record(channel.id, bot.user.id)
-                closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
-                await channel.send(embed=closed_embed)
-                try:
-                    await channel.edit(name=f"closed-{channel.name[:40]}")
-                except:
-                    pass
-                view = ClosedTicketControlsView()
-                await channel.send(view=view)
-                await send_log(guild, "Ticket Auto-Closed", f"Channel: {channel.mention}\nClosed by AI assistant.")
-                cleanup_ticket_channel_lock(channel.id)
+        reply = ai_data["reply"]
+        close_ticket = ai_data["close_ticket"]
+        needs_staff = ai_data["needs_staff"]
+        staff_summary = ai_data["staff_summary"]
+        suggested_category = ai_data["suggested_category"]
+        rename_to = ai_data["rename_to"]
+
+        if reply:
+            await channel.send(reply)
+            state["messages"].append(f"Bot: {reply}")
+            state["last_response"] = reply
+
+        if needs_staff and not state.get("staff_alerted"):
+            summary = staff_summary or "User needs help from staff."
+            topic = rename_to or infer_short_topic_from_text(message.content)
+
+            await maybe_rename_ticket_from_ai(channel, topic)
+
+            opener_member = await try_fetch_member(guild, ticket["opener_id"])
+            if opener_member and ai_config.get("alert_channel_id"):
+                await send_staff_alert(
+                    guild=guild,
+                    ticket_channel=channel,
+                    opener=opener_member,
+                    summary=summary,
+                    support_role_id=config["support_role_id"],
+                    alert_channel_id=ai_config["alert_channel_id"]
+                )
+                state["staff_alerted"] = True
+
+            await send_log(
+                guild,
+                "AI Requested Staff",
+                f"Channel: {channel.mention}\nSummary: {summary}"
+            )
+            return
+
+        if suggested_category and suggested_category != ticket["option_label"] and close_ticket:
+            await auto_close_ticket_by_ai(
+                channel,
+                guild,
+                f"Wrong category. Suggested category: {suggested_category}"
+            )
+            cleanup_ticket_channel_lock(channel.id)
+            return
+
+        if close_ticket:
+            await auto_close_ticket_by_ai(channel, guild, "Conversation completed.")
+            cleanup_ticket_channel_lock(channel.id)
 
     finally:
         ai_processing.discard(channel.id)
 
 
-async def send_staff_alert(
-    guild: discord.Guild,
-    ticket_channel: discord.TextChannel,
-    opener: discord.Member,
-    summary: str,
-    support_role_id: int,
-    alert_channel_id: int
-):
-    alert_channel = guild.get_channel(alert_channel_id)
-    if not isinstance(alert_channel, discord.TextChannel):
-        return
+class TicketDropdown(discord.ui.Select):
+    def __init__(self, guild_id: int, rows: list[dict[str, Any]]):
+        options = [
+            discord.SelectOption(label=row["label"][:100], value=str(row["option_index"]))
+            for row in rows
+        ]
 
-    support_role = guild.get_role(support_role_id)
-    role_mention = support_role.mention if support_role else "@Support Team"
+        super().__init__(
+            placeholder="Make a selection",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"ticket_dropdown:{guild_id}"
+        )
+        self.guild_id = guild_id
 
-    config = await get_guild_config(guild.id)
-    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
 
-    embed = discord.Embed(
-        title="🚨 Staff Assistance Needed",
-        description=(
-            f"**User:** {opener.mention} ({opener.display_name})\n"
-            f"**Ticket:** {ticket_channel.mention}\n"
-            f"**Request:** {summary}\n\n"
-            f"*This message will be removed when claimed.*"
-        ),
-        color=color
-    )
-    embed = await apply_footer(embed, guild.id)
+        guild = interaction.guild
+        opener = interaction.user
 
-    try:
-        alert_msg = await alert_channel.send(content=role_mention, embed=embed)
-        await save_alert_message(guild.id, ticket_channel.id, alert_msg.id, alert_channel_id)
-    except Exception as e:
-        log.warning("Failed to send staff alert: %s", e)
+        config = await get_guild_config(guild.id)
+        if not config:
+            await safe_component_reply(
+                interaction,
+                embed=await base_embed(guild.id, "Error", "Ticket system is not configured.", error=True),
+                ephemeral=True
+            )
+            return
+
+        existing_ban = await get_active_ticket_ban(guild.id, opener.id)
+        if existing_ban:
+            expires_at = existing_ban.get("expires_at")
+            await safe_component_reply(
+                interaction,
+                embed=await base_embed(
+                    guild.id,
+                    "Ticket Banned",
+                    (
+                        f"You are banned from opening tickets in this server.\n\n"
+                        f"Duration: {existing_ban['duration_text']}\n"
+                        f"Expires: {format_ban_expiry(expires_at)}\n"
+                        f"Reason: {existing_ban['reason']}"
+                    ),
+                    error=True
+                ),
+                ephemeral=True
+            )
+            return
+
+        try:
+            await interaction.response.send_message(
+                embed=await base_embed(guild.id, "Opening Ticket", "Opening your ticket..."),
+                ephemeral=True
+            )
+        except Exception:
+            return
+
+        create_lock = get_ticket_create_lock(guild.id, opener.id)
+
+        async with create_lock:
+            try:
+                existing = await get_open_ticket_for_user(guild.id, opener.id)
+                if existing:
+                    existing_channel = guild.get_channel(existing["channel_id"])
+                    if existing_channel:
+                        await safe_ephemeral_edit_or_followup(
+                            interaction,
+                            embed=await base_embed(
+                                guild.id,
+                                "Open Ticket Found",
+                                f"You already have an open ticket: {existing_channel.mention}"
+                            )
+                        )
+                        return
+
+                try:
+                    selected_index = int(self.values[0])
+                except Exception:
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "Invalid selection.", error=True)
+                    )
+                    return
+
+                rows = await get_ticket_options(guild.id)
+                selected = next((r for r in rows if r["option_index"] == selected_index), None)
+
+                if not selected:
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True)
+                    )
+                    return
+
+                category = guild.get_channel(selected["category_id"])
+                if not isinstance(category, discord.CategoryChannel):
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "The configured category is invalid.", error=True)
+                    )
+                    return
+
+                support_role = guild.get_role(config["support_role_id"])
+                if not support_role:
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "The support role is invalid.", error=True)
+                    )
+                    return
+
+                me = guild.me
+                if me is None:
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(guild.id, "Error", "Bot member could not be resolved in this server.", error=True)
+                    )
+                    return
+
+                base_name = clean_channel_name(f"{selected['label']}-{opener.name}")
+                channel_name = base_name
+
+                existing_names = {c.name for c in guild.channels}
+                counter = 2
+                while channel_name in existing_names:
+                    suffix = f"-{counter}"
+                    channel_name = f"{base_name[:80-len(suffix)]}{suffix}"
+                    counter += 1
+
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    opener: discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        attach_files=True,
+                        embed_links=True
+                    ),
+                    support_role: discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        attach_files=True,
+                        embed_links=True,
+                        manage_messages=True
+                    ),
+                    me: discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        attach_files=True,
+                        embed_links=True,
+                        manage_channels=True,
+                        manage_messages=True
+                    )
+                }
+
+                try:
+                    ticket_channel = await guild.create_text_channel(
+                        name=channel_name,
+                        category=category,
+                        overwrites=overwrites,
+                        reason=f"Ticket created by {opener} ({opener.id})"
+                    )
+                except discord.Forbidden:
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(
+                            guild.id,
+                            "Error",
+                            "I do not have permission to create channels in that category.",
+                            error=True
+                        )
+                    )
+                    return
+                except discord.HTTPException as e:
+                    await safe_ephemeral_edit_or_followup(
+                        interaction,
+                        embed=await base_embed(
+                            guild.id,
+                            "Error",
+                            f"Failed to create the ticket channel.\n`{e}`",
+                            error=True
+                        )
+                    )
+                    return
+
+                await safe_ephemeral_edit_or_followup(
+                    interaction,
+                    embed=await base_embed(
+                        guild.id,
+                        "Ticket Created",
+                        f"Your ticket has been created: {ticket_channel.mention}"
+                    )
+                )
+
+                await create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
+
+                ticket_view = TicketControlsView()
+                ticket_embed = await build_ticket_embed(guild.id, selected["label"], opener)
+
+                with suppress(Exception):
+                    await ticket_channel.send(
+                        content=f"{support_role.mention} {opener.mention}",
+                        embed=ticket_embed,
+                        view=ticket_view
+                    )
+
+                ai_config = await get_ai_assistant_config(guild.id)
+                premium_row = await get_active_premium_guild_record(guild.id)
+
+                if ai_config and ai_config["enabled"] and premium_row and DEEPSEEK_API_KEY:
+                    ai_conversations[ticket_channel.id] = {
+                        "messages": [],
+                        "staff_alerted": False,
+                        "last_response": None,
+                        "greeted": True
+                    }
+                    with suppress(Exception):
+                        await ticket_channel.send("Hello! How can I help you?")
+
+                asyncio.create_task(refresh_guild_panel(guild.id))
+                asyncio.create_task(
+                    send_log(
+                        guild,
+                        "Ticket Opened",
+                        (
+                            f"User: {opener.mention}\n"
+                            f"Channel: {ticket_channel.mention}\n"
+                            f"Type: {selected['label']}"
+                        )
+                    )
+                )
+
+            except Exception as e:
+                log.exception("Ticket creation failed in guild %s for user %s", guild.id, opener.id)
+                await safe_ephemeral_edit_or_followup(
+                    interaction,
+                    embed=await base_embed(guild.id, "Error", f"Failed to create ticket.\n`{e}`", error=True)
+                )
+            finally:
+                cleanup_ticket_create_lock(guild.id, opener.id)
 
 
-async def remove_staff_alert(ticket_channel_id: int):
-    alert_data = await get_alert_message(ticket_channel_id)
-    if not alert_data:
-        return
+class TicketPanelView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
 
-    guild = bot.get_guild(alert_data["guild_id"])
-    if not guild:
-        await delete_alert_message(ticket_channel_id)
-        return
-
-    alert_channel = guild.get_channel(alert_data["alert_channel_id"])
-    if not isinstance(alert_channel, discord.TextChannel):
-        await delete_alert_message(ticket_channel_id)
-        return
-
-    try:
-        message = await alert_channel.fetch_message(alert_data["alert_message_id"])
-        await message.delete()
-    except:
-        pass
-
-    await delete_alert_message(ticket_channel_id)
-
-
-# =========================================================
+    @classmethod
+    async def build(cls, guild_id: int) -> "TicketPanelView":
+        self = cls(guild_id)
+        rows = await get_ticket_options(guild_id)
+        if rows:
+            self.add_item(TicketDropdown(guild_id, rows))
+        return self
+        # =========================================================
 # DM HELPERS
 # =========================================================
 async def dm_ticket_closed(
@@ -2263,835 +3062,67 @@ async def set_guild_profile(
 
 
 # =========================================================
-# SETUP HELPERS
+# STAFF ALERT HELPERS
 # =========================================================
-async def wait_for_user_message(channel: discord.TextChannel, user: discord.Member, timeout: int = 300) -> discord.Message:
-    def check(m: discord.Message):
-        return (
-            m.author.id == user.id
-            and m.channel.id == channel.id
-            and not m.author.bot
-        )
-    return await bot.wait_for("message", check=check, timeout=timeout)
-
-
-async def ask_text(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    embed_builder,
-    title: str,
-    description: str,
-    *,
-    optional: bool = False,
-    delete_reply: bool = True,
-) -> Optional[str]:
-    prompt = await channel.send(embed=embed_builder(title, description))
-    reply: Optional[discord.Message] = None
-
-    try:
-        reply = await wait_for_user_message(channel, user)
-        content = reply.content.strip()
-
-        if content.lower() in CANCEL_WORDS:
-            raise SetupCancelled()
-
-        if optional and content.lower() in SKIP_WORDS:
-            return None
-
-        if not content:
-            if optional:
-                return None
-            raise ValueError("Empty answer.")
-
-        return content
-    finally:
-        await safe_delete_message(prompt)
-        if delete_reply and reply is not None:
-            await safe_delete_message(reply)
-
-
-async def ask_image(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    embed_builder,
-    title: str,
-    description: str,
-) -> ImageData:
-    while True:
-        prompt = await channel.send(embed=embed_builder(title, description))
-        reply: Optional[discord.Message] = None
-
-        try:
-            reply = await wait_for_user_message(channel, user)
-
-            if reply.content.strip().lower() in CANCEL_WORDS:
-                raise SetupCancelled()
-
-            if not reply.attachments:
-                await channel.send(
-                    embed=embed_builder("No Image Found", "You need to upload an image in your reply."),
-                    delete_after=8
-                )
-                continue
-
-            attachment = reply.attachments[0]
-            if not is_image_attachment(attachment):
-                await channel.send(
-                    embed=embed_builder("Invalid Image", "Attachment must be an image."),
-                    delete_after=8
-                )
-                continue
-
-            raw = await attachment.read()
-            return ImageData(
-                filename=attachment.filename,
-                mime_type=attachment.content_type or "image/png",
-                raw=raw
-            )
-        finally:
-            await safe_delete_message(prompt)
-            if reply is not None:
-                await safe_delete_message(reply)
-
-
-async def ask_channel_select(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    data: SetupData,
-    title: str,
-    description: str,
-) -> discord.TextChannel:
-    view = discord.ui.View(timeout=300)
-    select = discord.ui.ChannelSelect(
-        placeholder="Choose a text channel",
-        min_values=1,
-        max_values=1,
-        channel_types=[discord.ChannelType.text]
-    )
-    view.add_item(select)
-
-    prompt = await channel.send(embed=setup_embed(data, title, description), view=view)
-
-    try:
-        while True:
-            interaction = await bot.wait_for(
-                "interaction",
-                check=lambda i: (
-                    i.type == discord.InteractionType.component
-                    and i.user.id == user.id
-                    and i.channel_id == channel.id
-                    and i.message is not None
-                    and i.message.id == prompt.id
-                ),
-                timeout=300
-            )
-
-            values = (interaction.data or {}).get("values", [])
-            if not values:
-                await interaction.response.send_message(
-                    embed=setup_embed(data, "Invalid Selection", "Please choose a text channel."),
-                    ephemeral=True
-                )
-                continue
-
-            channel_id = int(values[0])
-            selected_channel = channel.guild.get_channel(channel_id)
-
-            if not isinstance(selected_channel, discord.TextChannel):
-                await interaction.response.send_message(
-                    embed=setup_embed(data, "Invalid Selection", "That is not a valid text channel."),
-                    ephemeral=True
-                )
-                continue
-
-            await interaction.response.edit_message(view=None)
-            return selected_channel
-    finally:
-        with suppress(Exception):
-            await prompt.edit(view=None)
-
-
-async def ask_role_select(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    data: SetupData,
-    title: str,
-    description: str,
-) -> discord.Role:
-    view = discord.ui.View(timeout=300)
-    select = discord.ui.RoleSelect(
-        placeholder="Choose a support role",
-        min_values=1,
-        max_values=1
-    )
-    view.add_item(select)
-
-    prompt = await channel.send(embed=setup_embed(data, title, description), view=view)
-
-    try:
-        while True:
-            interaction = await bot.wait_for(
-                "interaction",
-                check=lambda i: (
-                    i.type == discord.InteractionType.component
-                    and i.user.id == user.id
-                    and i.channel_id == channel.id
-                    and i.message is not None
-                    and i.message.id == prompt.id
-                ),
-                timeout=300
-            )
-
-            values = (interaction.data or {}).get("values", [])
-            if not values:
-                await interaction.response.send_message(
-                    embed=setup_embed(data, "Invalid Selection", "Please choose a role."),
-                    ephemeral=True
-                )
-                continue
-
-            role_id = int(values[0])
-            selected_role = channel.guild.get_role(role_id)
-
-            if not isinstance(selected_role, discord.Role):
-                await interaction.response.send_message(
-                    embed=setup_embed(data, "Invalid Selection", "That is not a valid role."),
-                    ephemeral=True
-                )
-                continue
-
-            await interaction.response.edit_message(view=None)
-            return selected_role
-    finally:
-        with suppress(Exception):
-            await prompt.edit(view=None)
-
-
-async def ask_category_select(
-    channel: discord.TextChannel,
-    user: discord.Member,
-    data: SetupData,
-    title: str,
-    description: str,
-) -> discord.CategoryChannel:
-    view = discord.ui.View(timeout=300)
-    select = discord.ui.ChannelSelect(
-        placeholder="Choose a category",
-        min_values=1,
-        max_values=1,
-        channel_types=[discord.ChannelType.category]
-    )
-    view.add_item(select)
-
-    prompt = await channel.send(embed=setup_embed(data, title, description), view=view)
-
-    try:
-        while True:
-            interaction = await bot.wait_for(
-                "interaction",
-                check=lambda i: (
-                    i.type == discord.InteractionType.component
-                    and i.user.id == user.id
-                    and i.channel_id == channel.id
-                    and i.message is not None
-                    and i.message.id == prompt.id
-                ),
-                timeout=300
-            )
-
-            values = (interaction.data or {}).get("values", [])
-            if not values:
-                await interaction.response.send_message(
-                    embed=setup_embed(data, "Invalid Selection", "Please choose a category."),
-                    ephemeral=True
-                )
-                continue
-
-            category_id = int(values[0])
-            category = channel.guild.get_channel(category_id)
-
-            if not isinstance(category, discord.CategoryChannel):
-                await interaction.response.send_message(
-                    embed=setup_embed(data, "Invalid Selection", "That is not a valid category."),
-                    ephemeral=True
-                )
-                continue
-
-            await interaction.response.edit_message(view=None)
-            return category
-    finally:
-        with suppress(Exception):
-            await prompt.edit(view=None)
-
-
-# =========================================================
-# SETUP FLOW
-# =========================================================
-async def run_setup_wizard(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+async def send_staff_alert(
+    guild: discord.Guild,
+    ticket_channel: discord.TextChannel,
+    opener: discord.Member,
+    summary: str,
+    support_role_id: int,
+    alert_channel_id: int
+):
+    alert_channel = guild.get_channel(alert_channel_id)
+    if not isinstance(alert_channel, discord.TextChannel):
         return
 
-    guild = interaction.guild
-    user = interaction.user
-    channel = interaction.channel
+    support_role = guild.get_role(support_role_id)
+    role_mention = support_role.mention if support_role else "@Support Team"
 
-    if not isinstance(channel, discord.TextChannel):
-        await interaction.followup.send(
-            embed=await base_embed(guild.id, "Setup Failed", "Setup must be run in a text channel.", error=True),
-            ephemeral=True
-        )
-        return
+    config = await get_guild_config(guild.id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
 
-    data = SetupData(guild.id, user.id, channel.id)
-    setup_sessions[(guild.id, user.id)] = data
-    embed_builder = lambda t, d: setup_embed(data, t, d)
+    embed = discord.Embed(
+        title="Staff Assistance Needed",
+        description=(
+            f"**User:** {opener.mention} ({opener.display_name})\n"
+            f"**Ticket:** {ticket_channel.mention}\n"
+            f"**Summary:** {summary}\n\n"
+            f"*This alert will be removed when the ticket is claimed.*"
+        ),
+        color=color
+    )
+    embed = await apply_footer(embed, guild.id)
 
     try:
-        await channel.send(
-            embed=setup_embed(
-                data,
-                "Ticket Setup Started",
-                "I will ask you one question at a time.\n\n"
-                "Reply in this channel.\n"
-                "Type `cancel` anytime to stop the setup.\n"
-                "Type `skip` on optional questions."
-            )
-        )
-
-        data.title = await ask_text(channel, user, embed_builder, "Title", "Send the ticket panel title.")
-        data.description = await ask_text(channel, user, embed_builder, "Description", "Send the ticket panel description.")
-
-        color_raw = await ask_text(
-            channel, user, embed_builder,
-            "Embed Color",
-            "Send the embed hex color.\nExample: `#00FF66`\n\nType `skip` to use the default color.",
-            optional=True
-        )
-        if color_raw:
-            try:
-                data.color_hex = normalize_hex(color_raw)
-            except ValueError:
-                await channel.send(
-                    embed=await base_embed(None, "Invalid Color", "Invalid hex color. Default color `#00FF66` will be used.", error=True),
-                    delete_after=8
-                )
-                data.color_hex = "#00FF66"
-
-        panel_channel = await ask_channel_select(
-            channel, user, data,
-            "Panel Channel",
-            "Choose the channel where the ticket panel should be posted."
-        )
-        data.panel_channel_id = panel_channel.id
-
-        support_role = await ask_role_select(
-            channel, user, data,
-            "Support Team Role",
-            "Choose the support team role."
-        )
-        data.support_role_id = support_role.id
-
-        data.option_1_name = await ask_text(
-            channel, user, embed_builder,
-            "Ticket Option 1 Name",
-            "Send the name for the first ticket option.\nExample: `Support Ticket`"
-        )
-
-        option_1_category = await ask_category_select(
-            channel, user, data,
-            "Ticket Option 1 Category",
-            "Choose the category for ticket option 1."
-        )
-        data.option_1_category_id = option_1_category.id
-
-        data.option_2_name = await ask_text(
-            channel, user, embed_builder,
-            "Ticket Option 2 Name",
-            "Send the name for the second ticket option, or type `skip`.",
-            optional=True
-        )
-
-        if data.option_2_name:
-            option_2_category = await ask_category_select(
-                channel, user, data,
-                "Ticket Option 2 Category",
-                "Choose the category for ticket option 2."
-            )
-            data.option_2_category_id = option_2_category.id
-
-        data.option_3_name = await ask_text(
-            channel, user, embed_builder,
-            "Ticket Option 3 Name",
-            "Send the name for the third ticket option, or type `skip`.",
-            optional=True
-        )
-
-        if data.option_3_name:
-            option_3_category = await ask_category_select(
-                channel, user, data,
-                "Ticket Option 3 Category",
-                "Choose the category for ticket option 3."
-            )
-            data.option_3_category_id = option_3_category.id
-
-        log_channel = await ask_channel_select(
-            channel, user, data,
-            "Log Channel",
-            "Choose the log channel."
-        )
-        data.log_channel_id = log_channel.id
-
-        data.banner_image = await ask_image(
-            channel, user, embed_builder,
-            "Banner",
-            "Reply with the banner image uploaded as an attachment."
-        )
-
-        data.thumbnail_image = await ask_image(
-            channel, user, embed_builder,
-            "Server PFP / Small Picture",
-            "Reply with the small picture image uploaded as an attachment."
-        )
-
-        await channel.send(
-            embed=build_setup_preview_embed(guild, data),
-            view=SetupConfirmView(data)
-        )
-
-        await channel.send(
-            embed=setup_embed(
-                data,
-                "Setup Ready",
-                "Review the preview above and click **Publish** or **Cancel**."
-            ),
-            delete_after=20
-        )
-
-    except SetupCancelled:
-        await channel.send(embed=setup_embed(data, "Setup Cancelled", "The ticket setup was cancelled."))
-        cleanup_setup(guild.id, user.id)
-
+        alert_msg = await alert_channel.send(content=role_mention, embed=embed)
+        await save_alert_message(guild.id, ticket_channel.id, alert_msg.id, alert_channel_id)
     except Exception as e:
-        log.exception("Setup wizard failed in guild %s", guild.id)
-        await channel.send(
-            embed=await base_embed(guild.id, "Setup Failed", f"An error happened during setup:\n`{e}`", error=True)
-        )
-        cleanup_setup(guild.id, user.id)
+        log.warning("Failed to send staff alert: %s", e)
 
 
-# =========================================================
-# SETUP CONFIRM VIEW
-# =========================================================
-class SetupConfirmView(discord.ui.View):
-    def __init__(self, data: SetupData):
-        super().__init__(timeout=900)
-        self.data = data
+async def remove_staff_alert(ticket_channel_id: int):
+    alert_data = await get_alert_message(ticket_channel_id)
+    if not alert_data:
+        return
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.data.user_id:
-            await interaction.response.send_message(
-                embed=await base_embed(
-                    interaction.guild.id if interaction.guild else None,
-                    "Access Denied",
-                    "This setup is not yours.",
-                    error=True
-                ),
-                ephemeral=True
-            )
-            return False
-        return True
+    guild = bot.get_guild(alert_data["guild_id"])
+    if not guild:
+        await delete_alert_message(ticket_channel_id)
+        return
 
-    @discord.ui.button(label="Publish", style=discord.ButtonStyle.success)
-    async def publish_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild:
-            return
+    alert_channel = guild.get_channel(alert_data["alert_channel_id"])
+    if not isinstance(alert_channel, discord.TextChannel):
+        await delete_alert_message(ticket_channel_id)
+        return
 
-        await safe_defer(interaction, ephemeral=True, thinking=True)
+    try:
+        message = await alert_channel.fetch_message(alert_data["alert_message_id"])
+        await message.delete()
+    except Exception:
+        pass
 
-        data = self.data
-        guild = interaction.guild
-
-        try:
-            await clear_ticket_options(guild.id)
-            await save_ticket_option(guild.id, 1, data.option_1_name, data.option_1_category_id)
-
-            if data.option_2_name and data.option_2_category_id:
-                await save_ticket_option(guild.id, 2, data.option_2_name, data.option_2_category_id)
-
-            if data.option_3_name and data.option_3_category_id:
-                await save_ticket_option(guild.id, 3, data.option_3_name, data.option_3_category_id)
-
-            panel_channel = guild.get_channel(data.panel_channel_id)
-            if not isinstance(panel_channel, discord.TextChannel):
-                await interaction.followup.send(
-                    embed=await base_embed(guild.id, "Publish Failed", "Panel channel is invalid.", error=True),
-                    ephemeral=True
-                )
-                return
-
-            embed = discord.Embed(
-                title=data.title,
-                description=data.description,
-                color=hex_to_color(data.color_hex)
-            )
-
-            files: list[discord.File] = []
-
-            if data.thumbnail_image:
-                thumb_name = safe_attachment_name(data.thumbnail_image.filename, "thumbnail.png")
-                embed.set_thumbnail(url=f"attachment://{thumb_name}")
-                files.append(discord.File(io.BytesIO(data.thumbnail_image.raw), filename=thumb_name))
-
-            if data.banner_image:
-                banner_name = safe_attachment_name(data.banner_image.filename, "banner.png")
-                embed.set_image(url=f"attachment://{banner_name}")
-                files.append(discord.File(io.BytesIO(data.banner_image.raw), filename=banner_name))
-
-            embed = await apply_footer(embed, guild.id)
-
-            panel_view = await TicketPanelView.build(guild.id)
-            panel_message = await panel_channel.send(embed=embed, files=files, view=panel_view)
-
-            banner_url = None
-            thumbnail_url = None
-            for att in panel_message.attachments:
-                low = att.filename.lower()
-                if thumbnail_url is None and ("thumb" in low or "icon" in low or "pfp" in low):
-                    thumbnail_url = att.url
-                elif banner_url is None:
-                    banner_url = att.url
-
-            if data.banner_image and banner_url is None and panel_message.attachments:
-                banner_url = panel_message.attachments[0].url
-            if data.thumbnail_image and thumbnail_url is None:
-                if len(panel_message.attachments) >= 2:
-                    thumbnail_url = panel_message.attachments[1].url
-                elif len(panel_message.attachments) == 1 and not data.banner_image:
-                    thumbnail_url = panel_message.attachments[0].url
-
-            await save_guild_config(
-                guild_id=guild.id,
-                panel_channel_id=data.panel_channel_id,
-                panel_message_id=panel_message.id,
-                title=data.title,
-                description=data.description,
-                color_hex=data.color_hex,
-                banner_url=banner_url,
-                thumbnail_url=thumbnail_url,
-                support_role_id=data.support_role_id,
-                log_channel_id=data.log_channel_id
-            )
-
-            bot.add_view(await TicketPanelView.build(guild.id), message_id=panel_message.id)
-
-            with suppress(Exception):
-                if interaction.message:
-                    await interaction.message.edit(
-                        embed=await base_embed(guild.id, "Setup Complete", f"Ticket panel created in {panel_channel.mention}."),
-                        view=None
-                    )
-
-            await interaction.followup.send(
-                embed=await base_embed(guild.id, "Setup Complete", f"Ticket panel created in {panel_channel.mention}."),
-                ephemeral=True
-            )
-
-            cleanup_setup(guild.id, interaction.user.id)
-
-        except Exception as e:
-            log.exception("Failed to publish setup in guild %s", guild.id)
-            await interaction.followup.send(
-                embed=await base_embed(guild.id, "Publish Failed", f"An error happened:\n`{e}`", error=True),
-                ephemeral=True
-            )
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await safe_defer(interaction, ephemeral=True, thinking=False)
-
-        with suppress(Exception):
-            if interaction.message:
-                await interaction.message.edit(
-                    embed=await base_embed(
-                        interaction.guild.id if interaction.guild else None,
-                        "Setup Cancelled",
-                        "The setup was cancelled."
-                    ),
-                    view=None
-                )
-
-        if interaction.guild:
-            cleanup_setup(interaction.guild.id, interaction.user.id)
-
-        await interaction.followup.send(
-            embed=await base_embed(
-                interaction.guild.id if interaction.guild else None,
-                "Setup Cancelled",
-                "The setup was cancelled."
-            ),
-            ephemeral=True
-        )
-
-
-# =========================================================
-# PANEL VIEW
-# =========================================================
-class TicketDropdown(discord.ui.Select):
-    def __init__(self, guild_id: int, rows: list[dict[str, Any]]):
-        options = [
-            discord.SelectOption(label=row["label"][:100], value=str(row["option_index"]))
-            for row in rows
-        ]
-
-        super().__init__(
-            placeholder="Make a selection",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id=f"ticket_dropdown:{guild_id}"
-        )
-        self.guild_id = guild_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return
-
-        guild = interaction.guild
-        opener = interaction.user
-
-        config = await get_guild_config(guild.id)
-        if not config:
-            await safe_component_reply(
-                interaction,
-                embed=await base_embed(guild.id, "Error", "Ticket system is not configured.", error=True),
-                ephemeral=True
-            )
-            return
-
-        existing_ban = await get_active_ticket_ban(guild.id, opener.id)
-        if existing_ban:
-            expires_at = existing_ban.get("expires_at")
-            await safe_component_reply(
-                interaction,
-                embed=await base_embed(
-                    guild.id,
-                    "Ticket Banned",
-                    (
-                        f"You are banned from opening tickets in this server.\n\n"
-                        f"Duration: {existing_ban['duration_text']}\n"
-                        f"Expires: {format_ban_expiry(expires_at)}\n"
-                        f"Reason: {existing_ban['reason']}"
-                    ),
-                    error=True
-                ),
-                ephemeral=True
-            )
-            return
-
-        try:
-            await interaction.response.send_message(
-                embed=await base_embed(guild.id, "Opening Ticket", "Opening your ticket..."),
-                ephemeral=True
-            )
-        except Exception:
-            return
-
-        create_lock = get_ticket_create_lock(guild.id, opener.id)
-
-        async with create_lock:
-            try:
-                existing = await get_open_ticket_for_user(guild.id, opener.id)
-                if existing:
-                    existing_channel = guild.get_channel(existing["channel_id"])
-                    if existing_channel:
-                        await safe_ephemeral_edit_or_followup(
-                            interaction,
-                            embed=await base_embed(
-                                guild.id,
-                                "Open Ticket Found",
-                                f"You already have an open ticket: {existing_channel.mention}"
-                            )
-                        )
-                        return
-
-                try:
-                    selected_index = int(self.values[0])
-                except Exception:
-                    await safe_ephemeral_edit_or_followup(
-                        interaction,
-                        embed=await base_embed(guild.id, "Error", "Invalid selection.", error=True)
-                    )
-                    return
-
-                rows = await get_ticket_options(guild.id)
-                selected = next((r for r in rows if r["option_index"] == selected_index), None)
-
-                if not selected:
-                    await safe_ephemeral_edit_or_followup(
-                        interaction,
-                        embed=await base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True)
-                    )
-                    return
-
-                category = guild.get_channel(selected["category_id"])
-                if not isinstance(category, discord.CategoryChannel):
-                    await safe_ephemeral_edit_or_followup(
-                        interaction,
-                        embed=await base_embed(guild.id, "Error", "The configured category is invalid.", error=True)
-                    )
-                    return
-
-                support_role = guild.get_role(config["support_role_id"])
-                if not support_role:
-                    await safe_ephemeral_edit_or_followup(
-                        interaction,
-                        embed=await base_embed(guild.id, "Error", "The support role is invalid.", error=True)
-                    )
-                    return
-
-                me = guild.me
-                if me is None:
-                    await safe_ephemeral_edit_or_followup(
-                        interaction,
-                        embed=await base_embed(guild.id, "Error", "Bot member could not be resolved in this server.", error=True)
-                    )
-                    return
-
-                base_name = clean_channel_name(f"{selected['label']}-{opener.name}")
-                channel_name = base_name
-
-                existing_names = {c.name for c in guild.channels}
-                counter = 2
-                while channel_name in existing_names:
-                    suffix = f"-{counter}"
-                    channel_name = f"{base_name[:80-len(suffix)]}{suffix}"
-                    counter += 1
-
-                overwrites = {
-                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                    opener: discord.PermissionOverwrite(
-                        view_channel=True,
-                        send_messages=True,
-                        read_message_history=True,
-                        attach_files=True,
-                        embed_links=True
-                    ),
-                    support_role: discord.PermissionOverwrite(
-                        view_channel=True,
-                        send_messages=True,
-                        read_message_history=True,
-                        attach_files=True,
-                        embed_links=True,
-                        manage_messages=True
-                    ),
-                    me: discord.PermissionOverwrite(
-                        view_channel=True,
-                        send_messages=True,
-                        read_message_history=True,
-                        attach_files=True,
-                        embed_links=True,
-                        manage_channels=True,
-                        manage_messages=True
-                    )
-                }
-
-                try:
-                    ticket_channel = await guild.create_text_channel(
-                        name=channel_name,
-                        category=category,
-                        overwrites=overwrites,
-                        reason=f"Ticket created by {opener} ({opener.id})"
-                    )
-                except discord.Forbidden:
-                    await safe_ephemeral_edit_or_followup(
-                        interaction,
-                        embed=await base_embed(
-                            guild.id,
-                            "Error",
-                            "I do not have permission to create channels in that category.",
-                            error=True
-                        )
-                    )
-                    return
-                except discord.HTTPException as e:
-                    await safe_ephemeral_edit_or_followup(
-                        interaction,
-                        embed=await base_embed(
-                            guild.id,
-                            "Error",
-                            f"Failed to create the ticket channel.\n`{e}`",
-                            error=True
-                        )
-                    )
-                    return
-
-                await safe_ephemeral_edit_or_followup(
-                    interaction,
-                    embed=await base_embed(
-                        guild.id,
-                        "Ticket Created",
-                        f"Your ticket has been created: {ticket_channel.mention}"
-                    )
-                )
-
-                await create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
-
-                ticket_view = TicketControlsView()
-                ticket_embed = await build_ticket_embed(guild.id, selected["label"], opener)
-
-                with suppress(Exception):
-                    await ticket_channel.send(
-                        content=f"{support_role.mention} {opener.mention}",
-                        embed=ticket_embed,
-                        view=ticket_view
-                    )
-
-                # Initialize AI conversation but DON'T send greeting - wait for user
-                ai_config = await get_ai_assistant_config(guild.id)
-                premium_row = await get_active_premium_guild_record(guild.id)
-
-                if ai_config and ai_config["enabled"] and premium_row and DEEPSEEK_API_KEY:
-                    ai_conversations[ticket_channel.id] = {
-                        "messages": [],
-                        "staff_alerted": False,
-                        "last_response": None
-                    }
-
-                asyncio.create_task(refresh_guild_panel(guild.id))
-                asyncio.create_task(
-                    send_log(
-                        guild,
-                        "Ticket Opened",
-                        (
-                            f"User: {opener.mention}\n"
-                            f"Channel: {ticket_channel.mention}\n"
-                            f"Type: {selected['label']}"
-                        )
-                    )
-                )
-
-            except Exception as e:
-                log.exception("Ticket creation failed in guild %s for user %s", guild.id, opener.id)
-                await safe_ephemeral_edit_or_followup(
-                    interaction,
-                    embed=await base_embed(guild.id, "Error", f"Failed to create ticket.\n`{e}`", error=True)
-                )
-            finally:
-                cleanup_ticket_create_lock(guild.id, opener.id)
-
-
-class TicketPanelView(discord.ui.View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-
-    @classmethod
-    async def build(cls, guild_id: int) -> "TicketPanelView":
-        self = cls(guild_id)
-        rows = await get_ticket_options(guild_id)
-        if rows:
-            self.add_item(TicketDropdown(guild_id, rows))
-        return self
+    await delete_alert_message(ticket_channel_id)
 
 
 # =========================================================
@@ -3152,14 +3183,12 @@ class ClaimTicketButton(discord.ui.Button):
 
             await set_ticket_claimed(interaction.channel.id, interaction.user.id)
 
-            # Remove AI alert message and disable AI assistant
             await remove_staff_alert(interaction.channel.id)
             ai_conversations.pop(interaction.channel.id, None)
 
-            # Check if server has premium for AI disabled message
             premium_row = await get_active_premium_guild_record(interaction.guild.id)
             ai_config = await get_ai_assistant_config(interaction.guild.id)
-            
+
             if premium_row and ai_config and ai_config["enabled"]:
                 claim_text = f"Ticket claimed by {interaction.user.mention}.\n\n*AI Assistant has been disabled.*"
             else:
@@ -3172,12 +3201,9 @@ class ClaimTicketButton(discord.ui.Button):
             )
             await interaction.channel.send(embed=claim_embed)
 
-            # Update the view to disable the claim button
             try:
                 if interaction.message:
-                    # Create a new view with claim button disabled
                     new_view = TicketControlsView()
-                    # Disable the claim button in the new view
                     for child in new_view.children:
                         if isinstance(child, ClaimTicketButton):
                             child.disabled = True
@@ -3274,14 +3300,17 @@ class CloseTicketButton(discord.ui.Button):
 
             await close_ticket_record(interaction.channel.id, interaction.user.id)
 
-            # Disable AI assistant for closed ticket
             ai_conversations.pop(interaction.channel.id, None)
+            await remove_staff_alert(interaction.channel.id)
+
+            with suppress(Exception):
+                if not interaction.channel.name.startswith("closed-"):
+                    await interaction.channel.edit(name=f"closed-{interaction.channel.name}"[:95])
 
             closed_embed = await build_closed_ticket_embed(interaction.guild.id, interaction.user)
             with suppress(Exception):
                 await interaction.channel.send(embed=closed_embed)
 
-            # Send the closed controls view
             closed_view = ClosedTicketControlsView()
             await interaction.channel.send(view=closed_view)
 
@@ -3313,7 +3342,7 @@ class CloseTicketButton(discord.ui.Button):
 class ReopenTicketButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
-            label="Reopen Ticket",
+            label="Open Ticket",
             style=discord.ButtonStyle.success,
             custom_id="ticket_reopen_button",
             disabled=False
@@ -3377,11 +3406,17 @@ class ReopenTicketButton(discord.ui.Button):
 
             await reopen_ticket_record(interaction.channel.id)
 
+            current_name = interaction.channel.name
+            if current_name.startswith("closed-"):
+                reopened_name = current_name[len("closed-"):]
+                reopened_name = reopened_name or "ticket"
+                with suppress(Exception):
+                    await interaction.channel.edit(name=reopened_name[:95])
+
             reopened_embed = await build_reopened_ticket_embed(interaction.guild.id, interaction.user)
             with suppress(Exception):
                 await interaction.channel.send(embed=reopened_embed)
 
-            # Send new ticket controls view
             new_view = TicketControlsView()
             await interaction.channel.send(view=new_view)
 
@@ -3463,7 +3498,6 @@ class DeleteTicketButton(discord.ui.Button):
             except Exception:
                 pass
 
-            # Generate transcript
             transcript_file = await build_transcript_zip(channel)
             opener_text = f"<@{ticket['opener_id']}>"
             channel_name = channel.name
@@ -3513,9 +3547,7 @@ class DeletingTicketControlsView(discord.ui.View):
         self.add_item(ClaimTicketButton(disabled=True, closed_variant=True))
         self.add_item(CloseTicketButton(disabled=True, closed_variant=True))
         self.add_item(DeleteTicketButton(disabled=True, closed_variant=True))
-
-
-# =========================================================
+        # =========================================================
 # BACKGROUND TASKS
 # =========================================================
 async def ticket_ban_expiry_loop():
@@ -3729,7 +3761,7 @@ async def setprofile(
                     ephemeral=True
                 )
 
-        except Exception as e:
+        except Exception:
             log.exception("Setprofile command failed in guild %s", interaction.guild.id)
             await interaction.followup.send(
                 embed=await base_embed(
@@ -4028,8 +4060,7 @@ async def enableticketassistant(interaction: discord.Interaction, alert_channel:
         return
 
     await set_ai_assistant_config(interaction.guild.id, True, alert_channel.id, prompt_channel.id)
-    
-    # Fetch and save custom prompt
+
     custom_prompt = await fetch_prompt_from_channel(prompt_channel.id)
     if custom_prompt:
         await update_custom_prompt(interaction.guild.id, custom_prompt)
@@ -4038,7 +4069,7 @@ async def enableticketassistant(interaction: discord.Interaction, alert_channel:
         embed=await base_embed(
             interaction.guild.id,
             "AI Assistant Enabled",
-            f"Ticket assistant has been activated.\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
+            f"Ticket Assistant has been activated.\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
         ),
         ephemeral=False
     )
@@ -4838,7 +4869,6 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Process AI assistant
     await handle_ai_assistant_message(message)
 
 
@@ -4872,8 +4902,463 @@ async def close_resources():
         await db_pool.close()
         db_pool = None
         log.info("Postgres pool closed.")
+# =========================================================
+# DEL 5 - ADVANCED AI PATCH
+# Lägg ovanför MAIN
+# =========================================================
+
+ADVANCED_PURCHASE_WORDS = {
+    "buy", "purchase", "payment", "pay", "paid", "refund", "invoice",
+    "billing", "donate", "donation", "vip", "premium", "turf", "store",
+    "shop", "order", "checkout", "upgrade", "package", "bundle"
+}
+
+ADVANCED_SUPPORT_WORDS = {
+    "rank", "ban", "appeal", "account", "admin", "owner", "staff",
+    "unban", "problem", "issue", "error", "bug", "glitch", "report"
+}
+
+ADVANCED_END_WORDS = {
+    "ok", "okay", "thanks", "thank you", "ty", "thx", "no", "nope",
+    "nah", "that's all", "thats all", "nothing else", "all good",
+    "im good", "i'm good", "done", "resolved", "fixed", "nvm",
+    "never mind"
+}
 
 
+def normalize_simple_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower().strip())
+
+
+def ai_text_has_any(text: str, words: set[str]) -> bool:
+    lower = normalize_simple_text(text)
+    return any(word in lower for word in words)
+
+
+def ai_guess_best_category_advanced(user_text: str, current_category: str, available_categories: list[str]) -> Optional[str]:
+    lower_text = normalize_simple_text(user_text)
+    current_lower = normalize_simple_text(current_category)
+
+    purchase_mode = ai_text_has_any(lower_text, ADVANCED_PURCHASE_WORDS)
+    support_mode = ai_text_has_any(lower_text, ADVANCED_SUPPORT_WORDS)
+
+    scored: list[tuple[int, str]] = []
+
+    for category in available_categories:
+        if category == current_category:
+            continue
+
+        cat_lower = normalize_simple_text(category)
+        score = 0
+
+        if purchase_mode and any(k in cat_lower for k in ["buy", "purchase", "shop", "store", "payment", "billing", "donate", "premium", "vip"]):
+            score += 10
+
+        if support_mode and any(k in cat_lower for k in ["support", "help", "report", "bug", "appeal", "rank", "admin"]):
+            score += 6
+
+        msg_words = set(re.findall(r"[a-z0-9]+", lower_text))
+        cat_words = set(re.findall(r"[a-z0-9]+", cat_lower))
+        score += len(msg_words & cat_words)
+
+        if score > 0:
+            scored.append((score, category))
+
+    if not scored:
+        return None
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    best = scored[0][1]
+
+    if normalize_simple_text(best) == current_lower:
+        return None
+
+    return best
+
+
+def ai_build_short_topic_advanced(user_text: str) -> str:
+    lower = normalize_simple_text(user_text)
+
+    amount_match = re.search(r"(\d+[kKmM]?)", lower)
+
+    if "donat" in lower:
+        if amount_match:
+            return f"donate {amount_match.group(1)}"
+        return "donation"
+
+    if any(word in lower for word in ["buy", "purchase", "payment", "pay", "refund", "billing"]):
+        if "turf" in lower:
+            return "purchase turf"
+        if "vip" in lower:
+            return "purchase vip"
+        if "premium" in lower:
+            return "purchase premium"
+        return "purchase"
+
+    if any(word in lower for word in ["bug", "error", "issue", "glitch", "problem"]):
+        return "bug report"
+
+    if any(word in lower for word in ["appeal", "unban", "ban"]):
+        return "ban appeal"
+
+    if any(word in lower for word in ["rank"]):
+        return "rank help"
+
+    words = re.findall(r"[a-z0-9]+", lower)
+    if not words:
+        return "ticket"
+
+    return clean_short_ticket_topic(" ".join(words[:3]))
+
+
+def ai_fallback_response(
+    user_message: str,
+    ticket_category: str,
+    available_categories: list[str]
+) -> dict[str, Any]:
+    lower = normalize_simple_text(user_message)
+
+    if lower in ADVANCED_END_WORDS:
+        return {
+            "reply": "Alright, I'll close this ticket now.",
+            "close_ticket": True,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": "",
+            "rename_to": ""
+        }
+
+    if ai_text_has_any(lower, ADVANCED_PURCHASE_WORDS):
+        guessed = ai_guess_best_category_advanced(user_message, ticket_category, available_categories)
+        if guessed and guessed != ticket_category:
+            return {
+                "reply": f"You opened the wrong ticket type. Please open a {guessed} ticket instead.",
+                "close_ticket": True,
+                "needs_staff": False,
+                "staff_summary": "",
+                "suggested_category": guessed,
+                "rename_to": ""
+            }
+
+        return {
+            "reply": "I'll get you a staff member to help you with this.",
+            "close_ticket": False,
+            "needs_staff": True,
+            "staff_summary": "User needs help with a purchase/payment-related request.",
+            "suggested_category": "",
+            "rename_to": ai_build_short_topic_advanced(user_message)
+        }
+
+    if ai_text_has_any(lower, {"admin", "owner", "staff", "rank", "appeal", "account"}):
+        return {
+            "reply": "I'll get you a staff member to help you with this.",
+            "close_ticket": False,
+            "needs_staff": True,
+            "staff_summary": "User needs help from staff.",
+            "suggested_category": "",
+            "rename_to": ai_build_short_topic_advanced(user_message)
+        }
+
+    guessed = ai_guess_best_category_advanced(user_message, ticket_category, available_categories)
+    if guessed and guessed != ticket_category:
+        return {
+            "reply": f"You opened the wrong ticket type. Please open a {guessed} ticket instead.",
+            "close_ticket": True,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": guessed,
+            "rename_to": ""
+        }
+
+    return {
+        "reply": "Could you explain a little more so I can help?",
+        "close_ticket": False,
+        "needs_staff": False,
+        "staff_summary": "",
+        "suggested_category": "",
+        "rename_to": ""
+    }
+
+
+async def get_ai_response_advanced(
+    guild_id: int,
+    conversation: list[str],
+    user_message: str,
+    opener_name: str,
+    ticket_category: str,
+    available_categories: list[str]
+) -> dict[str, Any]:
+    custom_prompt = custom_prompts_cache.get(guild_id, "")
+    categories_text = ", ".join(available_categories)
+    recent_convo = "\n".join(conversation[-12:]) if conversation else "(no prior conversation)"
+
+    system_prompt = f"""You are a highly capable Discord ticket assistant helping users BEFORE staff claim the ticket.
+
+Current ticket category: {ticket_category}
+Available categories: {categories_text}
+User name: {opener_name}
+
+You must return ONLY valid JSON.
+
+JSON format:
+{{
+  "reply": "short helpful message",
+  "close_ticket": false,
+  "needs_staff": false,
+  "staff_summary": "",
+  "suggested_category": "",
+  "rename_to": ""
+}}
+
+Rules:
+1. Keep the reply short, natural, and useful.
+2. If the user opened the wrong category:
+   - say so briefly
+   - suggest the best category
+   - set close_ticket=true
+3. If the user is done, thanked you, or says they need nothing else:
+   - set close_ticket=true
+4. If the request involves buying, payment, premium, vip, turf, donation, billing, refund, rank issues, account issues, appeals, staff-only decisions, or anything unsafe to guess:
+   - set needs_staff=true
+   - add a short staff_summary
+   - add a short rename_to topic
+   - do not close the ticket
+5. If unsure, escalate to staff rather than guessing.
+6. rename_to should be very short and lowercase friendly.
+7. Never delete tickets. Only close_ticket may be true.
+8. If the current ticket category is clearly wrong, you may close it after suggesting the correct category.
+
+Custom instructions:
+{custom_prompt}
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Recent conversation:\n{recent_convo}\n\nNewest user message:\n{user_message}"
+        }
+    ]
+
+    response = await call_deepseek_api_fast(messages, max_tokens=240)
+    parsed = extract_json_object(response or "")
+
+    if not parsed:
+        return ai_fallback_response(user_message, ticket_category, available_categories)
+
+    reply = str(parsed.get("reply", "")).strip()[:350]
+    close_ticket = bool(parsed.get("close_ticket", False))
+    needs_staff = bool(parsed.get("needs_staff", False))
+    staff_summary = str(parsed.get("staff_summary", "")).strip()[:200]
+    suggested_category = str(parsed.get("suggested_category", "")).strip()[:100]
+    rename_to = str(parsed.get("rename_to", "")).strip()[:60]
+
+    lower = normalize_simple_text(user_message)
+
+    if lower in ADVANCED_END_WORDS:
+        close_ticket = True
+        needs_staff = False
+        suggested_category = ""
+        if not reply:
+            reply = "Alright, I'll close this ticket now."
+
+    if ai_text_has_any(lower, ADVANCED_PURCHASE_WORDS):
+        if not needs_staff:
+            guessed = ai_guess_best_category_advanced(user_message, ticket_category, available_categories)
+            current_lower = normalize_simple_text(ticket_category)
+
+            if guessed and guessed != ticket_category and not any(k in current_lower for k in ["buy", "purchase", "shop", "store", "payment", "billing", "donate", "premium", "vip"]):
+                suggested_category = guessed
+                close_ticket = True
+                needs_staff = False
+                staff_summary = ""
+                rename_to = ""
+                reply = f"You opened the wrong ticket type. Please open a {guessed} ticket instead."
+            else:
+                needs_staff = True
+                close_ticket = False
+                if not staff_summary:
+                    staff_summary = "User needs help with a purchase/payment-related request."
+                if not rename_to:
+                    rename_to = ai_build_short_topic_advanced(user_message)
+                if not reply:
+                    reply = "I'll get you a staff member to help you with this."
+
+    if ai_text_has_any(lower, {"admin", "owner", "rank", "appeal", "account"}) and not close_ticket:
+        needs_staff = True
+        if not staff_summary:
+            staff_summary = "User needs help from staff."
+        if not rename_to:
+            rename_to = ai_build_short_topic_advanced(user_message)
+        if not reply:
+            reply = "I'll get you a staff member to help you with this."
+
+    if not suggested_category:
+        guessed = ai_guess_best_category_advanced(user_message, ticket_category, available_categories)
+        if guessed and guessed != ticket_category and not needs_staff:
+            suggested_category = guessed
+            close_ticket = True
+            if not reply:
+                reply = f"You opened the wrong ticket type. Please open a {guessed} ticket instead."
+
+    if needs_staff and not reply:
+        reply = "I'll get you a staff member to help you with this."
+
+    if close_ticket and not reply:
+        reply = "Alright, I'll close this ticket now."
+
+    return {
+        "reply": reply,
+        "close_ticket": close_ticket,
+        "needs_staff": needs_staff,
+        "staff_summary": staff_summary,
+        "suggested_category": suggested_category,
+        "rename_to": rename_to
+    }
+
+
+async def handle_ai_assistant_message_advanced(message: discord.Message):
+    if not DEEPSEEK_API_KEY:
+        return
+
+    if message.author.bot:
+        return
+
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+
+    if not isinstance(message.author, discord.Member):
+        return
+
+    guild = message.guild
+    if not guild:
+        return
+
+    channel = message.channel
+
+    if channel.id in ai_processing:
+        return
+
+    ticket = await get_ticket_by_channel(channel.id)
+    if not ticket:
+        return
+
+    if ticket["status"] == "closed":
+        return
+
+    if ticket["claimed_by"] is not None:
+        return
+
+    ai_config = await get_ai_assistant_config(guild.id)
+    if not ai_config or not ai_config["enabled"]:
+        return
+
+    premium_row = await get_active_premium_guild_record(guild.id)
+    if not premium_row:
+        return
+
+    config = await get_guild_config(guild.id)
+    if not config:
+        return
+
+    ai_processing.add(channel.id)
+
+    try:
+        state = ai_conversations.setdefault(channel.id, {
+            "messages": [],
+            "staff_alerted": False,
+            "last_response": None,
+            "greeted": True,
+            "close_attempted": False
+        })
+
+        if state.get("staff_alerted"):
+            return
+
+        user_text = message.content.strip()
+        lower = normalize_simple_text(user_text)
+        state["messages"].append(f"User: {user_text}")
+
+        ticket_options = await get_ticket_options(guild.id)
+        available_categories = [opt["label"] for opt in ticket_options]
+
+        ai_data = await get_ai_response_advanced(
+            guild.id,
+            state["messages"],
+            user_text,
+            message.author.display_name,
+            ticket["option_label"],
+            available_categories
+        )
+
+        reply = ai_data["reply"]
+        close_ticket = ai_data["close_ticket"]
+        needs_staff = ai_data["needs_staff"]
+        staff_summary = ai_data["staff_summary"]
+        suggested_category = ai_data["suggested_category"]
+        rename_to = ai_data["rename_to"]
+
+        if reply:
+            with suppress(Exception):
+                await channel.send(reply)
+            state["messages"].append(f"Bot: {reply}")
+            state["last_response"] = reply
+
+        if needs_staff and not state.get("staff_alerted"):
+            summary = staff_summary or "User needs help from staff."
+            topic = rename_to or ai_build_short_topic_advanced(user_text)
+
+            await maybe_rename_ticket_from_ai(channel, topic)
+
+            opener_member = await try_fetch_member(guild, ticket["opener_id"])
+            if opener_member and ai_config.get("alert_channel_id"):
+                await send_staff_alert(
+                    guild=guild,
+                    ticket_channel=channel,
+                    opener=opener_member,
+                    summary=summary,
+                    support_role_id=config["support_role_id"],
+                    alert_channel_id=ai_config["alert_channel_id"]
+                )
+                state["staff_alerted"] = True
+
+            await send_log(
+                guild,
+                "AI Requested Staff",
+                f"Channel: {channel.mention}\nSummary: {summary}"
+            )
+            return
+
+        if suggested_category and suggested_category != ticket["option_label"] and close_ticket:
+            await auto_close_ticket_by_ai(
+                channel,
+                guild,
+                f"Wrong category. Suggested category: {suggested_category}"
+            )
+            cleanup_ticket_channel_lock(channel.id)
+            return
+
+        if close_ticket and not state.get("close_attempted"):
+            state["close_attempted"] = True
+            await auto_close_ticket_by_ai(channel, guild, "Conversation completed.")
+            cleanup_ticket_channel_lock(channel.id)
+
+    except Exception as e:
+        log.exception("Advanced AI assistant failed in channel %s: %s", channel.id, e)
+    finally:
+        ai_processing.discard(channel.id)
+
+
+# =========================================================
+# PATCH on_message TO USE ADVANCED VERSION
+# Lägg denna efter DEL 4, ovanför MAIN
+# =========================================================
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    await handle_ai_assistant_message_advanced(message)
 # =========================================================
 # MAIN
 # =========================================================
@@ -4883,3 +5368,4 @@ if __name__ == "__main__":
     finally:
         with suppress(Exception):
             asyncio.run(close_resources())
+            
