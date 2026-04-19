@@ -4083,120 +4083,6 @@ async def enableticketassistant(interaction: discord.Interaction, alert_channel:
     )
 
 
-
-
-@bot.tree.command(name="enableaiassistant", description="Enable AI ticket assistant (Premium only)")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-async def enableaiassistant(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return
-
-    config = await get_guild_config(interaction.guild.id)
-    if not config:
-        await interaction.response.send_message(
-            embed=await base_embed(
-                interaction.guild.id,
-                "Setup Required",
-                'You must set up the ticket panel using the `/setup` command before you can proceed with this.',
-                error=True
-            ),
-            ephemeral=True
-        )
-        return
-
-    premium_row = await get_active_premium_guild_record(interaction.guild.id)
-    if not premium_row:
-        await interaction.response.send_message(
-            embed=await base_embed(
-                interaction.guild.id,
-                "Premium Required",
-                "The AI ticket assistant is only available in premium servers.",
-                error=True
-            ),
-            ephemeral=True
-        )
-        return
-
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id, "Access Denied", "Only administrators can use this command.", error=True),
-            ephemeral=True
-        )
-        return
-
-    if not DEEPSEEK_API_KEY:
-        await interaction.response.send_message(
-            embed=await base_embed(
-                interaction.guild.id,
-                "AI Not Configured",
-                "The AI assistant is not configured. Please set the DEEPSEEK_API_KEY environment variable.",
-                error=True
-            ),
-            ephemeral=True
-        )
-        return
-
-    await safe_defer(interaction, ephemeral=True, thinking=True)
-
-    guild = interaction.guild
-    support_role = guild.get_role(config["support_role_id"])
-    admin_roles = [r for r in guild.roles if r.permissions.administrator]
-
-    overwrites_alert = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-    if support_role:
-        overwrites_alert[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-    for role in admin_roles:
-        overwrites_alert[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-    if guild.me:
-        overwrites_alert[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
-
-    overwrites_prompt = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-    if guild.owner:
-        overwrites_prompt[guild.owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-    if guild.me:
-        overwrites_prompt[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
-
-    ai_category_name = "Ticket AI"
-    category = discord.utils.get(guild.categories, name=ai_category_name)
-    if category is None:
-        category = await guild.create_category(ai_category_name, reason="AI assistant setup")
-
-    alert_channel = discord.utils.get(guild.text_channels, name="ai-alerts", category=category)
-    if alert_channel is None:
-        alert_channel = await guild.create_text_channel("ai-alerts", category=category, overwrites=overwrites_alert, reason="AI assistant setup")
-    else:
-        await alert_channel.edit(overwrites=overwrites_alert)
-
-    prompt_channel = discord.utils.get(guild.text_channels, name="ai-prompts", category=category)
-    if prompt_channel is None:
-        prompt_channel = await guild.create_text_channel("ai-prompts", category=category, overwrites=overwrites_prompt, reason="AI assistant setup")
-        with suppress(Exception):
-            await prompt_channel.send("Send one message in this channel describing how the AI assistant should behave.")
-    else:
-        await prompt_channel.edit(overwrites=overwrites_prompt)
-
-    await set_ai_assistant_config(interaction.guild.id, True, alert_channel.id, prompt_channel.id)
-    custom_prompt = await fetch_prompt_from_channel(prompt_channel.id)
-    if custom_prompt:
-        await update_custom_prompt(interaction.guild.id, custom_prompt)
-
-    await interaction.followup.send(
-        embed=await base_embed(
-            interaction.guild.id,
-            "AI Assistant Enabled",
-            f"Ticket Assistant has been activated.\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
-        ),
-        ephemeral=False
-    )
-
-    await send_log(
-        interaction.guild,
-        "AI Assistant Enabled",
-        f"Enabled by: {interaction.user.mention}\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
-    )
-
-
 @bot.tree.command(name="disableticketassistant", description="Disable AI ticket assistant")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -4765,26 +4651,6 @@ async def renameticket_error(interaction: discord.Interaction, error: app_comman
 
 @enableticketassistant.error
 async def enableticketassistant_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    embed = await base_embed(
-        interaction.guild.id if interaction.guild else None,
-        "Enable Assistant Failed",
-        f"{error}",
-        error=True
-    )
-
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-    except Exception:
-        pass
-
-
-
-
-@enableaiassistant.error
-async def enableaiassistant_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     embed = await base_embed(
         interaction.guild.id if interaction.guild else None,
         "Enable Assistant Failed",
@@ -5495,6 +5361,505 @@ async def on_message(message: discord.Message):
         return
 
     await handle_ai_assistant_message_advanced(message)
+
+
+# =========================================================
+# NEXT LEVEL AI + AUTO DB MIGRATION PATCH
+# =========================================================
+
+_old_init_db = init_db
+
+async def init_db():
+    await _old_init_db()
+    assert db_pool is not None
+
+    async with db_pool.acquire() as conn:
+        # Automatic schema upgrades for existing databases
+        await conn.execute("""
+            ALTER TABLE ai_assistant_config
+            ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT FALSE
+        """)
+        await conn.execute("""
+            ALTER TABLE ai_assistant_config
+            ADD COLUMN IF NOT EXISTS alert_channel_id BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE ai_assistant_config
+            ADD COLUMN IF NOT EXISTS prompt_channel_id BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE ai_assistant_config
+            ADD COLUMN IF NOT EXISTS custom_prompt TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE ai_assistant_config
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        """)
+        await conn.execute("""
+            ALTER TABLE ai_assistant_config
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_ticket_memory (
+                channel_id BIGINT PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                memory_summary TEXT,
+                last_topic TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ai_ticket_memory_guild
+            ON ai_ticket_memory(guild_id)
+        """)
+
+
+ADVANCED_ROUTING_KEYWORDS = {
+    "purchase": {"buy", "purchase", "checkout", "invoice", "billing", "refund", "pay", "payment", "price", "cost", "vip", "premium", "turf", "store", "shop", "donate", "donation"},
+    "technical": {"bug", "error", "issue", "glitch", "problem", "broken", "not working", "crash", "failed"},
+    "moderation": {"ban", "appeal", "unban", "punishment", "mute", "warn"},
+    "account": {"account", "rank", "access", "permission", "role", "roles", "admin", "owner", "staff"},
+    "finished": {"thanks", "thank you", "thx", "ty", "okay", "ok", "resolved", "done", "all good", "nothing else", "never mind", "nvm"},
+}
+
+
+async def get_ticket_memory(channel_id: int) -> Optional[dict[str, Any]]:
+    return await db_fetchrow("""
+        SELECT channel_id, guild_id, memory_summary, last_topic, updated_at
+        FROM ai_ticket_memory
+        WHERE channel_id = $1
+    """, channel_id)
+
+
+async def upsert_ticket_memory(channel_id: int, guild_id: int, memory_summary: str, last_topic: Optional[str] = None):
+    await db_execute("""
+        INSERT INTO ai_ticket_memory (channel_id, guild_id, memory_summary, last_topic, updated_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (channel_id)
+        DO UPDATE SET
+            memory_summary = EXCLUDED.memory_summary,
+            last_topic = COALESCE(EXCLUDED.last_topic, ai_ticket_memory.last_topic),
+            updated_at = NOW()
+    """, channel_id, guild_id, memory_summary, last_topic)
+
+
+async def delete_ticket_memory(channel_id: int):
+    with suppress(Exception):
+        await db_execute("DELETE FROM ai_ticket_memory WHERE channel_id = $1", channel_id)
+
+
+def detect_intent_bucket(text: str) -> str:
+    lowered = normalize_simple_text(text)
+    scores = {}
+    for bucket, words in ADVANCED_ROUTING_KEYWORDS.items():
+        scores[bucket] = sum(1 for w in words if w in lowered)
+    best_bucket = max(scores.items(), key=lambda x: x[1])[0]
+    return best_bucket if scores[best_bucket] > 0 else "general"
+
+
+def build_smart_topic_from_text(text: str) -> str:
+    lowered = normalize_simple_text(text)
+    amount_match = re.search(r"(\d+[kKmM]?)", lowered)
+
+    if detect_intent_bucket(lowered) == "purchase":
+        if "donat" in lowered:
+            return f"donate-{amount_match.group(1).lower()}" if amount_match else "donation"
+        if "refund" in lowered:
+            return "refund"
+        if "vip" in lowered:
+            return "vip-purchase"
+        if "premium" in lowered:
+            return "premium-purchase"
+        if "turf" in lowered:
+            return "turf-purchase"
+        return "purchase"
+
+    if detect_intent_bucket(lowered) == "technical":
+        if "login" in lowered:
+            return "login-bug"
+        return "bug-report"
+
+    if detect_intent_bucket(lowered) == "moderation":
+        return "ban-appeal"
+
+    if detect_intent_bucket(lowered) == "account":
+        if "rank" in lowered:
+            return "rank-help"
+        if "role" in lowered:
+            return "role-help"
+        return "account-help"
+
+    words = re.findall(r"[a-z0-9]+", lowered)
+    return clean_channel_name("-".join(words[:3])) or "ticket"
+
+
+async def summarize_for_memory(conversation: list[str], latest_user_message: str) -> str:
+    compact = "\n".join(conversation[-14:])
+    return f"Latest topic: {latest_user_message[:180]}\nContext:\n{compact[:1500]}"
+
+
+def fallback_ai_decision(
+    user_message: str,
+    ticket_category: str,
+    available_categories: list[str],
+    previous_memory: str = ""
+) -> dict[str, Any]:
+    lowered = normalize_simple_text(user_message)
+    bucket = detect_intent_bucket(lowered)
+    topic = build_smart_topic_from_text(lowered)
+
+    if bucket == "finished":
+        return {
+            "reply": "Perfect — I'll close this ticket now.",
+            "close_ticket": True,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": "",
+            "rename_to": ""
+        }
+
+    if bucket in {"purchase", "technical", "moderation", "account"}:
+        best_cat = ai_guess_best_category_advanced(user_message, ticket_category, available_categories)
+        current_lower = normalize_simple_text(ticket_category)
+
+        # Wrong-category correction before escalation
+        if best_cat and best_cat != ticket_category:
+            best_lower = normalize_simple_text(best_cat)
+            wrong_category = (
+                (bucket == "purchase" and not any(k in current_lower for k in ["buy", "purchase", "store", "shop", "payment", "billing", "donate", "premium", "vip"])) or
+                (bucket == "technical" and not any(k in current_lower for k in ["bug", "report", "support", "issue"])) or
+                (bucket == "moderation" and not any(k in current_lower for k in ["appeal", "ban", "support"])) or
+                (bucket == "account" and not any(k in current_lower for k in ["account", "rank", "support", "help"]))
+            )
+            if wrong_category:
+                return {
+                    "reply": f"You opened the wrong ticket type. Please open a {best_cat} ticket instead.",
+                    "close_ticket": True,
+                    "needs_staff": False,
+                    "staff_summary": "",
+                    "suggested_category": best_cat,
+                    "rename_to": ""
+                }
+
+        summaries = {
+            "purchase": "User needs help with a purchase, payment, premium, refund or donation request.",
+            "technical": "User is reporting a bug, issue or technical problem.",
+            "moderation": "User needs moderation help or is appealing a punishment.",
+            "account": "User needs staff help with rank, role, permissions or account access."
+        }
+        replies = {
+            "purchase": "I'll get a staff member to help you with this purchase request.",
+            "technical": "I'll get a staff member to help you with this issue.",
+            "moderation": "I'll get a staff member to review this for you.",
+            "account": "I'll get a staff member to help you with this."
+        }
+        return {
+            "reply": replies[bucket],
+            "close_ticket": False,
+            "needs_staff": True,
+            "staff_summary": summaries[bucket],
+            "suggested_category": "",
+            "rename_to": topic
+        }
+
+    best_cat = ai_guess_best_category_advanced(user_message, ticket_category, available_categories)
+    if best_cat and best_cat != ticket_category:
+        return {
+            "reply": f"You opened the wrong ticket type. Please open a {best_cat} ticket instead.",
+            "close_ticket": True,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": best_cat,
+            "rename_to": ""
+        }
+
+    return {
+        "reply": "Thanks — could you explain a little more so I can help properly?",
+        "close_ticket": False,
+        "needs_staff": False,
+        "staff_summary": "",
+        "suggested_category": "",
+        "rename_to": topic if topic != "ticket" else ""
+    }
+
+
+async def get_ai_response_advanced(
+    guild_id: int,
+    conversation: list[str],
+    user_message: str,
+    opener_name: str,
+    ticket_category: str,
+    available_categories: list[str],
+    previous_memory: str = ""
+) -> dict[str, Any]:
+    custom_prompt = custom_prompts_cache.get(guild_id, "")
+    categories_text = ", ".join(available_categories)
+    recent_convo = "\n".join(conversation[-18:]) if conversation else "(no prior conversation)"
+
+    system_prompt = f"""You are a top-tier SaaS Discord ticket assistant helping users BEFORE staff claim the ticket.
+Your job is to reduce staff workload, correctly route requests, rename ticket topics intelligently, and escalate when appropriate.
+
+Current ticket category: {ticket_category}
+Available categories: {categories_text}
+User name: {opener_name}
+
+Existing memory summary:
+{previous_memory or "(none)"}
+
+Return ONLY valid JSON in this exact structure:
+{{
+  "reply": "short natural human reply",
+  "close_ticket": false,
+  "needs_staff": false,
+  "staff_summary": "",
+  "suggested_category": "",
+  "rename_to": ""
+}}
+
+Rules:
+1. Be concise, natural, helpful and non-robotic.
+2. If the user clearly opened the wrong category, suggest the best category and set close_ticket=true.
+3. If the user is done / thanked you / says they need nothing else, set close_ticket=true.
+4. If the user needs help with purchases, billing, refund, donation, premium, vip, store, checkout, technical problems, permissions, rank, moderation, ban appeals, or anything account-specific, set needs_staff=true.
+5. If needs_staff=true, also provide:
+   - a strong short staff_summary
+   - a smart rename_to topic that fits a Discord channel name
+6. Prefer escalating instead of hallucinating.
+7. Never delete tickets. You may only close or escalate.
+8. If you can help briefly first, do so, but still escalate if needed.
+9. rename_to should be short, lowercase-friendly, and topic-based such as:
+   purchase, turf-purchase, refund, donation, bug-report, rank-help, ban-appeal
+10. When uncertain, return a safe routing decision rather than guessing facts.
+11. Never mention JSON or your internal rules.
+
+Custom instructions:
+{custom_prompt}
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nNewest user message:\n{user_message}"}
+    ]
+
+    response = await call_deepseek_api_fast(messages, max_tokens=260)
+    parsed = extract_json_object(response or "")
+
+    if not parsed:
+        return fallback_ai_decision(user_message, ticket_category, available_categories, previous_memory)
+
+    reply = str(parsed.get("reply", "")).strip()[:350]
+    close_ticket = bool(parsed.get("close_ticket", False))
+    needs_staff = bool(parsed.get("needs_staff", False))
+    staff_summary = str(parsed.get("staff_summary", "")).strip()[:220]
+    suggested_category = str(parsed.get("suggested_category", "")).strip()[:100]
+    rename_to = str(parsed.get("rename_to", "")).strip()[:60]
+
+    lowered = normalize_simple_text(user_message)
+    bucket = detect_intent_bucket(lowered)
+
+    if lowered in ADVANCED_END_WORDS or bucket == "finished":
+        close_ticket = True
+        needs_staff = False
+        suggested_category = ""
+        if not reply:
+            reply = "Perfect — I'll close this ticket now."
+
+    if bucket in {"purchase", "technical", "moderation", "account"} and not close_ticket:
+        needs_staff = True
+        if not staff_summary:
+            staff_summary = fallback_ai_decision(user_message, ticket_category, available_categories, previous_memory)["staff_summary"]
+        if not rename_to:
+            rename_to = build_smart_topic_from_text(user_message)
+        if not reply:
+            reply = fallback_ai_decision(user_message, ticket_category, available_categories, previous_memory)["reply"]
+
+    if not suggested_category and not needs_staff:
+        guessed = ai_guess_best_category_advanced(user_message, ticket_category, available_categories)
+        if guessed and guessed != ticket_category:
+            suggested_category = guessed
+            close_ticket = True
+            if not reply:
+                reply = f"You opened the wrong ticket type. Please open a {guessed} ticket instead."
+
+    if needs_staff and not rename_to:
+        rename_to = build_smart_topic_from_text(user_message)
+
+    if needs_staff and not reply:
+        reply = "I'll get a staff member to help you with this."
+
+    if close_ticket and not reply:
+        reply = "Alright — I'll close this ticket now."
+
+    return {
+        "reply": reply,
+        "close_ticket": close_ticket,
+        "needs_staff": needs_staff,
+        "staff_summary": staff_summary,
+        "suggested_category": suggested_category,
+        "rename_to": rename_to
+    }
+
+
+async def handle_ai_assistant_message_advanced(message: discord.Message):
+    if not DEEPSEEK_API_KEY:
+        return
+
+    if message.author.bot:
+        return
+
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+
+    if not isinstance(message.author, discord.Member):
+        return
+
+    guild = message.guild
+    if not guild:
+        return
+
+    channel = message.channel
+
+    if channel.id in ai_processing:
+        return
+
+    ticket = await get_ticket_by_channel(channel.id)
+    if not ticket:
+        return
+
+    if ticket["status"] == "closed":
+        return
+
+    if ticket["claimed_by"] is not None:
+        return
+
+    ai_config = await get_ai_assistant_config(guild.id)
+    if not ai_config or not ai_config["enabled"]:
+        return
+
+    premium_row = await get_active_premium_guild_record(guild.id)
+    if not premium_row:
+        return
+
+    config = await get_guild_config(guild.id)
+    if not config:
+        return
+
+    ai_processing.add(channel.id)
+
+    try:
+        memory_row = await get_ticket_memory(channel.id)
+        previous_memory = memory_row["memory_summary"] if memory_row else ""
+
+        state = ai_conversations.setdefault(channel.id, {
+            "messages": [],
+            "staff_alerted": False,
+            "last_response": None,
+            "greeted": True,
+            "close_attempted": False
+        })
+
+        if state.get("staff_alerted"):
+            return
+
+        user_text = message.content.strip()
+        state["messages"].append(f"User: {user_text}")
+
+        ticket_options = await get_ticket_options(guild.id)
+        available_categories = [opt["label"] for opt in ticket_options]
+
+        ai_data = await get_ai_response_advanced(
+            guild.id,
+            state["messages"],
+            user_text,
+            message.author.display_name,
+            ticket["option_label"],
+            available_categories,
+            previous_memory
+        )
+
+        reply = ai_data["reply"]
+        close_ticket = ai_data["close_ticket"]
+        needs_staff = ai_data["needs_staff"]
+        staff_summary = ai_data["staff_summary"]
+        suggested_category = ai_data["suggested_category"]
+        rename_to = ai_data["rename_to"]
+
+        if reply:
+            with suppress(Exception):
+                async with channel.typing():
+                    await asyncio.sleep(0.35)
+                await channel.send(reply)
+            state["messages"].append(f"Bot: {reply}")
+            state["last_response"] = reply
+
+        memory_summary = await summarize_for_memory(state["messages"], user_text)
+        await upsert_ticket_memory(channel.id, guild.id, memory_summary, rename_to or None)
+
+        if rename_to:
+            await maybe_rename_ticket_from_ai(channel, rename_to)
+
+        if needs_staff and not state.get("staff_alerted"):
+            summary = staff_summary or "User needs help from staff."
+            topic = rename_to or build_smart_topic_from_text(user_text)
+
+            await maybe_rename_ticket_from_ai(channel, topic)
+
+            opener_member = await try_fetch_member(guild, ticket["opener_id"])
+            if opener_member and ai_config.get("alert_channel_id"):
+                await send_staff_alert(
+                    guild=guild,
+                    ticket_channel=channel,
+                    opener=opener_member,
+                    summary=summary,
+                    support_role_id=config["support_role_id"],
+                    alert_channel_id=ai_config["alert_channel_id"]
+                )
+                state["staff_alerted"] = True
+
+            await send_log(
+                guild,
+                "AI Requested Staff",
+                f"Channel: {channel.mention}\nSummary: {summary}\nTopic: {topic}"
+            )
+            return
+
+        if suggested_category and suggested_category != ticket["option_label"] and close_ticket:
+            await auto_close_ticket_by_ai(
+                channel,
+                guild,
+                f"Wrong category. Suggested category: {suggested_category}"
+            )
+            await delete_ticket_memory(channel.id)
+            cleanup_ticket_channel_lock(channel.id)
+            return
+
+        if close_ticket and not state.get("close_attempted"):
+            state["close_attempted"] = True
+            await auto_close_ticket_by_ai(channel, guild, "Conversation completed.")
+            await delete_ticket_memory(channel.id)
+            cleanup_ticket_channel_lock(channel.id)
+
+    except Exception as e:
+        log.exception("Next-level AI assistant failed in channel %s: %s", channel.id, e)
+    finally:
+        ai_processing.discard(channel.id)
+
+
+_old_auto_close_ticket_by_ai = auto_close_ticket_by_ai
+
+async def auto_close_ticket_by_ai(channel: discord.TextChannel, guild: discord.Guild, reason_text: str):
+    await _old_auto_close_ticket_by_ai(channel, guild, reason_text)
+    await delete_ticket_memory(channel.id)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    await handle_ai_assistant_message_advanced(message)
+
+
 # =========================================================
 # MAIN
 # =========================================================
