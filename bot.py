@@ -960,16 +960,16 @@ def hex_to_color(value: str) -> discord.Color:
 
 def clean_channel_name(text: str) -> str:
     text = text.lower()
-    text = re.sub(r"[^a-z0-9\- ]", "", text)
-    text = re.sub(r"\s+", "-", text).strip("-")
+    text = re.sub(r"[^a-z0-9\\- ]", "", text)
+    text = re.sub(r"\\s+", "-", text).strip("-")
     text = re.sub(r"-{2,}", "-", text)
     return text[:80] if text else "ticket"
 
 
 def clean_short_ticket_topic(text: str) -> str:
     text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9\s-]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"[^a-z0-9\\s-]", "", text)
+    text = re.sub(r"\\s+", " ", text).strip()
     return text[:40] if text else "ticket"
 
 
@@ -1009,7 +1009,7 @@ def parse_duration_to_expiry(duration_text: str) -> tuple[Optional[datetime], st
     if clean in {"perm", "permanent", "forever"}:
         return None, "perm"
 
-    match = re.fullmatch(r"(\d+)\s*(min|m|h|d)", clean)
+    match = re.fullmatch(r"(\\d+)\\s*(min|m|h|d)", clean)
     if not match:
         raise ValueError("Invalid duration format. Use 1min, 5m, 1h, 1d or perm.")
 
@@ -1103,7 +1103,7 @@ def extract_json_object(text: str) -> Optional[dict]:
         if isinstance(parsed, dict):
             return parsed
 
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    match = re.search(r"\\{.*\\}", text, re.DOTALL)
     if match:
         with suppress(Exception):
             parsed = json.loads(match.group(0))
@@ -2597,9 +2597,7 @@ class TicketPanelView(discord.ui.View):
         if rows:
             self.add_item(TicketDropdown(guild_id, rows))
         return self
-
-
-# =========================================================
+        # =========================================================
 # DM HELPERS
 # =========================================================
 async def dm_ticket_closed(
@@ -3551,9 +3549,7 @@ class DeletingTicketControlsView(discord.ui.View):
         self.add_item(ClaimTicketButton(disabled=True, closed_variant=True))
         self.add_item(CloseTicketButton(disabled=True, closed_variant=True))
         self.add_item(DeleteTicketButton(disabled=True, closed_variant=True))
-
-
-# =========================================================
+        # =========================================================
 # BACKGROUND TASKS
 # =========================================================
 async def ticket_ban_expiry_loop():
@@ -3606,154 +3602,6 @@ async def premium_expiry_loop_task():
 
         await asyncio.sleep(30)
 
-
-
-
-async def ensure_ai_channels(
-    guild: discord.Guild,
-    support_role_id: int
-) -> tuple[Optional[discord.TextChannel], Optional[discord.TextChannel], Optional[str]]:
-    support_role = guild.get_role(support_role_id)
-    if support_role is None:
-        return None, None, "The configured support role is invalid."
-
-    me = guild.me
-    if me is None:
-        return None, None, "Bot member could not be resolved in this server."
-
-    owner_member = guild.owner
-    if owner_member is None:
-        with suppress(Exception):
-            owner_member = await guild.fetch_member(guild.owner_id)
-
-    existing_alert = discord.utils.get(guild.text_channels, name="ai-alerts")
-    existing_prompt = discord.utils.get(guild.text_channels, name="ai-prompts")
-
-    alert_channel = existing_alert if isinstance(existing_alert, discord.TextChannel) else None
-    prompt_channel = existing_prompt if isinstance(existing_prompt, discord.TextChannel) else None
-
-    if alert_channel is None:
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            support_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
-        }
-        if owner_member is not None:
-            overwrites[owner_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-        try:
-            alert_channel = await guild.create_text_channel(
-                name="ai-alerts",
-                overwrites=overwrites,
-                reason="Auto-created AI assistant alert channel"
-            )
-        except discord.Forbidden:
-            return None, None, "I do not have permission to create the AI alert channel."
-        except discord.HTTPException as e:
-            return None, None, f"Failed to create AI alert channel: {e}"
-
-    if prompt_channel is None:
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            support_role: discord.PermissionOverwrite(view_channel=False),
-            me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
-        }
-        if owner_member is not None:
-            overwrites[owner_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-        try:
-            prompt_channel = await guild.create_text_channel(
-                name="ai-prompts",
-                overwrites=overwrites,
-                reason="Auto-created AI assistant prompt channel"
-            )
-        except discord.Forbidden:
-            return None, None, "I do not have permission to create the AI prompt channel."
-        except discord.HTTPException as e:
-            return None, None, f"Failed to create AI prompt channel: {e}"
-
-    return alert_channel, prompt_channel, None
-
-
-async def enable_ai_assistant_common(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return
-
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            embed=await base_embed(interaction.guild.id, "Access Denied", "Only administrators can use this command.", error=True),
-            ephemeral=True
-        )
-        return
-
-    config = await get_guild_config(interaction.guild.id)
-    if not config:
-        await interaction.response.send_message(
-            embed=await base_embed(
-                interaction.guild.id,
-                "Setup Required",
-                "You must set up the ticket panel using the `/setup` command before you can proceed with this.",
-                error=True
-            ),
-            ephemeral=True
-        )
-        return
-
-    premium_row = await get_active_premium_guild_record(interaction.guild.id)
-    if not premium_row:
-        await interaction.response.send_message(
-            embed=await base_embed(
-                interaction.guild.id,
-                "Premium Required",
-                "The AI ticket assistant is only available in premium servers.",
-                error=True
-            ),
-            ephemeral=True
-        )
-        return
-
-    if not DEEPSEEK_API_KEY:
-        await interaction.response.send_message(
-            embed=await base_embed(
-                interaction.guild.id,
-                "AI Not Configured",
-                "The AI assistant is not configured. Please set the DEEPSEEK_API_KEY environment variable.",
-                error=True
-            ),
-            ephemeral=True
-        )
-        return
-
-    await safe_defer(interaction, ephemeral=False, thinking=True)
-
-    alert_channel, prompt_channel, channel_error = await ensure_ai_channels(interaction.guild, config["support_role_id"])
-    if channel_error or alert_channel is None or prompt_channel is None:
-        await interaction.followup.send(
-            embed=await base_embed(interaction.guild.id, "Enable Assistant Failed", channel_error or "Failed to create AI channels.", error=True),
-            ephemeral=True
-        )
-        return
-
-    await set_ai_assistant_config(interaction.guild.id, True, alert_channel.id, prompt_channel.id)
-
-    custom_prompt = await fetch_prompt_from_channel(prompt_channel.id)
-    if custom_prompt:
-        await update_custom_prompt(interaction.guild.id, custom_prompt)
-
-    await interaction.followup.send(
-        embed=await base_embed(
-            interaction.guild.id,
-            "AI Assistant Enabled",
-            f"Ticket Assistant has been activated.\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
-        ),
-        ephemeral=False
-    )
-
-    await send_log(
-        interaction.guild,
-        "AI Assistant Enabled",
-        f"Enabled by: {interaction.user.mention}\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
-    )
 
 # =========================================================
 # COMMANDS
@@ -4220,6 +4068,120 @@ async def enableticketassistant(interaction: discord.Interaction, alert_channel:
         await update_custom_prompt(interaction.guild.id, custom_prompt)
 
     await interaction.response.send_message(
+        embed=await base_embed(
+            interaction.guild.id,
+            "AI Assistant Enabled",
+            f"Ticket Assistant has been activated.\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
+        ),
+        ephemeral=False
+    )
+
+    await send_log(
+        interaction.guild,
+        "AI Assistant Enabled",
+        f"Enabled by: {interaction.user.mention}\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
+    )
+
+
+
+
+@bot.tree.command(name="enableaiassistant", description="Enable AI ticket assistant (Premium only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def enableaiassistant(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    config = await get_guild_config(interaction.guild.id)
+    if not config:
+        await interaction.response.send_message(
+            embed=await base_embed(
+                interaction.guild.id,
+                "Setup Required",
+                'You must set up the ticket panel using the `/setup` command before you can proceed with this.',
+                error=True
+            ),
+            ephemeral=True
+        )
+        return
+
+    premium_row = await get_active_premium_guild_record(interaction.guild.id)
+    if not premium_row:
+        await interaction.response.send_message(
+            embed=await base_embed(
+                interaction.guild.id,
+                "Premium Required",
+                "The AI ticket assistant is only available in premium servers.",
+                error=True
+            ),
+            ephemeral=True
+        )
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            embed=await base_embed(interaction.guild.id, "Access Denied", "Only administrators can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    if not DEEPSEEK_API_KEY:
+        await interaction.response.send_message(
+            embed=await base_embed(
+                interaction.guild.id,
+                "AI Not Configured",
+                "The AI assistant is not configured. Please set the DEEPSEEK_API_KEY environment variable.",
+                error=True
+            ),
+            ephemeral=True
+        )
+        return
+
+    await safe_defer(interaction, ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+    support_role = guild.get_role(config["support_role_id"])
+    admin_roles = [r for r in guild.roles if r.permissions.administrator]
+
+    overwrites_alert = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+    if support_role:
+        overwrites_alert[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    for role in admin_roles:
+        overwrites_alert[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    if guild.me:
+        overwrites_alert[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
+
+    overwrites_prompt = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+    if guild.owner:
+        overwrites_prompt[guild.owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    if guild.me:
+        overwrites_prompt[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
+
+    ai_category_name = "Ticket AI"
+    category = discord.utils.get(guild.categories, name=ai_category_name)
+    if category is None:
+        category = await guild.create_category(ai_category_name, reason="AI assistant setup")
+
+    alert_channel = discord.utils.get(guild.text_channels, name="ai-alerts", category=category)
+    if alert_channel is None:
+        alert_channel = await guild.create_text_channel("ai-alerts", category=category, overwrites=overwrites_alert, reason="AI assistant setup")
+    else:
+        await alert_channel.edit(overwrites=overwrites_alert)
+
+    prompt_channel = discord.utils.get(guild.text_channels, name="ai-prompts", category=category)
+    if prompt_channel is None:
+        prompt_channel = await guild.create_text_channel("ai-prompts", category=category, overwrites=overwrites_prompt, reason="AI assistant setup")
+        with suppress(Exception):
+            await prompt_channel.send("Send one message in this channel describing how the AI assistant should behave.")
+    else:
+        await prompt_channel.edit(overwrites=overwrites_prompt)
+
+    await set_ai_assistant_config(interaction.guild.id, True, alert_channel.id, prompt_channel.id)
+    custom_prompt = await fetch_prompt_from_channel(prompt_channel.id)
+    if custom_prompt:
+        await update_custom_prompt(interaction.guild.id, custom_prompt)
+
+    await interaction.followup.send(
         embed=await base_embed(
             interaction.guild.id,
             "AI Assistant Enabled",
@@ -4819,6 +4781,8 @@ async def enableticketassistant_error(interaction: discord.Interaction, error: a
         pass
 
 
+
+
 @enableaiassistant.error
 async def enableaiassistant_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     embed = await base_embed(
@@ -5044,14 +5008,12 @@ async def on_message(message: discord.Message):
     await handle_ai_assistant_message(message)
 
 
-async def setup_hook_impl():
+@bot.event
+async def setup_hook():
     for cmd_name in OWNER_COMMAND_NAMES:
         cmd = bot.tree.get_command(cmd_name)
         if cmd is not None:
             cmd.default_permissions = discord.Permissions.none()
-
-
-bot.setup_hook = setup_hook_impl
 
 
 # =========================================================
