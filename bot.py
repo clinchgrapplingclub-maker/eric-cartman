@@ -960,18 +960,16 @@ def hex_to_color(value: str) -> discord.Color:
 
 def clean_channel_name(text: str) -> str:
     text = text.lower()
-    text = re.sub(r"[^a-z0-9\\- ]", "", text)
-    text = re.sub(r"\\s+", "-", text).strip("-")
+    text = re.sub(r"[^a-z0-9\- ]", "", text)
+    text = re.sub(r"\s+", "-", text).strip("-")
     text = re.sub(r"-{2,}", "-", text)
     return text[:80] if text else "ticket"
 
-
 def clean_short_ticket_topic(text: str) -> str:
     text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9\\s-]", "", text)
-    text = re.sub(r"\\s+", " ", text).strip()
+    text = re.sub(r"[^a-z0-9\s-]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text[:40] if text else "ticket"
-
 
 def safe_attachment_name(filename: str, fallback: str) -> str:
     if not filename:
@@ -1009,7 +1007,7 @@ def parse_duration_to_expiry(duration_text: str) -> tuple[Optional[datetime], st
     if clean in {"perm", "permanent", "forever"}:
         return None, "perm"
 
-    match = re.fullmatch(r"(\\d+)\\s*(min|m|h|d)", clean)
+    match = re.fullmatch(r"(\d+)\s*(min|m|h|d)", clean)
     if not match:
         raise ValueError("Invalid duration format. Use 1min, 5m, 1h, 1d or perm.")
 
@@ -1025,7 +1023,6 @@ def parse_duration_to_expiry(duration_text: str) -> tuple[Optional[datetime], st
         return now + timedelta(days=value), f"{value}d"
 
     raise ValueError("Invalid duration format.")
-
 
 def premium_expiry_for_code(duration_code: str) -> Optional[datetime]:
     now = datetime.now(timezone.utc)
@@ -1103,7 +1100,7 @@ def extract_json_object(text: str) -> Optional[dict]:
         if isinstance(parsed, dict):
             return parsed
 
-    match = re.search(r"\\{.*\\}", text, re.DOTALL)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         with suppress(Exception):
             parsed = json.loads(match.group(0))
@@ -1111,7 +1108,6 @@ def extract_json_object(text: str) -> Optional[dict]:
                 return parsed
 
     return None
-
 
 def infer_short_topic_from_text(text: str) -> str:
     lower = text.lower()
@@ -2735,9 +2731,10 @@ class TicketDropdown(discord.ui.Select):
 
             except Exception as e:
                 log.exception("Ticket creation failed in guild %s for user %s", guild.id, opener.id)
+                await send_log(guild, "Ticket Creation Failed", f"User: {opener.mention}\nReason: {type(e).__name__}: {e}")
                 await safe_ephemeral_edit_or_followup(
                     interaction,
-                    embed=await base_embed(guild.id, "Error", f"Failed to create ticket.\n`{e}`", error=True)
+                    embed=await base_embed(guild.id, "Error", f"Failed to create ticket.\nReason: {type(e).__name__}: {e}", error=True)
                 )
             finally:
                 cleanup_ticket_create_lock(guild.id, opener.id)
@@ -4366,7 +4363,6 @@ async def premiumkey(interaction: discord.Interaction, key: str):
         "Premium Activated",
         (
             f"Activated by: {interaction.user.mention}\n"
-            f"Premium key: `{display_premium_key(normalized)}`\n"
             f"Expires: {format_premium_expiry(premium_row['expires_at'])}"
         )
     )
