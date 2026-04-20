@@ -5860,6 +5860,324 @@ async def on_message(message: discord.Message):
     await handle_ai_assistant_message_advanced(message)
 
 
+
+# =========================================================
+# ULTRA AI PATCH
+# =========================================================
+ULTRA_PRIORITY_KEYWORDS = {
+    "urgent": 4,
+    "scam": 5,
+    "chargeback": 5,
+    "stolen": 5,
+    "hacked": 5,
+    "fraud": 5,
+    "refund": 4,
+    "payment": 4,
+    "buy": 3,
+    "purchase": 3,
+    "vip": 3,
+    "premium": 3,
+    "turf": 3,
+    "bug": 2,
+    "error": 2,
+    "ban": 3,
+    "appeal": 3,
+    "rank": 2,
+}
+
+ULTRA_REPLY_STYLES = [
+    "Got it — ",
+    "Thanks for explaining — ",
+    "Understood — ",
+]
+
+def ultra_detect_priority(text: str) -> int:
+    lowered = normalize_simple_text(text)
+    score = 1
+    for key, weight in ULTRA_PRIORITY_KEYWORDS.items():
+        if key in lowered:
+            score = max(score, weight)
+    return score
+
+def ultra_build_staff_summary(user_message: str, memory_summary: str = "") -> str:
+    lowered = normalize_simple_text(user_message)
+    topic = build_smart_topic_from_text(lowered)
+    priority = ultra_detect_priority(lowered)
+    base = []
+    base.append(f"topic={topic}")
+    base.append(f"priority={priority}")
+    if "refund" in lowered:
+        base.append("refund/payment request")
+    elif any(x in lowered for x in ["buy", "purchase", "premium", "vip", "turf", "donate"]):
+        base.append("purchase-related request")
+    elif any(x in lowered for x in ["bug", "error", "issue", "glitch", "problem"]):
+        base.append("technical issue")
+    elif any(x in lowered for x in ["ban", "appeal", "unban"]):
+        base.append("moderation appeal")
+    elif any(x in lowered for x in ["rank", "account", "role", "permission"]):
+        base.append("account/rank issue")
+    else:
+        base.append("general staff help needed")
+
+    if memory_summary:
+        compact = normalize_simple_text(memory_summary)[:120]
+        if compact:
+            base.append(f"context={compact}")
+    return " | ".join(base)[:220]
+
+def ultra_make_human_reply(prefix_text: str, core_text: str) -> str:
+    prefix = ULTRA_REPLY_STYLES[hash(prefix_text) % len(ULTRA_REPLY_STYLES)]
+    reply = f"{prefix}{core_text}".strip()
+    return reply[:340]
+
+async def get_ai_response_advanced(
+    guild_id: int,
+    conversation: list[str],
+    user_message: str,
+    opener_name: str,
+    ticket_category: str,
+    available_categories: list[str]
+) -> dict[str, Any]:
+    custom_prompt = custom_prompts_cache.get(guild_id, "")
+    recent_convo = "\n".join(conversation[-16:]) if conversation else "(no prior conversation)"
+    memory_row = None
+    try:
+        memory_row = await get_ticket_memory(next(iter([])))  # no-op fallback
+    except Exception:
+        memory_row = None
+
+    system_prompt = f"""You are a premium Discord ticket AI assistant helping users before human staff claim the ticket.
+
+Current ticket category: {ticket_category}
+Available categories: {", ".join(available_categories)}
+User name: {opener_name}
+
+Return ONLY valid JSON:
+{{
+  "reply": "short natural human reply",
+  "close_ticket": false,
+  "needs_staff": false,
+  "staff_summary": "",
+  "suggested_category": "",
+  "rename_to": ""
+}}
+
+Decision policy:
+1. If the user is clearly done, thanked you, or says nothing else is needed -> close_ticket=true.
+2. If the message is about purchases, premium, VIP, payments, refunds, donations, account access, ranks, bans, appeals, bugs, broken features, or anything risky -> needs_staff=true.
+3. If the user opened the wrong category, explain that briefly and suggest the best available category. You may close the ticket after that.
+4. rename_to must be short and useful, like purchase, refund, bug-report, ban-appeal, rank-help, turf-purchase.
+5. Prefer escalating instead of guessing.
+6. Never delete tickets. Only close_ticket may be true.
+
+Custom instructions:
+{custom_prompt}
+"""
+    response = await call_deepseek_api_fast(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nNewest user message:\n{user_message}"}
+        ],
+        max_tokens=260
+    )
+    parsed = extract_json_object(response or "")
+
+    fallback = fallback_ai_decision(user_message, ticket_category, available_categories)
+
+    if not parsed:
+        return fallback
+
+    reply = str(parsed.get("reply", "")).strip()[:350]
+    close_ticket = bool(parsed.get("close_ticket", False))
+    needs_staff = bool(parsed.get("needs_staff", False))
+    staff_summary = str(parsed.get("staff_summary", "")).strip()[:220]
+    suggested_category = str(parsed.get("suggested_category", "")).strip()[:100]
+    rename_to = str(parsed.get("rename_to", "")).strip()[:60]
+
+    lowered = normalize_simple_text(user_message)
+    bucket = detect_intent_bucket(lowered)
+    priority = ultra_detect_priority(lowered)
+
+    if lowered in ADVANCED_END_WORDS or bucket == "finished":
+        close_ticket = True
+        needs_staff = False
+        suggested_category = ""
+        reply = reply or "Perfect — I'll close this ticket now."
+
+    if bucket in {"purchase", "technical", "moderation", "account"}:
+        needs_staff = True
+        close_ticket = False
+        rename_to = rename_to or build_smart_topic_from_text(lowered)
+        staff_summary = staff_summary or ultra_build_staff_summary(user_message)
+        if not reply:
+            if bucket == "purchase":
+                reply = ultra_make_human_reply(user_message, "I'll get a staff member to help with this purchase request.")
+            elif bucket == "technical":
+                reply = ultra_make_human_reply(user_message, "I'll get a staff member to review this issue.")
+            elif bucket == "moderation":
+                reply = ultra_make_human_reply(user_message, "I'll get a staff member to review this appeal.")
+            else:
+                reply = ultra_make_human_reply(user_message, "I'll get a staff member to help with this account issue.")
+
+    guessed = ai_guess_best_category_advanced(user_message, ticket_category, available_categories)
+    if guessed and guessed != ticket_category and not needs_staff:
+        suggested_category = guessed
+        close_ticket = True
+        reply = reply or f"You opened the wrong ticket type. Please open a {guessed} ticket instead."
+
+    if not staff_summary and needs_staff:
+        staff_summary = ultra_build_staff_summary(user_message)
+
+    if not rename_to and needs_staff:
+        rename_to = build_smart_topic_from_text(lowered)
+
+    if not reply:
+        if priority >= 4 and needs_staff:
+            reply = ultra_make_human_reply(user_message, "this looks important, so I'm escalating it to staff now.")
+        else:
+            reply = fallback["reply"]
+
+    return {
+        "reply": reply[:350],
+        "close_ticket": close_ticket,
+        "needs_staff": needs_staff,
+        "staff_summary": staff_summary[:220],
+        "suggested_category": suggested_category[:100],
+        "rename_to": rename_to[:60]
+    }
+
+async def handle_ai_assistant_message_advanced(message: discord.Message):
+    if not DEEPSEEK_API_KEY:
+        return
+    if message.author.bot:
+        return
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+    if not isinstance(message.author, discord.Member):
+        return
+
+    guild = message.guild
+    if not guild:
+        return
+    channel = message.channel
+
+    if channel.id in ai_processing:
+        return
+
+    ticket = await get_ticket_by_channel(channel.id)
+    if not ticket or ticket["status"] == "closed" or ticket["claimed_by"] is not None:
+        return
+
+    ai_config = await get_ai_assistant_config(guild.id)
+    if not ai_config or not ai_config["enabled"]:
+        return
+
+    premium_row = await get_active_premium_guild_record(guild.id)
+    if not premium_row:
+        return
+
+    config = await get_guild_config(guild.id)
+    if not config:
+        return
+
+    ai_processing.add(channel.id)
+    try:
+        state = ai_conversations.setdefault(channel.id, {
+            "messages": [],
+            "staff_alerted": False,
+            "last_response": None,
+            "greeted": True,
+            "close_attempted": False,
+            "priority": 1
+        })
+
+        user_text = message.content.strip()
+        state["messages"].append(f"User: {user_text}")
+        state["messages"] = state["messages"][-24:]
+
+        summary = await summarize_for_memory(state["messages"], user_text)
+        await upsert_ticket_memory(channel.id, guild.id, summary, build_smart_topic_from_text(user_text))
+
+        ticket_options = await get_ticket_options(guild.id)
+        available_categories = [opt["label"] for opt in ticket_options]
+
+        ai_data = await get_ai_response_advanced(
+            guild.id,
+            state["messages"],
+            user_text,
+            message.author.display_name,
+            ticket["option_label"],
+            available_categories
+        )
+
+        reply = ai_data["reply"]
+        close_ticket = ai_data["close_ticket"]
+        needs_staff = ai_data["needs_staff"]
+        staff_summary = ai_data["staff_summary"]
+        suggested_category = ai_data["suggested_category"]
+        rename_to = ai_data["rename_to"]
+
+        state["priority"] = max(state.get("priority", 1), ultra_detect_priority(user_text))
+
+        if rename_to:
+            await maybe_rename_ticket_from_ai(channel, rename_to)
+
+        if reply:
+            with suppress(Exception):
+                async with channel.typing():
+                    await asyncio.sleep(0.6 if len(reply) < 80 else 1.0)
+                await channel.send(reply)
+            state["messages"].append(f"Bot: {reply}")
+            state["last_response"] = reply
+
+        if needs_staff and not state.get("staff_alerted"):
+            opener_member = await try_fetch_member(guild, ticket["opener_id"])
+            enriched = staff_summary
+            if state.get("priority", 1) >= 4:
+                enriched = f"HIGH PRIORITY | {enriched}"
+
+            if opener_member and ai_config.get("alert_channel_id"):
+                await send_staff_alert(
+                    guild=guild,
+                    ticket_channel=channel,
+                    opener=opener_member,
+                    summary=enriched,
+                    support_role_id=config["support_role_id"],
+                    alert_channel_id=ai_config["alert_channel_id"]
+                )
+                state["staff_alerted"] = True
+
+            await send_log(
+                guild,
+                "AI Requested Staff",
+                f"Channel: {channel.mention}\nPriority: {state.get('priority',1)}\nSummary: {enriched}"
+            )
+            return
+
+        if suggested_category and suggested_category != ticket["option_label"] and close_ticket:
+            await auto_close_ticket_by_ai(channel, guild, f"Wrong category. Suggested category: {suggested_category}")
+            await delete_ticket_memory(channel.id)
+            cleanup_ticket_channel_lock(channel.id)
+            return
+
+        if close_ticket and not state.get("close_attempted"):
+            state["close_attempted"] = True
+            await auto_close_ticket_by_ai(channel, guild, "Conversation completed.")
+            await delete_ticket_memory(channel.id)
+            cleanup_ticket_channel_lock(channel.id)
+
+    except Exception as e:
+        log.exception("Ultra AI assistant failed in channel %s: %s", channel.id, e)
+    finally:
+        ai_processing.discard(channel.id)
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    await handle_ai_assistant_message_advanced(message)
+
+
 # =========================================================
 # MAIN
 # =========================================================
