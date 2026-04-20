@@ -1869,7 +1869,8 @@ class SetupConfirmView(discord.ui.View):
         if not interaction.guild:
             return
 
-        await safe_defer(interaction, ephemeral=True, thinking=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
 
         data = self.data
         guild = interaction.guild
@@ -2338,6 +2339,7 @@ async def auto_close_ticket_by_ai(channel: discord.TextChannel, guild: discord.G
         return
 
     await close_ticket_record(channel.id, bot.user.id if bot.user else None)
+    cleanup_ticket_create_lock(guild.id, ticket["opener_id"])
     await remove_staff_alert(channel.id)
     ai_conversations.pop(channel.id, None)
 
@@ -2393,7 +2395,9 @@ async def handle_ai_assistant_message(message: discord.Message):
         return
 
     ai_config = await get_ai_assistant_config(guild.id)
-    if not ai_config or not ai_config["enabled"]:
+    if not ai_config:
+        return
+    if ai_config.get("enabled") is not True:
         return
 
     premium_row = await get_active_premium_guild_record(guild.id)
@@ -2706,15 +2710,13 @@ class TicketDropdown(discord.ui.Select):
                 ai_config = await get_ai_assistant_config(guild.id)
                 premium_row = await get_active_premium_guild_record(guild.id)
 
-                if ai_config and ai_config["enabled"] and premium_row and DEEPSEEK_API_KEY:
+                if ai_config and ai_config.get("enabled") is True and premium_row and DEEPSEEK_API_KEY:
                     ai_conversations[ticket_channel.id] = {
                         "messages": [],
                         "staff_alerted": False,
                         "last_response": None,
-                        "greeted": True
+                        "greeted": False
                     }
-                    with suppress(Exception):
-                        await ticket_channel.send("Hello! How can I help you?")
 
                 asyncio.create_task(refresh_guild_panel(guild.id))
                 asyncio.create_task(
@@ -2773,6 +2775,34 @@ async def dm_ticket_closed(
         description=(
             f"Your ticket in **{guild.name}** has been closed.\n\n"
             f"Closed by: {closed_by.mention}\n"
+            f"Ticket: #{channel_name}"
+        ),
+        color=color
+    )
+    embed = await apply_footer(embed, guild.id, use_global_avatar=True)
+
+    with suppress(Exception):
+        await user.send(embed=embed)
+
+
+async def dm_ticket_reopened(
+    guild: discord.Guild,
+    opener_id: int,
+    reopened_by: discord.Member,
+    channel_name: str
+):
+    config = await get_guild_config(guild.id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    user = await try_fetch_user(opener_id)
+    if not user:
+        return
+
+    embed = discord.Embed(
+        title="Ticket Reopened",
+        description=(
+            f"Your ticket in **{guild.name}** has been reopened.\n\n"
+            f"Reopened by: {reopened_by.mention}\n"
             f"Ticket: #{channel_name}"
         ),
         color=color
@@ -3456,6 +3486,7 @@ class CloseTicketButton(discord.ui.Button):
                     return
 
             await close_ticket_record(interaction.channel.id, interaction.user.id)
+            cleanup_ticket_create_lock(interaction.guild.id, ticket["opener_id"])
 
             ai_conversations.pop(interaction.channel.id, None)
             await remove_staff_alert(interaction.channel.id)
@@ -3568,7 +3599,8 @@ class ReopenTicketButton(discord.ui.Button):
                 reopened_name = current_name[len("closed-"):]
                 reopened_name = reopened_name or "ticket"
                 with suppress(Exception):
-                    await interaction.channel.edit(name=reopened_name[:95])
+                    if interaction.channel.name != reopened_name[:95]:
+                        await interaction.channel.edit(name=reopened_name[:95])
 
             reopened_embed = await build_reopened_ticket_embed(interaction.guild.id, interaction.user)
             with suppress(Exception):
@@ -3582,6 +3614,15 @@ class ReopenTicketButton(discord.ui.Button):
                     await interaction.message.edit(view=None)
             except Exception:
                 pass
+
+            asyncio.create_task(
+                dm_ticket_reopened(
+                    interaction.guild,
+                    ticket["opener_id"],
+                    interaction.user,
+                    interaction.channel.name
+                )
+            )
 
             asyncio.create_task(refresh_guild_panel(interaction.guild.id))
             asyncio.create_task(
@@ -4180,13 +4221,30 @@ async def renameticket(interaction: discord.Interaction, name: str):
 @bot.tree.command(name="enableticketassistant", description="Enable AI ticket assistant (Premium only)")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-async def enableticketassistant(interaction: discord.Interaction, alert_channel: discord.TextChannel, prompt_channel: discord.TextChannel):
+async def enableticketassistant(
+    interaction: discord.Interaction,
+    alert_channel: Optional[discord.TextChannel] = None,
+    prompt_channel: Optional[discord.TextChannel] = None
+):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return
 
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
             embed=await base_embed(interaction.guild.id, "Access Denied", "Only administrators can use this command.", error=True),
+            ephemeral=True
+        )
+        return
+
+    setup_config = await get_guild_config(interaction.guild.id)
+    if not setup_config:
+        await interaction.response.send_message(
+            embed=await base_embed(
+                interaction.guild.id,
+                "Setup Required",
+                "You must set up the ticket panel using the `/setup` command before you can proceed with this.",
+                error=True
+            ),
             ephemeral=True
         )
         return
@@ -4216,6 +4274,34 @@ async def enableticketassistant(interaction: discord.Interaction, alert_channel:
         )
         return
 
+    support_role = interaction.guild.get_role(setup_config["support_role_id"]) if setup_config else None
+
+    if alert_channel is None:
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.guild.me: discord.PermissionOverwrite(view_channel=True),
+            interaction.user: discord.PermissionOverwrite(view_channel=True),
+        }
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(view_channel=True)
+        alert_channel = await interaction.guild.create_text_channel(
+            name="ai-alerts",
+            overwrites=overwrites,
+            reason="Automatic Ticket Assistant setup"
+        )
+
+    if prompt_channel is None:
+        prompt_overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.guild.me: discord.PermissionOverwrite(view_channel=True),
+            interaction.user: discord.PermissionOverwrite(view_channel=True),
+        }
+        prompt_channel = await interaction.guild.create_text_channel(
+            name="ai-prompt",
+            overwrites=prompt_overwrites,
+            reason="Automatic Ticket Assistant setup"
+        )
+
     await set_ai_assistant_config(interaction.guild.id, True, alert_channel.id, prompt_channel.id)
 
     custom_prompt = await fetch_prompt_from_channel(prompt_channel.id)
@@ -4236,6 +4322,13 @@ async def enableticketassistant(interaction: discord.Interaction, alert_channel:
         "AI Assistant Enabled",
         f"Enabled by: {interaction.user.mention}\nAlert channel: {alert_channel.mention}\nPrompt channel: {prompt_channel.mention}"
     )
+
+
+@bot.tree.command(name="enableaiassistant", description="Enable AI ticket assistant (Premium only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def enableaiassistant(interaction: discord.Interaction):
+    await enableticketassistant(interaction, None, None)
 
 
 @bot.tree.command(name="disableticketassistant", description="Disable AI ticket assistant")
@@ -4972,6 +5065,7 @@ async def on_ready():
 
     await init_db()
     await refresh_bot_owner_ids()
+    await db_execute("UPDATE ai_assistant_config SET enabled = FALSE WHERE enabled IS NULL")
     await load_custom_prompts()
 
     if not startup_ready_done:
@@ -5244,7 +5338,17 @@ async def get_ai_response_advanced(
     ticket_category: str,
     available_categories: list[str]
 ) -> dict[str, Any]:
-    custom_prompt = custom_prompts_cache.get(guild_id, "")
+    ai_config_live = await get_ai_assistant_config(guild_id)
+    custom_prompt = ""
+    if ai_config_live and ai_config_live.get("prompt_channel_id"):
+        fetched_prompt = await fetch_prompt_from_channel(ai_config_live["prompt_channel_id"])
+        if fetched_prompt:
+            custom_prompt = fetched_prompt
+        else:
+            custom_prompt = custom_prompts_cache.get(guild_id, "")
+    else:
+        custom_prompt = custom_prompts_cache.get(guild_id, "")
+
     categories_text = ", ".join(available_categories)
     recent_convo = "\n".join(conversation[-12:]) if conversation else "(no prior conversation)"
 
@@ -5406,7 +5510,9 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         return
 
     ai_config = await get_ai_assistant_config(guild.id)
-    if not ai_config or not ai_config["enabled"]:
+    if not ai_config:
+        return
+    if ai_config.get("enabled") is not True:
         return
 
     premium_row = await get_active_premium_guild_record(guild.id)
@@ -5887,7 +5993,9 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         return
 
     ai_config = await get_ai_assistant_config(guild.id)
-    if not ai_config or not ai_config["enabled"]:
+    if not ai_config:
+        return
+    if ai_config.get("enabled") is not True:
         return
 
     premium_row = await get_active_premium_guild_record(guild.id)
@@ -6223,7 +6331,9 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         return
 
     ai_config = await get_ai_assistant_config(guild.id)
-    if not ai_config or not ai_config["enabled"]:
+    if not ai_config:
+        return
+    if ai_config.get("enabled") is not True:
         return
 
     premium_row = await get_active_premium_guild_record(guild.id)
