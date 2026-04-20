@@ -2000,6 +2000,164 @@ class SetupConfirmView(discord.ui.View):
         )
 
 
+# =========================================================
+# MISSING CORE HELPERS (PATCHED BACK IN)
+# =========================================================
+async def is_support_or_admin(member: discord.Member, guild_id: int) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+
+    config = await get_guild_config(guild_id)
+    if not config:
+        return False
+
+    role = member.guild.get_role(config["support_role_id"])
+    return role in member.roles if role else False
+
+
+async def send_log(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    file: Optional[discord.File] = None
+):
+    config = await get_guild_config(guild.id)
+    if not config:
+        return
+
+    log_channel = guild.get_channel(config["log_channel_id"])
+    if not isinstance(log_channel, discord.TextChannel):
+        return
+
+    embed = await base_embed(guild.id, title, description)
+
+    try:
+        if file:
+            await log_channel.send(embed=embed, file=file)
+        else:
+            await log_channel.send(embed=embed)
+    except Exception as e:
+        log.warning("Failed to send log in guild %s: %s", guild.id, e)
+        return
+
+
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = False, thinking: bool = False) -> bool:
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+async def safe_component_reply(
+    interaction: discord.Interaction,
+    *,
+    embed: Optional[discord.Embed] = None,
+    content: Optional[str] = None,
+    ephemeral: bool = False
+):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+            return True
+    except Exception:
+        pass
+
+    try:
+        await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def safe_ephemeral_edit_or_followup(
+    interaction: discord.Interaction,
+    *,
+    embed: discord.Embed
+):
+    try:
+        await interaction.edit_original_response(embed=embed, content=None, view=None)
+        return True
+    except Exception:
+        pass
+
+    try:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def safe_non_ephemeral_followup(
+    interaction: discord.Interaction,
+    *,
+    embed: discord.Embed
+):
+    try:
+        await interaction.followup.send(embed=embed, ephemeral=False)
+        return True
+    except Exception:
+        return False
+
+
+async def refresh_guild_panel(guild_id: int):
+    config = await get_guild_config(guild_id)
+    if not config:
+        return
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+
+    channel = guild.get_channel(config["panel_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        message = await channel.fetch_message(config["panel_message_id"])
+    except Exception:
+        return
+
+    try:
+        view = await TicketPanelView.build(guild_id)
+        await message.edit(view=view)
+    except Exception:
+        pass
+
+
+@bot.tree.error
+async def global_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    if isinstance(original, NameError):
+        message = f"A required helper function is missing: `{original}`"
+    elif isinstance(original, PermissionError):
+        message = "The bot is missing permission to complete that action."
+    elif isinstance(original, asyncpg.PostgresError):
+        message = f"Database error: `{type(original).__name__}`"
+    else:
+        message = f"Something went wrong: `{type(original).__name__}: {original}`"
+
+    try:
+        embed = await base_embed(
+            interaction.guild.id if interaction.guild else None,
+            "Command Failed",
+            message,
+            error=True
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception:
+        pass
+
+
 async def load_custom_prompts():
     rows = await db_fetch("""
         SELECT guild_id, prompt_channel_id, custom_prompt 
