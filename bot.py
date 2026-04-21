@@ -1176,6 +1176,60 @@ def find_best_category_from_text(user_text: str, current_category: str, availabl
     return None
 
 
+
+def normalize_ai_prompt_text(prompt_text: str) -> str:
+    return "\n".join(line.strip() for line in (prompt_text or "").splitlines() if line.strip())
+
+
+def extract_prompt_directive_response(user_text: str, prompt_text: str) -> Optional[str]:
+    """
+    Supports patterns like:
+    - Staff applications: closed
+    - If someone asks to become a staff tell them that staff applications are closed
+    - If someone asks to get turf tell them to join the Roblox group...
+    """
+    if not prompt_text:
+        return None
+
+    user_lower = user_text.lower().strip()
+    lines = [line.strip() for line in prompt_text.splitlines() if line.strip()]
+    colon_pairs: list[tuple[str, str]] = []
+
+    for raw in lines:
+        line = raw.strip()
+        lower = line.lower()
+
+        if ":" in line:
+            left, right = line.split(":", 1)
+            key = left.strip().lower()
+            value = right.strip()
+            if key and value:
+                colon_pairs.append((key, value))
+
+        if "if someone asks" in lower and "tell them" in lower:
+            try:
+                after_asks = lower.split("if someone asks", 1)[1].strip()
+                trigger_part, response_part = after_asks.split("tell them", 1)
+                trigger_part = trigger_part.strip(" ,.-")
+                response_text = raw[raw.lower().find("tell them") + len("tell them"):].strip(" ,.-")
+                trigger_tokens = [t for t in re.findall(r"[a-z0-9]+", trigger_part) if t not in {"to", "the", "a", "an", "that"}]
+                if trigger_tokens and sum(1 for t in trigger_tokens if t in user_lower) >= max(1, min(2, len(trigger_tokens))):
+                    return response_text
+            except Exception:
+                pass
+
+    for key, value in colon_pairs:
+        key_tokens = [t for t in re.findall(r"[a-z0-9]+", key) if t not in {"the", "a", "an", "to"}]
+        if key_tokens and sum(1 for t in key_tokens if t in user_lower) >= max(1, min(2, len(key_tokens))):
+            if value.lower() == "closed":
+                return f"{key.title()} are closed."
+            if value.lower() == "open":
+                return f"{key.title()} are open."
+            return value
+
+    return None
+
+
 async def generate_unique_premium_keys(amount: int, duration_code: str, created_by: int) -> list[str]:
     keys: list[str] = []
     seen: set[str] = set()
@@ -2174,7 +2228,7 @@ async def load_custom_prompts():
 async def fetch_prompt_from_channel(channel_id: int) -> Optional[str]:
     now = time.monotonic()
     cached = ai_prompt_runtime_cache.get(channel_id)
-    if cached and now - cached[0] < 15:
+    if cached and now - cached[0] < 5:
         return cached[1]
 
     channel = bot.get_channel(channel_id)
@@ -2384,6 +2438,17 @@ async def auto_close_ticket_by_ai(channel: discord.TextChannel, guild: discord.G
 
     with suppress(Exception):
         await channel.send(view=ClosedTicketControlsView())
+
+    # DM the opener when AI closes the ticket
+    if guild.me:
+        asyncio.create_task(
+            dm_ticket_closed(
+                guild,
+                ticket["opener_id"],
+                guild.me,
+                channel.name
+            )
+        )
 
     await send_log(
         guild,
