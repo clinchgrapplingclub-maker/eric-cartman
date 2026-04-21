@@ -10,6 +10,7 @@ import re
 import secrets
 import string
 import zipfile
+import time
 from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass
@@ -109,6 +110,9 @@ PREMIUM_DURATION_LABELS = {
 # AI Assistant tracking
 ai_conversations: dict[int, dict[str, Any]] = {}
 ai_processing: set[int] = set()
+
+ai_prompt_runtime_cache: dict[int, tuple[float, str]] = {}
+ai_rename_runtime_cache: dict[int, tuple[str, float]] = {}
 
 # Extra AI stability / routing helpers
 AI_CLOSE_WORDS = {
@@ -2168,21 +2172,29 @@ async def load_custom_prompts():
 
 
 async def fetch_prompt_from_channel(channel_id: int) -> Optional[str]:
+    now = time.monotonic()
+    cached = ai_prompt_runtime_cache.get(channel_id)
+    if cached and now - cached[0] < 15:
+        return cached[1]
+
     channel = bot.get_channel(channel_id)
     if not isinstance(channel, discord.TextChannel):
         return None
 
+    parts: list[str] = []
     try:
-        async for message in channel.history(limit=50):
+        messages = [m async for m in channel.history(limit=25, oldest_first=True)]
+        for message in messages:
             if message.content and not message.author.bot:
-                return message.content
+                parts.append(message.content.strip())
     except Exception:
-        pass
+        return None
 
-    return None
+    prompt_text = "\n".join(parts).strip()
+    ai_prompt_runtime_cache[channel_id] = (now, prompt_text)
+    return prompt_text or None
 
-
-async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 240) -> Optional[str]:
+async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 140) -> Optional[str]:
     if not DEEPSEEK_API_KEY:
         return None
 
@@ -2195,10 +2207,11 @@ async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 240) ->
         "model": "deepseek-chat",
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.35
+        "temperature": 0.15
     }
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+    timeout = aiohttp.ClientTimeout(total=4, connect=2, sock_read=3)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
             async with session.post(
                 "https://api.deepseek.com/v1/chat/completions",
@@ -2212,7 +2225,6 @@ async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 240) ->
         except Exception:
             return None
 
-
 async def get_ai_response(
     guild_id: int,
     conversation: list[str],
@@ -2221,7 +2233,12 @@ async def get_ai_response(
     ticket_category: str,
     available_categories: list[str]
 ) -> Optional[dict[str, Any]]:
-    custom_prompt = custom_prompts_cache.get(guild_id, "")
+    ai_config = await get_ai_assistant_config(guild_id)
+    custom_prompt = ""
+    if ai_config and ai_config.get("prompt_channel_id"):
+        fetched_prompt = await fetch_prompt_from_channel(ai_config["prompt_channel_id"])
+        if fetched_prompt:
+            custom_prompt = fetched_prompt
     categories_text = ", ".join(available_categories)
 
     system_prompt = f"""You are a very smart Discord ticket assistant helping users before staff claim the ticket.
@@ -2329,9 +2346,21 @@ async def maybe_rename_ticket_from_ai(channel: discord.TextChannel, new_name: st
         return
     if channel.name == clean:
         return
-    with suppress(Exception):
-        await channel.edit(name=clean, reason="AI assistant renamed ticket topic")
 
+    now = time.monotonic()
+    cached = ai_rename_runtime_cache.get(channel.id)
+    if cached:
+        last_name, last_ts = cached
+        if last_name == clean:
+            return
+        if now - last_ts < 180:
+            return
+
+    try:
+        await channel.edit(name=clean, reason="AI assistant renamed ticket topic")
+        ai_rename_runtime_cache[channel.id] = (clean, now)
+    except Exception:
+        pass
 
 async def auto_close_ticket_by_ai(channel: discord.TextChannel, guild: discord.Guild, reason_text: str):
     ticket = await get_ticket_by_channel(channel.id)
@@ -2343,9 +2372,10 @@ async def auto_close_ticket_by_ai(channel: discord.TextChannel, guild: discord.G
     await remove_staff_alert(channel.id)
     ai_conversations.pop(channel.id, None)
 
-    with suppress(Exception):
-        if not channel.name.startswith("closed-"):
-            await channel.edit(name=f"closed-{channel.name}"[:95])
+    opener_member = await try_fetch_member(guild, ticket["opener_id"])
+    if opener_member:
+        with suppress(Exception):
+            await channel.set_permissions(opener_member, view_channel=False)
 
     if guild.me:
         closed_embed = await build_closed_ticket_embed(guild.id, guild.me)
@@ -2360,7 +2390,6 @@ async def auto_close_ticket_by_ai(channel: discord.TextChannel, guild: discord.G
         "Ticket Auto-Closed",
         f"Channel: {channel.mention}\nClosed by AI assistant.\nReason: {reason_text}"
     )
-
 
 async def handle_ai_assistant_message(message: discord.Message):
     if not DEEPSEEK_API_KEY:
@@ -2791,12 +2820,12 @@ async def dm_ticket_reopened(
     reopened_by: discord.Member,
     channel_name: str
 ):
-    config = await get_guild_config(guild.id)
-    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
-
     user = await try_fetch_user(opener_id)
     if not user:
         return
+
+    config = await get_guild_config(guild.id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
 
     embed = discord.Embed(
         title="Ticket Reopened",
@@ -2811,7 +2840,6 @@ async def dm_ticket_reopened(
 
     with suppress(Exception):
         await user.send(embed=embed)
-
 
 async def dm_ticket_banned(
     guild: discord.Guild,
@@ -2942,22 +2970,24 @@ async def handle_premium_end_side_effects(
     automatic: bool
 ):
     await reset_guild_profile_to_default(guild.id)
+    await set_ai_assistant_config(guild.id, False, None, None)
+    ai_assistant_config_cache.pop(guild.id, None)
+    custom_prompts_cache.pop(guild.id, None)
 
     if automatic:
         await dm_server_owner_premium_expired(guild.id, guild.name)
         await send_log(
             guild,
             "Premium Expired",
-            f"Server premium expired.\nPremium key: `{premium_row.get('premium_key') or 'Unknown'}`"
+            "Server premium expired. AI assistant was disabled automatically."
         )
     else:
         await dm_server_owner_premium_removed(guild.id, guild.name)
         await send_log(
             guild,
             "Premium Removed",
-            f"Server premium was removed.\nPremium key: `{premium_row.get('premium_key') or 'Unknown'}`"
+            "Server premium was removed. AI assistant was disabled automatically."
         )
-
 
 # =========================================================
 # TRANSCRIPT
@@ -3418,114 +3448,56 @@ class CloseTicketButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
-
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
         await safe_defer(interaction, ephemeral=False, thinking=False)
-
         lock = get_ticket_channel_lock(interaction.channel.id)
         async with lock:
             ticket = await get_ticket_by_channel(interaction.channel.id)
             if not ticket:
-                await safe_component_reply(
-                    interaction,
-                    embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True), ephemeral=True)
                 return
-
             if ticket["status"] == "closed":
-                await safe_component_reply(
-                    interaction,
-                    embed=await base_embed(interaction.guild.id, "Ticket Closed", "This ticket is already closed."),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Ticket Closed", "This ticket is already closed."), ephemeral=True)
                 return
-
             if not await is_support_or_admin(interaction.user, interaction.guild.id):
-                await safe_component_reply(
-                    interaction,
-                    embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True), ephemeral=True)
                 return
 
             config = await get_guild_config(interaction.guild.id)
             support_role = interaction.guild.get_role(config["support_role_id"]) if config else None
             opener_member = await try_fetch_member(interaction.guild, ticket["opener_id"])
-
             try:
                 if opener_member:
                     await interaction.channel.set_permissions(opener_member, view_channel=False)
             except discord.Forbidden:
-                await safe_component_reply(
-                    interaction,
-                    embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True), ephemeral=True)
                 return
 
             if support_role:
                 try:
-                    await interaction.channel.set_permissions(
-                        support_role,
-                        view_channel=True,
-                        send_messages=True,
-                        read_message_history=True,
-                        attach_files=True,
-                        embed_links=True,
-                        manage_messages=True
-                    )
+                    await interaction.channel.set_permissions(support_role, view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True, manage_messages=True)
                 except discord.Forbidden:
-                    await safe_component_reply(
-                        interaction,
-                        embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update support role permissions.", error=True),
-                        ephemeral=True
-                    )
+                    await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update support role permissions.", error=True), ephemeral=True)
                     return
 
             await close_ticket_record(interaction.channel.id, interaction.user.id)
             cleanup_ticket_create_lock(interaction.guild.id, ticket["opener_id"])
-
             ai_conversations.pop(interaction.channel.id, None)
             await remove_staff_alert(interaction.channel.id)
 
             with suppress(Exception):
-                if not interaction.channel.name.startswith("closed-"):
-                    await interaction.channel.edit(name=f"closed-{interaction.channel.name}"[:95])
-
-            closed_embed = await build_closed_ticket_embed(interaction.guild.id, interaction.user)
+                await interaction.channel.send(embed=await build_closed_ticket_embed(interaction.guild.id, interaction.user))
             with suppress(Exception):
-                await interaction.channel.send(embed=closed_embed)
-
-            closed_view = ClosedTicketControlsView()
-            await interaction.channel.send(view=closed_view)
-
-            try:
+                await interaction.channel.send(view=ClosedTicketControlsView())
+            with suppress(Exception):
                 if interaction.message:
                     await interaction.message.edit(view=None)
-            except Exception:
-                pass
 
-            asyncio.create_task(
-                dm_ticket_closed(
-                    interaction.guild,
-                    ticket["opener_id"],
-                    interaction.user,
-                    interaction.channel.name
-                )
-            )
-
+            asyncio.create_task(dm_ticket_closed(interaction.guild, ticket["opener_id"], interaction.user, interaction.channel.name))
             asyncio.create_task(refresh_guild_panel(interaction.guild.id))
-            asyncio.create_task(
-                send_log(
-                    interaction.guild,
-                    "Ticket Closed",
-                    f"Channel: #{interaction.channel.name}\nClosed by: {interaction.user.mention}"
-                )
-            )
-
+            asyncio.create_task(send_log(interaction.guild, "Ticket Closed", f"Channel: #{interaction.channel.name}\nClosed by: {interaction.user.mention}"))
 
 class ReopenTicketButton(discord.ui.Button):
     def __init__(self):
@@ -3539,100 +3511,43 @@ class ReopenTicketButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
-
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
         await safe_defer(interaction, ephemeral=False, thinking=False)
-
         lock = get_ticket_channel_lock(interaction.channel.id)
         async with lock:
             ticket = await get_ticket_by_channel(interaction.channel.id)
             if not ticket:
-                await safe_component_reply(
-                    interaction,
-                    embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True), ephemeral=True)
                 return
-
             if ticket["status"] == "open":
-                await safe_component_reply(
-                    interaction,
-                    embed=await base_embed(interaction.guild.id, "Ticket Open", "This ticket is already open."),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Ticket Open", "This ticket is already open."), ephemeral=True)
                 return
-
             if not await is_support_or_admin(interaction.user, interaction.guild.id):
-                await safe_component_reply(
-                    interaction,
-                    embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can reopen tickets.", error=True),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can reopen tickets.", error=True), ephemeral=True)
                 return
 
             opener_member = await try_fetch_member(interaction.guild, ticket["opener_id"])
-
             try:
                 if opener_member:
-                    await interaction.channel.set_permissions(
-                        opener_member,
-                        view_channel=True,
-                        send_messages=True,
-                        read_message_history=True,
-                        attach_files=True,
-                        embed_links=True
-                    )
+                    await interaction.channel.set_permissions(opener_member, view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
             except discord.Forbidden:
-                await safe_component_reply(
-                    interaction,
-                    embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True), ephemeral=True)
                 return
 
             await reopen_ticket_record(interaction.channel.id)
-
-            current_name = interaction.channel.name
-            if current_name.startswith("closed-"):
-                reopened_name = current_name[len("closed-"):]
-                reopened_name = reopened_name or "ticket"
-                with suppress(Exception):
-                    if interaction.channel.name != reopened_name[:95]:
-                        await interaction.channel.edit(name=reopened_name[:95])
-
-            reopened_embed = await build_reopened_ticket_embed(interaction.guild.id, interaction.user)
             with suppress(Exception):
-                await interaction.channel.send(embed=reopened_embed)
-
-            new_view = TicketControlsView()
-            await interaction.channel.send(view=new_view)
-
-            try:
+                await interaction.channel.send(embed=await build_reopened_ticket_embed(interaction.guild.id, interaction.user))
+            with suppress(Exception):
+                await interaction.channel.send(view=TicketControlsView())
+            with suppress(Exception):
                 if interaction.message:
                     await interaction.message.edit(view=None)
-            except Exception:
-                pass
 
-            asyncio.create_task(
-                dm_ticket_reopened(
-                    interaction.guild,
-                    ticket["opener_id"],
-                    interaction.user,
-                    interaction.channel.name
-                )
-            )
-
+            asyncio.create_task(dm_ticket_reopened(interaction.guild, ticket["opener_id"], interaction.user, interaction.channel.name))
             asyncio.create_task(refresh_guild_panel(interaction.guild.id))
-            asyncio.create_task(
-                send_log(
-                    interaction.guild,
-                    "Ticket Reopened",
-                    f"Channel: #{interaction.channel.name}\nReopened by: {interaction.user.mention}"
-                )
-            )
-
+            asyncio.create_task(send_log(interaction.guild, "Ticket Reopened", f"Channel: #{interaction.channel.name}\nReopened by: {interaction.user.mention}"))
 
 class DeleteTicketButton(discord.ui.Button):
     def __init__(self, disabled: bool = False, *, closed_variant: bool = False):
@@ -3646,83 +3561,51 @@ class DeleteTicketButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
-
         if not isinstance(interaction.channel, discord.TextChannel):
             return
 
-        await safe_defer(interaction, ephemeral=True, thinking=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
 
         channel = interaction.channel
         guild = interaction.guild
         deleter = interaction.user
-
         lock = get_ticket_channel_lock(channel.id)
         async with lock:
             ticket = await get_ticket_by_channel(channel.id)
             if not ticket:
-                await interaction.followup.send(
-                    embed=await base_embed(guild.id, "Error", "This is not a tracked ticket channel.", error=True),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(guild.id, "Error", "This is not a tracked ticket channel.", error=True), ephemeral=True)
                 return
-
             if not await is_support_or_admin(deleter, guild.id):
-                await interaction.followup.send(
-                    embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True),
-                    ephemeral=True
-                )
+                await safe_component_reply(interaction, embed=await base_embed(guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True), ephemeral=True)
                 return
 
-            try:
+            with suppress(Exception):
                 if interaction.message:
                     await interaction.message.edit(view=DeletingTicketControlsView())
-            except Exception:
-                pass
 
-            countdown_message: Optional[discord.Message] = None
-
+            countdown_message = None
             try:
-                countdown_embed = await build_delete_countdown_embed(guild.id, 3, deleter)
-                countdown_message = await channel.send(embed=countdown_embed)
-
+                countdown_message = await channel.send(embed=await build_delete_countdown_embed(guild.id, 3, deleter))
                 for seconds_left in (2, 1):
                     await asyncio.sleep(1)
                     with suppress(Exception):
-                        await countdown_message.edit(
-                            embed=await build_delete_countdown_embed(guild.id, seconds_left, deleter)
-                        )
-
+                        await countdown_message.edit(embed=await build_delete_countdown_embed(guild.id, seconds_left, deleter))
                 await asyncio.sleep(1)
             except Exception:
                 pass
 
             transcript_file = await build_transcript_zip(channel)
-            opener_text = f"<@{ticket['opener_id']}>"
-            channel_name = channel.name
-            channel_id = channel.id
-
-            await send_log(
-                guild,
-                "Ticket Deleted",
-                (
-                    f"Channel: #{channel_name}\n"
-                    f"Opened by: {opener_text}\n"
-                    f"Type: {ticket['option_label']}\n"
-                    f"Deleted by: {deleter.mention}"
-                ),
-                file=transcript_file
-            )
-
-            await delete_ticket_record(channel_id)
-            await remove_staff_alert(channel_id)
-
+            await send_log(guild, "Ticket Deleted", f"Channel: #{channel.name}\nOpened by: <@{ticket['opener_id']}>\nType: {ticket['option_label']}\nDeleted by: {deleter.mention}", file=transcript_file)
+            await delete_ticket_record(channel.id)
+            await remove_staff_alert(channel.id)
             asyncio.create_task(refresh_guild_panel(guild.id))
-
+            cleanup_ticket_channel_lock(channel.id)
             with suppress(Exception):
                 await channel.delete(reason=f"Ticket deleted by {deleter}")
-
-            cleanup_ticket_channel_lock(channel_id)
-
 
 class TicketControlsView(discord.ui.View):
     def __init__(self):
@@ -5345,7 +5228,12 @@ async def get_ai_response_advanced(
         if fetched_prompt:
             custom_prompt = fetched_prompt
         else:
-            custom_prompt = custom_prompts_cache.get(guild_id, "")
+            ai_config = await get_ai_assistant_config(guild_id)
+    custom_prompt = ""
+    if ai_config and ai_config.get("prompt_channel_id"):
+        fetched_prompt = await fetch_prompt_from_channel(ai_config["prompt_channel_id"])
+        if fetched_prompt:
+            custom_prompt = fetched_prompt
     else:
         custom_prompt = custom_prompts_cache.get(guild_id, "")
 
