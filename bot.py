@@ -4410,10 +4410,10 @@ async def enableticketassistant(
             "- if two rules are about the same thing, the latest one should win\n\n"
             "**Good examples:**\n"
             "`Staff applications: closed`\n"
-            '`If someone asks about applications, tell them applications are currently closed.`\n'
-            '`If someone asks how to join, tell them to read #welcome and complete the steps there.`\n'
-            '`If the user says "done", rename the ticket to waiting-review and alert HR.`\n'
-            '`If someone asks for pricing, tell them to check #pricing first.`\n\n"
+            "`If someone asks about applications, tell them applications are currently closed.`\n"
+            "`If someone asks how to join, tell them to read #welcome and complete the steps there.`\n"
+            "`If the user says \"done\", rename the ticket to waiting-review and alert HR.`\n"
+            "`If someone asks for pricing, tell them to check #pricing first.`\n\n"
             "**Tip:** keep each rule clear, short, and specific."
         ),
         color=await resolve_color_for_guild(interaction.guild.id)
