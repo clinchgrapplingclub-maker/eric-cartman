@@ -1178,8 +1178,18 @@ def find_best_category_from_text(user_text: str, current_category: str, availabl
 
 
 def normalize_ai_prompt_text(prompt_text: str) -> str:
-    return "\n".join(line.strip() for line in (prompt_text or "").splitlines() if line.strip())
-
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for raw in (prompt_text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(line)
+    return "\n".join(cleaned)
 
 def extract_prompt_directive_response(user_text: str, prompt_text: str) -> Optional[str]:
     """
@@ -2342,27 +2352,27 @@ async def load_custom_prompts():
 
 
 async def fetch_prompt_from_channel(channel_id: int) -> Optional[str]:
-    now = time.monotonic()
-    cached = ai_prompt_runtime_cache.get(channel_id)
-    if cached and now - cached[0] < 2:
-        return cached[1]
-
     channel = bot.get_channel(channel_id)
     if not isinstance(channel, discord.TextChannel):
         return None
 
-    parts: list[str] = []
     try:
-        messages = [m async for m in channel.history(limit=25, oldest_first=True)]
-        for message in messages:
-            if message.content and not message.author.bot:
-                parts.append(message.content.strip())
+        collected: list[str] = []
+        async for message in channel.history(limit=100):
+            if message.author.bot:
+                continue
+            content = (message.content or "").strip()
+            if content:
+                # history() default order is newest first, which is what we want
+                collected.append(content)
+
+        if not collected:
+            return None
+
+        # newest rules first so they override older ones when both match
+        return "\n\n".join(collected)
     except Exception:
         return None
-
-    prompt_text = "\n".join(parts).strip()
-    ai_prompt_runtime_cache[channel_id] = (now, prompt_text)
-    return prompt_text or None
 
 async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 120) -> Optional[str]:
     if not DEEPSEEK_API_KEY:
@@ -4395,14 +4405,16 @@ async def enableticketassistant(
             "This channel controls how the Ticket Assistant behaves.\n\n"
             "**How it works:**\n"
             "- the assistant reads non-bot messages in this channel\n"
-            "- put your rules here in plain English\n"
-            "- newest instructions can override older ones\n\n"
+            "- write rules in plain English\n"
+            "- newer rules are checked before older rules\n"
+            "- if two rules are about the same thing, the latest one should win\n\n"
             "**Good examples:**\n"
             "`Staff applications: closed`\n"
-            "`If someone asks to join the gang or become a member, tell them to verify in #welcome, follow all instructions, then say \"done\" in the ticket.`\n"
-            '`If the user says "done", rename the ticket to waiting-hr and call HR.`\n'
-            "`If someone asks to buy turf, tell them to join the Roblox group first.`\n\n"
-            "**Tip:** keep each rule clear and direct."
+            '`If someone asks about applications, tell them applications are currently closed.`\n'
+            '`If someone asks how to join, tell them to read #welcome and complete the steps there.`\n'
+            '`If the user says "done", rename the ticket to waiting-review and alert HR.`\n'
+            '`If someone asks for pricing, tell them to check #pricing first.`\n\n"
+            "**Tip:** keep each rule clear, short, and specific."
         ),
         color=await resolve_color_for_guild(interaction.guild.id)
     )
@@ -6505,12 +6517,331 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
     finally:
         ai_processing.discard(channel.id)
 
+
+# =========================================================
+# LIVE PROMPT + CLOSE CONFIRMATION OVERRIDES
+# =========================================================
+def ai_is_negative_reply(text: str) -> bool:
+    t = normalize_simple_text(text)
+    return t in {
+        "no", "nope", "nah", "that's all", "thats all", "nothing else",
+        "all good", "im good", "i'm good", "done", "resolved", "fixed"
+    }
+
+
+def ai_should_ask_anything_else(reply: str, *, needs_staff: bool, close_ticket: bool) -> bool:
+    if not reply or needs_staff or close_ticket:
+        return False
+    lower = normalize_simple_text(reply)
+    if "do you need anything else" in lower or "is there anything else" in lower:
+        return False
+    # don't ask after pure clarification prompts
+    if any(x in lower for x in [
+        "could you explain", "tell me exactly", "tell me what you need",
+        "what do you need help with", "could you clarify", "i still need a clear reason"
+    ]):
+        return False
+    return True
+
+
+async def refresh_prompt_cache_for_guild(guild_id: int, prompt_channel_id: int) -> str:
+    fetched_prompt = await fetch_prompt_from_channel(prompt_channel_id)
+    normalized = normalize_ai_prompt_text(fetched_prompt or "")
+    custom_prompts_cache[guild_id] = normalized
+    ai_prompt_runtime_cache[guild_id] = (asyncio.get_running_loop().time(), normalized)
+    try:
+        await update_custom_prompt(guild_id, normalized)
+    except Exception:
+        # runtime cache is enough even if DB update fails
+        pass
+    return normalized
+
+
+async def get_ai_response_advanced(
+    guild_id: int,
+    conversation: list[str],
+    user_message: str,
+    opener_name: str,
+    ticket_category: str,
+    available_categories: list[str]
+) -> dict[str, Any]:
+    ai_config = await get_ai_assistant_config(guild_id)
+
+    custom_prompt = ""
+    if ai_config and ai_config.get("prompt_channel_id"):
+        prompt_channel_id = ai_config["prompt_channel_id"]
+        cached = ai_prompt_runtime_cache.get(guild_id)
+        now = asyncio.get_running_loop().time()
+        if cached and now - cached[0] < 1.0:
+            custom_prompt = cached[1]
+        else:
+            custom_prompt = await refresh_prompt_cache_for_guild(guild_id, prompt_channel_id)
+    if not custom_prompt:
+        custom_prompt = custom_prompts_cache.get(guild_id, "") or ""
+
+    # Prompt rules have highest priority
+    structured = extract_structured_prompt_rule(user_message, custom_prompt)
+    if structured:
+        return structured
+
+    direct = extract_prompt_directive_response(user_message, custom_prompt)
+    if direct:
+        return {
+            "reply": direct[:350],
+            "close_ticket": False,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": "",
+            "rename_to": ""
+        }
+
+    lower = normalize_simple_text(user_message)
+    explicit_close = lower in ADVANCED_END_WORDS
+    categories_text = ", ".join(available_categories)
+    recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
+
+    if explicit_close:
+        return {
+            "reply": "Alright, I'll close this ticket now.",
+            "close_ticket": True,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": "",
+            "rename_to": ""
+        }
+
+    if ai_text_has_any(lower, ADVANCED_PURCHASE_WORDS):
+        return {
+            "reply": "I'll get you a staff member to help you with this.",
+            "close_ticket": False,
+            "needs_staff": True,
+            "staff_summary": "User needs help with a purchase/payment-related request.",
+            "suggested_category": "",
+            "rename_to": ai_build_short_topic_advanced(user_message)
+        }
+
+    # use model only when needed
+    system_prompt = f"""You are a highly capable Discord ticket assistant helping users BEFORE staff claim the ticket.
+
+Current ticket category: {ticket_category}
+Available categories: {categories_text}
+User name: {opener_name}
+
+You must return ONLY valid JSON.
+
+JSON format:
+{{
+  "reply": "short helpful message",
+  "close_ticket": false,
+  "needs_staff": false,
+  "staff_summary": "",
+  "suggested_category": "",
+  "rename_to": ""
+}}
+
+Rules:
+1. Respect prompt channel instructions first.
+2. Never close a ticket unless the user clearly indicates they are done.
+3. Never rename a ticket unless a real staff member needs to step in.
+4. If unsure, ask one short clarifying question instead of repeating yourself.
+5. Keep replies short, useful, natural, and non-repetitive.
+6. Never delete tickets.
+
+Prompt channel instructions:
+{custom_prompt}
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nNewest user message:\n{user_message}"}
+    ]
+
+    response = await call_deepseek_api_fast(messages, max_tokens=90)
+    parsed = extract_json_object(response or "")
+
+    if not parsed:
+        return {
+            "reply": build_non_repeating_unclear_reply(user_message, conversation[-1] if conversation else None),
+            "close_ticket": False,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": "",
+            "rename_to": ""
+        }
+
+    reply = str(parsed.get("reply", "")).strip()[:350]
+    needs_staff = bool(parsed.get("needs_staff", False))
+    staff_summary = str(parsed.get("staff_summary", "")).strip()[:200]
+    rename_to = str(parsed.get("rename_to", "")).strip()[:60] if needs_staff else ""
+    suggested_category = str(parsed.get("suggested_category", "")).strip()[:100]
+    close_ticket = bool(parsed.get("close_ticket", False)) and explicit_close
+
+    return {
+        "reply": reply or build_non_repeating_unclear_reply(user_message, conversation[-1] if conversation else None),
+        "close_ticket": close_ticket,
+        "needs_staff": needs_staff,
+        "staff_summary": staff_summary,
+        "suggested_category": suggested_category,
+        "rename_to": rename_to
+    }
+
+
+async def handle_ai_assistant_message_advanced(message: discord.Message):
+    if not DEEPSEEK_API_KEY:
+        return
+    if message.author.bot:
+        return
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+    if not isinstance(message.author, discord.Member):
+        return
+
+    guild = message.guild
+    if not guild:
+        return
+    channel = message.channel
+
+    if channel.id in ai_processing:
+        return
+
+    ticket = await get_ticket_by_channel(channel.id)
+    if not ticket or ticket["status"] == "closed" or ticket["claimed_by"] is not None:
+        return
+
+    ai_config = await get_ai_assistant_config(guild.id)
+    if not ai_config or ai_config.get("enabled") is not True:
+        return
+
+    premium_row = await get_active_premium_guild_record(guild.id)
+    if not premium_row:
+        return
+
+    config = await get_guild_config(guild.id)
+    if not config:
+        return
+
+    ai_processing.add(channel.id)
+    try:
+        state = ai_conversations.setdefault(channel.id, {
+            "messages": [],
+            "staff_alerted": False,
+            "last_response": None,
+            "last_user_text": None,
+            "close_attempted": False,
+            "awaiting_anything_else": False
+        })
+
+        user_text = message.content.strip()
+        lower = normalize_simple_text(user_text)
+
+        # If we previously asked "Do you need anything else?", wait for the user's actual answer
+        if state.get("awaiting_anything_else"):
+            state["awaiting_anything_else"] = False
+            if ai_is_negative_reply(user_text):
+                with suppress(Exception):
+                    await channel.send("Alright, I'll close this ticket now.")
+                await auto_close_ticket_by_ai(channel, guild, "User said they do not need anything else.")
+                await delete_ticket_memory(channel.id)
+                cleanup_ticket_channel_lock(channel.id)
+                return
+            # User asked something new or said yes: continue normally, do not auto-close
+
+        if state.get("last_user_text") == lower and len(lower) <= 6:
+            return
+        state["last_user_text"] = lower
+
+        state["messages"].append(f"User: {user_text}")
+        state["messages"] = state["messages"][-24:]
+
+        summary = await summarize_for_memory(state["messages"], user_text)
+        await upsert_ticket_memory(channel.id, guild.id, summary, build_smart_topic_from_text(user_text))
+
+        ticket_options = await get_ticket_options(guild.id)
+        available_categories = [opt["label"] for opt in ticket_options]
+
+        ai_data = await get_ai_response_advanced(
+            guild.id,
+            state["messages"],
+            user_text,
+            message.author.display_name,
+            ticket["option_label"],
+            available_categories
+        )
+
+        reply = (ai_data.get("reply") or "").strip()
+        close_ticket = bool(ai_data.get("close_ticket", False))
+        needs_staff = bool(ai_data.get("needs_staff", False))
+        staff_summary = (ai_data.get("staff_summary") or "").strip()
+        rename_to = (ai_data.get("rename_to") or "").strip()
+
+        if reply and state.get("last_response") == reply:
+            reply = build_non_repeating_unclear_reply(user_text, state.get("last_response"))
+
+        if needs_staff and rename_to:
+            await maybe_rename_ticket_from_ai(channel, rename_to)
+
+        if reply:
+            with suppress(Exception):
+                await channel.send(reply)
+            state["messages"].append(f"Bot: {reply}")
+            state["last_response"] = reply
+
+        if needs_staff and not state.get("staff_alerted"):
+            opener_member = await try_fetch_member(guild, ticket["opener_id"])
+            enriched = ultra_build_staff_summary(user_text, summary)
+            if opener_member and ai_config.get("alert_channel_id"):
+                await send_staff_alert(
+                    guild=guild,
+                    ticket_channel=channel,
+                    opener=opener_member,
+                    summary=enriched,
+                    support_role_id=config["support_role_id"],
+                    alert_channel_id=ai_config["alert_channel_id"]
+                )
+                state["staff_alerted"] = True
+
+            await send_log(
+                guild,
+                "AI Requested Staff",
+                f"Channel: {channel.mention}\nSummary: {enriched}"
+            )
+            return
+
+        # Ask before closing; do not instantly close after a normal answer
+        if not needs_staff and not close_ticket and ai_should_ask_anything_else(reply, needs_staff=needs_staff, close_ticket=close_ticket):
+            state["awaiting_anything_else"] = True
+            with suppress(Exception):
+                await channel.send("Do you need anything else?")
+            state["last_response"] = "Do you need anything else?"
+            return
+
+        if close_ticket and not state.get("close_attempted"):
+            state["close_attempted"] = True
+            await auto_close_ticket_by_ai(channel, guild, "Conversation completed.")
+            await delete_ticket_memory(channel.id)
+            cleanup_ticket_channel_lock(channel.id)
+
+    except Exception as e:
+        log.exception("Advanced AI assistant failed in channel %s: %s", channel.id, e)
+    finally:
+        ai_processing.discard(channel.id)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    await handle_ai_assistant_message_advanced(message)
+    if not isinstance(message.channel, discord.TextChannel):
+        return
 
+    guild = message.guild
+    if guild:
+        ai_config = await get_ai_assistant_config(guild.id)
+        if ai_config and ai_config.get("prompt_channel_id") == message.channel.id:
+            await refresh_prompt_cache_for_guild(guild.id, message.channel.id)
+            return
+
+    await handle_ai_assistant_message_advanced(message)
 
 # =========================================================
 # MAIN
