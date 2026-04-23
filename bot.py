@@ -1195,16 +1195,18 @@ def extract_prompt_directive_response(user_text: str, prompt_text: str) -> Optio
     """
     Supports patterns like:
     - Staff applications: closed
-    - If someone asks to become a staff tell them that staff applications are closed
-    - If someone asks to get turf tell them to join the Roblox group...
+    - Member applications: open
+    - If someone asks to become staff tell them ...
+    Newest prompt lines are checked first.
     """
     if not prompt_text:
         return None
 
-    user_lower = user_text.lower().strip()
+    user_lower = normalize_simple_text(user_text)
     lines = [line.strip() for line in prompt_text.splitlines() if line.strip()]
     colon_pairs: list[tuple[str, str]] = []
 
+    # newest-first prompt text should keep newest rules first
     for raw in lines:
         line = raw.strip()
         lower = line.lower()
@@ -1216,54 +1218,75 @@ def extract_prompt_directive_response(user_text: str, prompt_text: str) -> Optio
             if key and value:
                 colon_pairs.append((key, value))
 
-        if "if someone asks" in lower and "tell them" in lower:
+        if "if someone ask" in lower and "tell them" in lower:
             try:
-                after_asks = lower.split("if someone asks", 1)[1].strip()
-                trigger_part, response_part = after_asks.split("tell them", 1)
-                trigger_part = trigger_part.strip(" ,.-")
-                response_text = raw[raw.lower().find("tell them") + len("tell them"):].strip(" ,.-")
-                trigger_tokens = [t for t in re.findall(r"[a-z0-9]+", trigger_part) if t not in {"to", "the", "a", "an", "that"}]
-                if trigger_tokens and sum(1 for t in trigger_tokens if t in user_lower) >= max(1, min(2, len(trigger_tokens))):
-                    return response_text
+                trigger_part = re.split(r"if someone asks?|tell them", lower)
+                if len(trigger_part) >= 3:
+                    trigger = trigger_part[1].strip(" ,.-")
+                    response_text = raw[raw.lower().find("tell them") + len("tell them"):].strip(" ,.-")
+                    trigger_tokens = [t for t in re.findall(r"[a-z0-9]+", trigger) if t not in {"to", "the", "a", "an", "that", "someone"}]
+                    hit_count = sum(1 for t in trigger_tokens if t in user_lower)
+                    if trigger_tokens and hit_count >= max(1, min(2, len(trigger_tokens))):
+                        if response_text.lower().startswith("do these steps"):
+                            return None
+                        return response_text
             except Exception:
                 pass
 
+    # exact intent-aware colon matching
     for key, value in colon_pairs:
-        key_tokens = [t for t in re.findall(r"[a-z0-9]+", key) if t not in {"the", "a", "an", "to"}]
-        if key_tokens and sum(1 for t in key_tokens if t in user_lower) >= max(1, min(2, len(key_tokens))):
+        key_l = key.lower()
+        if "staff" in key_l and any(x in user_lower for x in ["staff", "staff member", "apply for staff", "become staff"]):
             if value.lower() == "closed":
-                return f"{key.title()} are closed."
+                return "Staff applications are closed right now."
             if value.lower() == "open":
-                return f"{key.title()} are open."
+                return "Staff applications are open right now."
+            return value
+        if any(x in key_l for x in ["member", "join", "application"]) and "staff" not in user_lower and any(x in user_lower for x in ["member", "join", "join the gang", "become a member"]):
+            if value.lower() == "closed":
+                return "Member applications are closed right now."
+            if value.lower() == "open":
+                return "Member applications are open right now."
             return value
 
     return None
-
 
 def classify_user_intent_for_prompt(user_text: str) -> set[str]:
     t = normalize_simple_text(user_text)
     tags: set[str] = set()
 
-    if any(x in t for x in ["join the gang", "become a member", "be a member", "join", "member"]):
-        tags.add("join_member")
-    if any(x in t for x in ["staff", "staff app", "staff application", "become staff", "apply for staff"]):
+    # staff must win over generic "member"
+    if any(x in t for x in [
+        "staff member", "become staff", "be a staff", "join staff",
+        "staff application", "staff applications", "apply for staff",
+        "i wanna become a staff", "i wanna be a staff", "hr"
+    ]):
         tags.add("staff_application")
+
+    if "staff_application" not in tags and any(x in t for x in [
+        "join the gang", "become a member", "be a member", "join the group",
+        "join group", "become member", "member application", "join member"
+    ]):
+        tags.add("join_member")
+
     if any(x in t for x in ["turf", "buy turf"]):
         tags.add("turf")
+
     if t in {"done", "finished", "i'm done", "im done"} or " done" in t:
         tags.add("done")
-    return tags
 
+    return tags
 
 def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional[dict[str, Any]]:
     """
-    Supports multi-line admin rules such as:
-    If someone asks about X, tell them to ...
-    Then optional internal workflow lines such as rename/ping HR are kept internal.
+    Multi-line rule parser.
+    Chooses the best matching block instead of the first broad match.
+    Filters out internal instructions so only user-facing lines are returned.
     """
     if not prompt_text:
         return None
 
+    user_lower = normalize_simple_text(user_text)
     intent_tags = classify_user_intent_for_prompt(user_text)
     lines = [line.rstrip() for line in prompt_text.splitlines() if line.strip()]
     blocks: list[str] = []
@@ -1281,20 +1304,36 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
     if current:
         blocks.append("\n".join(current))
 
+    best_payload = None
+    best_score = -1
+
     for block in blocks:
         low = block.lower()
-        matched = False
+        score = 0
 
-        if ("join the gang" in low or "become a member" in low or "be a member" in low or "join" in low or "member" in low) and "join_member" in intent_tags:
-            matched = True
-        if ("become a staff" in low or "staff application" in low or "staff applications" in low or "apply for staff" in low) and "staff_application" in intent_tags:
-            matched = True
-        if ("turf" in low) and "turf" in intent_tags:
-            matched = True
-        if ("say \"done\"" in low or "say 'done'" in low or "say done" in low) and "done" in intent_tags:
-            matched = True
+        if "staff_application" in intent_tags:
+            if any(x in low for x in ["become a staff", "staff application", "staff applications", "apply for staff", "staff member"]):
+                score += 100
+            if "member" in low and "staff" not in low:
+                score -= 50
 
-        if not matched:
+        if "join_member" in intent_tags:
+            if any(x in low for x in ["join the gang", "become a member", "be a member", "join the group", "member application"]):
+                score += 100
+            if "staff" in low:
+                score -= 50
+
+        if "turf" in intent_tags and "turf" in low:
+            score += 100
+
+        if "done" in intent_tags and any(x in low for x in ['say "done"', "say 'done'", "say done", "when they're done", "when their done"]):
+            score += 100
+
+        # extra keyword overlap
+        query_tokens = [t for t in re.findall(r"[a-z0-9]+", user_lower) if t not in {"i", "wanna", "want", "to", "be", "a", "the"}]
+        score += sum(1 for t in query_tokens if t in low)
+
+        if score <= 0:
             continue
 
         response_lines: list[str] = []
@@ -1308,11 +1347,10 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
 
             if i == 0 and "tell them" in line_low:
                 response_part = line[line_low.find("tell them") + len("tell them"):].strip(" :-")
-                if response_part:
+                if response_part and response_part.lower() not in {"do these steps", "follow these instructions", "follow these steps"}:
                     response_lines.append(response_part)
                 continue
 
-            # Internal workflow rules
             if any(k in line_low for k in ["rename the ticket", "rename ticket", "rename the channel"]):
                 rename_to = "hr-review" if "hr" in line_low else ai_build_short_topic_advanced(user_text)
                 continue
@@ -1322,23 +1360,33 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
                 staff_summary = "User completed the required steps and needs staff follow-up."
                 continue
 
-            # Exclude internal/admin/back-office instructions from the user reply
+            # strip internal / admin-only instructions
             if any(k in line_low for k in [
                 "then you should", "the assistant should", "rename the ticket", "rename ticket",
                 "call a hr", "ping a hr", "call hr", "ping hr", "get a hr", "notify hr",
                 "after they", "after the user", "once they", "once the user", "then get",
                 "then call", "then ping", "check so the proof is valid", "if someone opens a ticket",
-                "if someone asks for", "when their done", "when they're done", "when they are done"
+                "if someone asks for", "when their done", "when they're done", "when they are done",
+                "do these steps", "follow these steps", "follow these instructions", "steps"
             ]):
                 continue
 
-            # Keep only direct user-facing guidance
+            # keep user-facing guidance only
             response_lines.append(line)
 
-        # Keep the reply focused and short
-        reply = "\n".join(x for x in response_lines if x).strip()
+        # de-duplicate and keep concise
+        cleaned = []
+        seen = set()
+        for line in response_lines:
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(line)
+
+        reply = "\n".join(cleaned).strip()
         if reply:
-            return {
+            payload = {
                 "reply": reply[:350],
                 "close_ticket": False,
                 "needs_staff": needs_staff,
@@ -1346,8 +1394,11 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
                 "suggested_category": "",
                 "rename_to": (rename_to[:60] if needs_staff and rename_to else "")
             }
+            if score > best_score:
+                best_score = score
+                best_payload = payload
 
-    return None
+    return best_payload
 
 def build_non_repeating_unclear_reply(user_text: str, last_response: Optional[str]) -> str:
     t = normalize_simple_text(user_text)
@@ -5471,7 +5522,6 @@ async def get_ai_response_advanced(
 
     lower = normalize_simple_text(user_message)
 
-    # Simple greeting must stay simple.
     if lower in {"hi", "hello", "hey", "yo"}:
         return {
             "reply": "Hello! How can I help you today?",
@@ -5482,7 +5532,6 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    # Prompt rules first for actual questions
     structured = extract_structured_prompt_rule(user_message, custom_prompt)
     if structured:
         return structured
@@ -5554,10 +5603,9 @@ Rules:
 1. Answer only the user's actual question.
 2. Do not include unrelated extra info.
 3. Never auto-close unless the user clearly indicates they are done.
-4. If your reply asks a follow-up question like "Do you need anything else?" then close_ticket must be false.
-5. Respect prompt channel instructions exactly when they apply.
-6. Only set rename_to if a real staff member needs to step in.
-7. Never delete tickets.
+4. Respect prompt channel instructions exactly when they apply.
+5. Only set rename_to if a real staff member needs to step in.
+6. Never copy internal admin workflow text to the user.
 
 Prompt channel instructions:
 {custom_prompt}
@@ -5586,14 +5634,10 @@ Prompt channel instructions:
     staff_summary = str(parsed.get("staff_summary", "")).strip()[:200]
     rename_to = str(parsed.get("rename_to", "")).strip()[:60] if needs_staff else ""
     suggested_category = str(parsed.get("suggested_category", "")).strip()[:100]
-    close_ticket = bool(parsed.get("close_ticket", False)) and explicit_close
-
-    if "anything else" in reply.lower() or "can i help with anything else" in reply.lower() or "is there anything else" in reply.lower():
-        close_ticket = False
 
     return {
         "reply": reply,
-        "close_ticket": close_ticket,
+        "close_ticket": False,
         "needs_staff": needs_staff,
         "staff_summary": staff_summary,
         "suggested_category": suggested_category,
@@ -5648,7 +5692,6 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         user_text = message.content.strip()
         lower = normalize_simple_text(user_text)
 
-        # After "Do you need anything else?"
         if state.get("awaiting_anything_else"):
             state["awaiting_anything_else"] = False
             if ai_is_negative_reply(user_text):
@@ -5663,7 +5706,6 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
                     await channel.send("Okay, what more can I do for you?")
                 state["last_response"] = "Okay, what more can I do for you?"
                 return
-            # Otherwise continue normally as a new question
 
         if state.get("last_user_text") == lower and len(lower) <= 6:
             return
@@ -5696,8 +5738,9 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         if not reply:
             reply = build_non_repeating_unclear_reply(user_text, state.get("last_response"))
 
+        # don't repeat same answer; ask open follow-up instead
         if reply and state.get("last_response") == reply:
-            reply = build_non_repeating_unclear_reply(user_text, state.get("last_response"))
+            reply = "Okay, what more can I do for you?"
 
         if reply:
             with suppress(Exception):
@@ -5725,7 +5768,7 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
             await send_log(guild, "AI Requested Staff", f"Channel: {channel.mention}\nSummary: {summary}")
             return
 
-        if reply and ai_should_ask_anything_else(reply, needs_staff=needs_staff, close_ticket=close_ticket):
+        if ai_should_ask_anything_else(reply, needs_staff=needs_staff, close_ticket=close_ticket):
             state["awaiting_anything_else"] = True
             with suppress(Exception):
                 await channel.send("Do you need anything else?")
@@ -5739,7 +5782,7 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
             cleanup_ticket_channel_lock(channel.id)
 
     except Exception as e:
-        log.exception("Ultra AI assistant failed in channel %s: %s", channel.id, e)
+        log.exception("Advanced AI assistant failed in channel %s: %s", channel.id, e)
     finally:
         ai_processing.discard(channel.id)
 
