@@ -1258,10 +1258,8 @@ def classify_user_intent_for_prompt(user_text: str) -> set[str]:
 def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional[dict[str, Any]]:
     """
     Supports multi-line admin rules such as:
-    If someone ask to join the gang or to become a member, tell them to ...
-    ...more lines...
-    ...when they're done they should ping the ticket bot and say "done"
-    ...then you should rename the ticket and call a HR...
+    If someone asks about X, tell them to ...
+    Then optional internal workflow lines such as rename/ping HR are kept internal.
     """
     if not prompt_text:
         return None
@@ -1278,9 +1276,8 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
                 blocks.append("\n".join(current))
                 current = []
             current.append(line.strip())
-        else:
-            if current:
-                current.append(line.strip())
+        elif current:
+            current.append(line.strip())
     if current:
         blocks.append("\n".join(current))
 
@@ -1288,9 +1285,9 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
         low = block.lower()
         matched = False
 
-        if ("join the gang" in low or "become a member" in low or "member" in low) and "join_member" in intent_tags:
+        if ("join the gang" in low or "become a member" in low or "be a member" in low or "join" in low or "member" in low) and "join_member" in intent_tags:
             matched = True
-        if ("become a staff" in low or "staff application" in low or "staff applications" in low) and "staff_application" in intent_tags:
+        if ("become a staff" in low or "staff application" in low or "staff applications" in low or "apply for staff" in low) and "staff_application" in intent_tags:
             matched = True
         if ("turf" in low) and "turf" in intent_tags:
             matched = True
@@ -1315,23 +1312,30 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
                     response_lines.append(response_part)
                 continue
 
+            # Internal workflow rules
             if any(k in line_low for k in ["rename the ticket", "rename ticket", "rename the channel"]):
                 rename_to = "hr-review" if "hr" in line_low else ai_build_short_topic_advanced(user_text)
                 continue
 
-            if any(k in line_low for k in ["call a hr", "ping a hr", "call hr", "ping hr", "get a hr", "notify hr"]):
+            if any(k in line_low for k in ["call a hr", "ping a hr", "call hr", "ping hr", "get a hr", "notify hr", "get a staff member", "alert hr"]):
                 needs_staff = True
-                staff_summary = "User completed membership/application steps and needs HR follow-up."
+                staff_summary = "User completed the required steps and needs staff follow-up."
                 continue
 
-            # Only keep actual user-facing instruction lines, not internal workflow lines
-            if not any(k in line_low for k in [
+            # Exclude internal/admin/back-office instructions from the user reply
+            if any(k in line_low for k in [
                 "then you should", "the assistant should", "rename the ticket", "rename ticket",
-                "call a hr", "ping a hr", "call hr", "ping hr", "get a hr", "notify hr"
+                "call a hr", "ping a hr", "call hr", "ping hr", "get a hr", "notify hr",
+                "after they", "after the user", "once they", "once the user", "then get",
+                "then call", "then ping", "check so the proof is valid", "if someone opens a ticket",
+                "if someone asks for", "when their done", "when they're done", "when they are done"
             ]):
-                response_lines.append(line)
+                continue
 
-        # Keep the answer focused on the asked thing only
+            # Keep only direct user-facing guidance
+            response_lines.append(line)
+
+        # Keep the reply focused and short
         reply = "\n".join(x for x in response_lines if x).strip()
         if reply:
             return {
@@ -5467,7 +5471,7 @@ async def get_ai_response_advanced(
 
     lower = normalize_simple_text(user_message)
 
-    # Greeting should stay simple and never pull unrelated prompt rules.
+    # Simple greeting must stay simple.
     if lower in {"hi", "hello", "hey", "yo"}:
         return {
             "reply": "Hello! How can I help you today?",
@@ -5637,17 +5641,40 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
             "staff_alerted": False,
             "last_response": None,
             "last_user_text": None,
-            "close_attempted": False
+            "close_attempted": False,
+            "awaiting_anything_else": False
         })
 
         user_text = message.content.strip()
         lower = normalize_simple_text(user_text)
+
+        # After "Do you need anything else?"
+        if state.get("awaiting_anything_else"):
+            state["awaiting_anything_else"] = False
+            if ai_is_negative_reply(user_text):
+                with suppress(Exception):
+                    await channel.send("Alright, I'll close this ticket now.")
+                await auto_close_ticket_by_ai(channel, guild, "User said they do not need anything else.")
+                await delete_ticket_memory(channel.id)
+                cleanup_ticket_channel_lock(channel.id)
+                return
+            if ai_is_affirmative_reply(user_text):
+                with suppress(Exception):
+                    await channel.send("Okay, what more can I do for you?")
+                state["last_response"] = "Okay, what more can I do for you?"
+                return
+            # Otherwise continue normally as a new question
 
         if state.get("last_user_text") == lower and len(lower) <= 6:
             return
         state["last_user_text"] = lower
 
         state["messages"].append(f"User: {user_text}")
+        state["messages"] = state["messages"][-24:]
+
+        summary = await summarize_for_memory(state["messages"], user_text)
+        await upsert_ticket_memory(channel.id, guild.id, ticket["opener_id"], summary)
+
         ticket_options = await get_ticket_options(guild.id)
         available_categories = [opt["label"] for opt in ticket_options]
 
@@ -5676,9 +5703,9 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
             with suppress(Exception):
                 await channel.send(reply)
             state["messages"].append(f"Bot: {reply}")
+            state["messages"] = state["messages"][-24:]
             state["last_response"] = reply
 
-        # Only rename when real human help is needed
         if needs_staff and rename_to:
             await maybe_rename_ticket_from_ai(channel, rename_to)
 
@@ -5698,13 +5725,21 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
             await send_log(guild, "AI Requested Staff", f"Channel: {channel.mention}\nSummary: {summary}")
             return
 
+        if reply and ai_should_ask_anything_else(reply, needs_staff=needs_staff, close_ticket=close_ticket):
+            state["awaiting_anything_else"] = True
+            with suppress(Exception):
+                await channel.send("Do you need anything else?")
+            state["last_response"] = "Do you need anything else?"
+            return
+
         if close_ticket and not state.get("close_attempted"):
             state["close_attempted"] = True
             await auto_close_ticket_by_ai(channel, guild, "Conversation completed.")
+            await delete_ticket_memory(channel.id)
             cleanup_ticket_channel_lock(channel.id)
 
     except Exception as e:
-        log.exception("Advanced AI assistant failed in channel %s: %s", channel.id, e)
+        log.exception("Ultra AI assistant failed in channel %s: %s", channel.id, e)
     finally:
         ai_processing.discard(channel.id)
 
@@ -6539,6 +6574,13 @@ def ai_is_negative_reply(text: str) -> bool:
         "all good", "im good", "i'm good", "done", "resolved", "fixed"
     }
 
+
+
+def ai_is_affirmative_reply(text: str) -> bool:
+    t = normalize_simple_text(text)
+    return t in {
+        "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "ye", "affirmative"
+    }
 
 def ai_should_ask_anything_else(reply: str, *, needs_staff: bool, close_ticket: bool) -> bool:
     if not reply or needs_staff or close_ticket:
