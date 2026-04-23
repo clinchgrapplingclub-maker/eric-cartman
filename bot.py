@@ -1256,7 +1256,6 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
     if not prompt_text:
         return None
 
-    user_lower = normalize_simple_text(user_text)
     intent_tags = classify_user_intent_for_prompt(user_text)
     lines = [line.rstrip() for line in prompt_text.splitlines() if line.strip()]
     blocks: list[str] = []
@@ -1266,14 +1265,14 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
         low = line.lower().strip()
         if low.startswith("if someone ask") or low.startswith("if someone asks"):
             if current:
-                blocks.append("\\n".join(current))
+                blocks.append("\n".join(current))
                 current = []
             current.append(line.strip())
         else:
             if current:
                 current.append(line.strip())
     if current:
-        blocks.append("\\n".join(current))
+        blocks.append("\n".join(current))
 
     for block in blocks:
         low = block.lower()
@@ -1296,9 +1295,10 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
         needs_staff = False
         staff_summary = ""
 
-        block_lines = [x.strip() for x in block.split("\\n") if x.strip()]
+        block_lines = [x.strip() for x in block.split("\n") if x.strip()]
         for i, line in enumerate(block_lines):
             line_low = line.lower()
+
             if i == 0 and "tell them" in line_low:
                 response_part = line[line_low.find("tell them") + len("tell them"):].strip(" :-")
                 if response_part:
@@ -1307,15 +1307,22 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
 
             if any(k in line_low for k in ["rename the ticket", "rename ticket", "rename the channel"]):
                 rename_to = "hr-review" if "hr" in line_low else ai_build_short_topic_advanced(user_text)
+                continue
 
             if any(k in line_low for k in ["call a hr", "ping a hr", "call hr", "ping hr", "get a hr", "notify hr"]):
                 needs_staff = True
                 staff_summary = "User completed membership/application steps and needs HR follow-up."
+                continue
 
-            if not any(k in line_low for k in ["rename the ticket", "rename ticket", "call a hr", "ping a hr", "call hr", "ping hr", "get a hr", "notify hr"]):
+            # Only keep actual user-facing instruction lines, not internal workflow lines
+            if not any(k in line_low for k in [
+                "then you should", "the assistant should", "rename the ticket", "rename ticket",
+                "call a hr", "ping a hr", "call hr", "ping hr", "get a hr", "notify hr"
+            ]):
                 response_lines.append(line)
 
-        reply = "\\n".join(x for x in response_lines if x).strip()
+        # Keep the answer focused on the asked thing only
+        reply = "\n".join(x for x in response_lines if x).strip()
         if reply:
             return {
                 "reply": reply[:350],
@@ -1323,11 +1330,10 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
                 "needs_staff": needs_staff,
                 "staff_summary": staff_summary[:200],
                 "suggested_category": "",
-                "rename_to": (rename_to or ai_build_short_topic_advanced(user_text))[:60]
+                "rename_to": (rename_to[:60] if needs_staff and rename_to else "")
             }
 
     return None
-
 
 def build_non_repeating_unclear_reply(user_text: str, last_response: Optional[str]) -> str:
     t = normalize_simple_text(user_text)
@@ -5448,7 +5454,7 @@ async def get_ai_response_advanced(
     if not custom_prompt:
         custom_prompt = custom_prompts_cache.get(guild_id, "") or ""
 
-    # 1) Strong deterministic prompt-channel rules first
+    # Prompt rules first
     structured = extract_structured_prompt_rule(user_message, custom_prompt)
     if structured:
         return structured
@@ -5461,7 +5467,7 @@ async def get_ai_response_advanced(
             "needs_staff": False,
             "staff_summary": "",
             "suggested_category": "",
-            "rename_to": ai_build_short_topic_advanced(user_message)
+            "rename_to": ""
         }
 
     lower = normalize_simple_text(user_message)
@@ -5469,7 +5475,6 @@ async def get_ai_response_advanced(
     categories_text = ", ".join(available_categories)
     recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
 
-    # 2) Deterministic fast paths to avoid slow guessing + spam
     if explicit_close:
         return {
             "reply": "Alright, I'll close this ticket now.",
@@ -5490,7 +5495,6 @@ async def get_ai_response_advanced(
             "rename_to": ai_build_short_topic_advanced(user_message)
         }
 
-    # If the message is too short/unclear, don't call the model — reply deterministically
     if len(lower) < 5 or len(re.findall(r"[a-z0-9]+", lower)) <= 1:
         return {
             "reply": "",
@@ -5522,10 +5526,11 @@ JSON format:
 Rules:
 1. Keep the reply short, useful, and non-repetitive.
 2. Never auto-close unless the user clearly indicates they are done.
-3. Respect prompt channel instructions exactly when they apply.
-4. If unsure, ask one short clarifying question instead of repeating yourself.
-5. If the request needs staff, set needs_staff=true and provide a short staff_summary.
-6. Never delete tickets. Only close_ticket may be true.
+3. If your reply asks a follow-up question like "Is there anything else..." then close_ticket must be false.
+4. Respect prompt channel instructions exactly when they apply.
+5. If unsure, ask one short clarifying question instead of repeating yourself.
+6. Only set rename_to if a real staff member needs to step in.
+7. Never delete tickets. Only close_ticket may be true.
 
 Prompt channel instructions:
 {custom_prompt}
@@ -5552,12 +5557,16 @@ Prompt channel instructions:
     reply = str(parsed.get("reply", "")).strip()[:350]
     needs_staff = bool(parsed.get("needs_staff", False))
     staff_summary = str(parsed.get("staff_summary", "")).strip()[:200]
-    rename_to = str(parsed.get("rename_to", "")).strip()[:60]
+    rename_to = str(parsed.get("rename_to", "")).strip()[:60] if needs_staff else ""
     suggested_category = str(parsed.get("suggested_category", "")).strip()[:100]
+    close_ticket = bool(parsed.get("close_ticket", False)) and explicit_close
+
+    if "anything else" in reply.lower() or "can i help with anything else" in reply.lower() or "is there anything else" in reply.lower():
+        close_ticket = False
 
     return {
         "reply": reply,
-        "close_ticket": False,
+        "close_ticket": close_ticket,
         "needs_staff": needs_staff,
         "staff_summary": staff_summary,
         "suggested_category": suggested_category,
@@ -5611,7 +5620,6 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         user_text = message.content.strip()
         lower = normalize_simple_text(user_text)
 
-        # Don't spam if the exact same short unclear message repeats
         if state.get("last_user_text") == lower and len(lower) <= 6:
             return
         state["last_user_text"] = lower
@@ -5638,7 +5646,6 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         if not reply:
             reply = build_non_repeating_unclear_reply(user_text, state.get("last_response"))
 
-        # prevent same reply spam
         if reply and state.get("last_response") == reply:
             reply = build_non_repeating_unclear_reply(user_text, state.get("last_response"))
 
@@ -5648,7 +5655,8 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
             state["messages"].append(f"Bot: {reply}")
             state["last_response"] = reply
 
-        if rename_to:
+        # Only rename when real human help is needed
+        if needs_staff and rename_to:
             await maybe_rename_ticket_from_ai(channel, rename_to)
 
         if needs_staff and not state.get("staff_alerted"):
