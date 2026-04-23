@@ -1348,13 +1348,12 @@ def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional
 def build_non_repeating_unclear_reply(user_text: str, last_response: Optional[str]) -> str:
     t = normalize_simple_text(user_text)
     if t in {"hi", "hello", "hey", "yo"}:
-        return "Tell me what you need help with, for example support, buying turf, or applications."
+        return "Hello! How can I help you today?"
     if len(t) <= 4:
-        return "Tell me exactly what you need help with so I can guide you properly."
-    if last_response and "Tell me" in last_response:
-        return "I still need a clear reason for the ticket, like support, membership, purchase, or report."
-    return "Could you explain exactly what you need help with?"
-
+        return "Tell me what you need help with."
+    if last_response and "Tell me what you need help with" in last_response:
+        return "Please tell me exactly what you need help with."
+    return "Could you explain what you need help with?"
 
 async def generate_unique_premium_keys(amount: int, duration_code: str, created_by: int) -> list[str]:
     keys: list[str] = []
@@ -5466,7 +5465,20 @@ async def get_ai_response_advanced(
     if not custom_prompt:
         custom_prompt = custom_prompts_cache.get(guild_id, "") or ""
 
-    # Prompt rules first
+    lower = normalize_simple_text(user_message)
+
+    # Greeting should stay simple and never pull unrelated prompt rules.
+    if lower in {"hi", "hello", "hey", "yo"}:
+        return {
+            "reply": "Hello! How can I help you today?",
+            "close_ticket": False,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": "",
+            "rename_to": ""
+        }
+
+    # Prompt rules first for actual questions
     structured = extract_structured_prompt_rule(user_message, custom_prompt)
     if structured:
         return structured
@@ -5482,7 +5494,6 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    lower = normalize_simple_text(user_message)
     explicit_close = lower in ADVANCED_END_WORDS
     categories_text = ", ".join(available_categories)
     recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
@@ -5536,13 +5547,13 @@ JSON format:
 }}
 
 Rules:
-1. Keep the reply short, useful, and non-repetitive.
-2. Never auto-close unless the user clearly indicates they are done.
-3. If your reply asks a follow-up question like "Is there anything else..." then close_ticket must be false.
-4. Respect prompt channel instructions exactly when they apply.
-5. If unsure, ask one short clarifying question instead of repeating yourself.
+1. Answer only the user's actual question.
+2. Do not include unrelated extra info.
+3. Never auto-close unless the user clearly indicates they are done.
+4. If your reply asks a follow-up question like "Do you need anything else?" then close_ticket must be false.
+5. Respect prompt channel instructions exactly when they apply.
 6. Only set rename_to if a real staff member needs to step in.
-7. Never delete tickets. Only close_ticket may be true.
+7. Never delete tickets.
 
 Prompt channel instructions:
 {custom_prompt}
@@ -6532,17 +6543,31 @@ def ai_is_negative_reply(text: str) -> bool:
 def ai_should_ask_anything_else(reply: str, *, needs_staff: bool, close_ticket: bool) -> bool:
     if not reply or needs_staff or close_ticket:
         return False
+
     lower = normalize_simple_text(reply)
+
     if "do you need anything else" in lower or "is there anything else" in lower:
         return False
-    # don't ask after pure clarification prompts
+
+    # Never ask after greetings or clarification prompts
     if any(x in lower for x in [
-        "could you explain", "tell me exactly", "tell me what you need",
-        "what do you need help with", "could you clarify", "i still need a clear reason"
+        "hello! how can i help you today",
+        "how can i help you today",
+        "tell me what you need help with",
+        "please tell me exactly what you need help with",
+        "could you explain what you need help with",
+        "could you explain", "could you clarify"
     ]):
         return False
-    return True
 
+    # Ask only after a concrete answer/instruction was given
+    if any(x in lower for x in [
+        "are closed", "are open", "is closed", "is open",
+        "please follow", "check", "read", "apply", "contact", "currently"
+    ]):
+        return True
+
+    return False
 
 async def refresh_prompt_cache_for_guild(guild_id: int, prompt_channel_id: int) -> str:
     fetched_prompt = await fetch_prompt_from_channel(prompt_channel_id)
