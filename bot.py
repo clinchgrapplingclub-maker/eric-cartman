@@ -1252,30 +1252,118 @@ def extract_prompt_directive_response(user_text: str, prompt_text: str) -> Optio
 
     return None
 
-def ai_get_hard_intent(user_text: str) -> str:
+
+def ai_detect_user_intent(user_text: str) -> str:
     t = normalize_simple_text(user_text)
-    if t in {"hi", "hello", "hey", "yo"}:
+
+    if t in {"hi", "hello", "hey", "yo", "sup"}:
         return "greeting"
-    if any(p in t for p in [
-        "staff member", "become a staff", "become staff", "be a staff",
-        "join staff", "staff application", "staff applications", "staff app",
-        "apply for staff", "i wanna become a staff", "i want to become a staff",
-        "i wanna be a staff", "i want to be a staff", "can i become staff",
-        "can i be staff", "moderator", "admin application"
+
+    if t in {"no", "nope", "nah", "nothing else", "all good", "no thank you", "no thanks", "thats all", "that's all"}:
+        return "negative_close"
+
+    if t in {"yes", "yeah", "yep", "sure", "ok", "okay"}:
+        return "yes_continue"
+
+    if any(x in t for x in ["sent proof", "i sent proof", "proof sent", "done", "finished", "i did it", "i have done it", "i completed"]):
+        return "proof_done"
+
+    if any(x in t for x in [
+        "staff member", "staff team", "become staff", "become a staff", "be a staff",
+        "join staff", "staff application", "staff applications", "apply for staff",
+        "can i be staff", "can i become staff", "how can i become staff"
     ]) or "staff" in t:
         return "staff"
-    if any(p in t for p in [
-        "become a member", "be a member", "join the gang", "join the group",
-        "join group", "become member", "member application", "join member",
-        "how do i join", "how can i join", "i want to join", "i wanna join"
-    ]) or ("member" in t and "staff" not in t):
+
+    if any(x in t for x in [
+        "become a member", "be member", "be a member", "join the gang",
+        "join the group", "join group", "become member", "how can i join",
+        "how do i join", "i wanna join", "i want to join", "member"
+    ]):
         return "member"
-    if any(x in t for x in ["turf", "buy turf"]):
-        return "turf"
-    if t in {"done", "finished", "i'm done", "im done"} or " done" in t:
-        return "done"
+
+    if any(x in t for x in ["buy", "purchase", "payment", "donate", "refund", "premium", "vip", "turf"]):
+        return "purchase"
+
     return "unknown"
 
+
+def prompt_lines_for_intent(prompt_text: str, intent: str) -> list[str]:
+    if not prompt_text:
+        return []
+
+    lines = [l.strip() for l in prompt_text.splitlines() if l.strip()]
+    selected: list[str] = []
+
+    for line in lines:
+        low = line.lower()
+
+        if intent == "staff":
+            if "staff" in low and not any(x in low for x in ["if someone asks", "if someone ask", "then you", "rename", "call hr", "ping hr"]):
+                selected.append(line)
+
+        elif intent == "member":
+            if any(x in low for x in ["member", "join", "group", "proof", "verify", "display"]) and "staff" not in low:
+                if not any(x in low for x in ["if someone asks", "if someone ask", "then you", "rename", "call hr", "ping hr", "once they", "after they", "check so"]):
+                    selected.append(line)
+
+    cleaned = []
+    seen = set()
+    for line in selected:
+        line = re.sub(r"^tell them to\s+", "", line, flags=re.I).strip()
+        line = re.sub(r"^tell them that\s+", "", line, flags=re.I).strip()
+        if not line:
+            continue
+        key = line.lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(line)
+
+    return cleaned[:5]
+
+
+def build_member_steps_reply(prompt_text: str) -> str:
+    lines = prompt_lines_for_intent(prompt_text, "member")
+    if lines:
+        body = "\n".join(f"- {line}" for line in lines)
+        return f"Sure! Here are the steps:\n{body}\n\nSend proof here once you're finished."
+
+    return "Sure! Follow the member instructions, then send proof here once you're finished."
+
+
+def build_staff_reply(prompt_text: str) -> str:
+    direct = extract_prompt_directive_response("staff applications", prompt_text)
+    if direct:
+        return direct
+
+    lines = prompt_lines_for_intent(prompt_text, "staff")
+    for line in lines:
+        low = line.lower()
+        if "closed" in low:
+            return "Unfortunately, staff applications are closed right now. It will be announced when they open again, so stay tuned!"
+        if "open" in low:
+            return "Staff applications are open right now. Please follow the application instructions."
+
+    return "Unfortunately, staff applications are closed right now. It will be announced when they open again, so stay tuned!"
+
+
+def build_anything_else_question() -> str:
+    return "Anything else before I close?"
+
+
+def ai_get_hard_intent(user_text: str) -> str:
+    detected = ai_detect_user_intent(user_text)
+    if detected == "staff":
+        return "staff"
+    if detected == "member":
+        return "member"
+    if detected == "purchase":
+        return "turf"
+    if detected == "proof_done":
+        return "done"
+    if detected == "greeting":
+        return "greeting"
+    return "unknown"
 
 def prompt_block_matches_intent(block: str, intent: str) -> bool:
     low = block.lower()
@@ -5552,12 +5640,11 @@ async def get_ai_response_advanced(
     if not custom_prompt:
         custom_prompt = custom_prompts_cache.get(guild_id, "") or ""
 
-    lower = normalize_simple_text(user_message)
-    intent = ai_get_hard_intent(user_message)
+    intent = ai_detect_user_intent(user_message)
 
     if intent == "greeting":
         return {
-            "reply": "Hello! How can I help you today?",
+            "reply": "Hi! How can I help you?",
             "close_ticket": False,
             "needs_staff": False,
             "staff_summary": "",
@@ -5565,10 +5652,9 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    direct = extract_prompt_directive_response(user_message, custom_prompt)
-    if direct:
+    if intent == "member":
         return {
-            "reply": direct[:350],
+            "reply": build_member_steps_reply(custom_prompt),
             "close_ticket": False,
             "needs_staff": False,
             "staff_summary": "",
@@ -5576,11 +5662,27 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    structured = extract_structured_prompt_rule(user_message, custom_prompt)
-    if structured:
-        return structured
+    if intent == "staff":
+        return {
+            "reply": build_staff_reply(custom_prompt),
+            "close_ticket": False,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": "",
+            "rename_to": ""
+        }
 
-    if lower in ADVANCED_END_WORDS:
+    if intent == "proof_done":
+        return {
+            "reply": "Alright, I'll get a staff member to double-check it and help finish this.",
+            "close_ticket": False,
+            "needs_staff": True,
+            "staff_summary": "User says they completed the required steps and sent proof.",
+            "suggested_category": "",
+            "rename_to": "waiting-review"
+        }
+
+    if intent == "negative_close":
         return {
             "reply": "Alright, I'll close this ticket now.",
             "close_ticket": True,
@@ -5590,7 +5692,7 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    if ai_text_has_any(lower, ADVANCED_PURCHASE_WORDS):
+    if intent == "purchase":
         return {
             "reply": "I'll get you a staff member to help you with this.",
             "close_ticket": False,
@@ -5600,62 +5702,13 @@ async def get_ai_response_advanced(
             "rename_to": ai_build_short_topic_advanced(user_message)
         }
 
-    if len(lower) < 5 or len(re.findall(r"[a-z0-9]+", lower)) <= 1:
-        return {
-            "reply": "",
-            "close_ticket": False,
-            "needs_staff": False,
-            "staff_summary": "",
-            "suggested_category": "",
-            "rename_to": ""
-        }
-
-    categories_text = ", ".join(available_categories)
-    recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
-    system_prompt = f"""You are a Discord ticket assistant.
-Answer only the user's exact question. Do not include unrelated rules.
-Never treat staff member as regular member.
-Return ONLY JSON:
-{{
-  "reply": "short answer",
-  "close_ticket": false,
-  "needs_staff": false,
-  "staff_summary": "",
-  "suggested_category": "",
-  "rename_to": ""
-}}
-
-Current category: {ticket_category}
-Available categories: {categories_text}
-Prompt rules:
-{custom_prompt}
-"""
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nNewest user message:\n{user_message}"}
-    ]
-
-    response = await call_deepseek_api_fast(messages, max_tokens=100)
-    parsed = extract_json_object(response or "")
-
-    if not parsed:
-        return {
-            "reply": "",
-            "close_ticket": False,
-            "needs_staff": False,
-            "staff_summary": "",
-            "suggested_category": "",
-            "rename_to": ""
-        }
-
     return {
-        "reply": str(parsed.get("reply", "")).strip()[:350],
+        "reply": "Tell me what you need help with.",
         "close_ticket": False,
-        "needs_staff": bool(parsed.get("needs_staff", False)),
-        "staff_summary": str(parsed.get("staff_summary", "")).strip()[:200],
-        "suggested_category": str(parsed.get("suggested_category", "")).strip()[:100],
-        "rename_to": str(parsed.get("rename_to", "")).strip()[:60] if bool(parsed.get("needs_staff", False)) else ""
+        "needs_staff": False,
+        "staff_summary": "",
+        "suggested_category": "",
+        "rename_to": ""
     }
 
 async def handle_ai_assistant_message_advanced(message: discord.Message):
@@ -5700,22 +5753,26 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
             "last_response": None,
             "last_user_text": None,
             "close_attempted": False,
-            "awaiting_anything_else": False
+            "awaiting_anything_else": False,
+            "flow": None
         })
 
         user_text = message.content.strip()
         lower = normalize_simple_text(user_text)
+        intent = ai_detect_user_intent(user_text)
 
         if state.get("awaiting_anything_else"):
             state["awaiting_anything_else"] = False
-            if ai_is_negative_reply(user_text):
+
+            if intent == "negative_close" or ai_is_negative_reply(user_text):
                 with suppress(Exception):
                     await channel.send("Alright, I'll close this ticket now.")
                 await auto_close_ticket_by_ai(channel, guild, "User said they do not need anything else.")
                 await delete_ticket_memory(channel.id)
                 cleanup_ticket_channel_lock(channel.id)
                 return
-            if ai_is_affirmative_reply(user_text):
+
+            if intent == "yes_continue" or ai_is_affirmative_reply(user_text):
                 with suppress(Exception):
                     await channel.send("Okay, what more can I do for you?")
                 state["last_response"] = "Okay, what more can I do for you?"
@@ -5727,9 +5784,6 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
 
         state["messages"].append(f"User: {user_text}")
         state["messages"] = state["messages"][-24:]
-
-        summary = await summarize_for_memory(state["messages"], user_text)
-        await upsert_ticket_memory(channel.id, guild.id, ticket["opener_id"], summary)
 
         ticket_options = await get_ticket_options(guild.id)
         available_categories = [opt["label"] for opt in ticket_options]
@@ -5750,9 +5804,8 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         rename_to = ai_data.get("rename_to", "").strip()
 
         if not reply:
-            reply = build_non_repeating_unclear_reply(user_text, state.get("last_response"))
+            reply = "Tell me what you need help with."
 
-        # don't repeat same answer; ask open follow-up instead
         if reply and state.get("last_response") == reply:
             reply = "Okay, what more can I do for you?"
 
@@ -5780,13 +5833,18 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
                 )
                 state["staff_alerted"] = True
             await send_log(guild, "AI Requested Staff", f"Channel: {channel.mention}\nSummary: {summary}")
-            return
 
-        if ai_should_ask_anything_else(reply, needs_staff=needs_staff, close_ticket=close_ticket):
             state["awaiting_anything_else"] = True
             with suppress(Exception):
-                await channel.send("Do you need anything else?")
-            state["last_response"] = "Do you need anything else?"
+                await channel.send(build_anything_else_question())
+            state["last_response"] = build_anything_else_question()
+            return
+
+        if intent in {"staff", "member"}:
+            state["awaiting_anything_else"] = True
+            with suppress(Exception):
+                await channel.send(build_anything_else_question())
+            state["last_response"] = build_anything_else_question()
             return
 
         if close_ticket and not state.get("close_attempted"):
