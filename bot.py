@@ -1192,21 +1192,15 @@ def normalize_ai_prompt_text(prompt_text: str) -> str:
     return "\n".join(cleaned)
 
 def extract_prompt_directive_response(user_text: str, prompt_text: str) -> Optional[str]:
-    """
-    Supports patterns like:
-    - Staff applications: closed
-    - Member applications: open
-    - If someone asks to become staff tell them ...
-    Newest prompt lines are checked first.
-    """
     if not prompt_text:
         return None
+    intent = ai_get_hard_intent(user_text)
+    if intent == "greeting":
+        return None
 
-    user_lower = normalize_simple_text(user_text)
     lines = [line.strip() for line in prompt_text.splitlines() if line.strip()]
     colon_pairs: list[tuple[str, str]] = []
 
-    # newest-first prompt text should keep newest rules first
     for raw in lines:
         line = raw.strip()
         lower = line.lower()
@@ -1218,63 +1212,101 @@ def extract_prompt_directive_response(user_text: str, prompt_text: str) -> Optio
             if key and value:
                 colon_pairs.append((key, value))
 
-        if "if someone ask" in lower and "tell them" in lower:
+        if ("if someone ask" in lower or "if someone asks" in lower) and "tell them" in lower:
             try:
-                trigger_part = re.split(r"if someone asks?|tell them", lower)
-                if len(trigger_part) >= 3:
-                    trigger = trigger_part[1].strip(" ,.-")
-                    response_text = raw[raw.lower().find("tell them") + len("tell them"):].strip(" ,.-")
-                    trigger_tokens = [t for t in re.findall(r"[a-z0-9]+", trigger) if t not in {"to", "the", "a", "an", "that", "someone"}]
-                    hit_count = sum(1 for t in trigger_tokens if t in user_lower)
-                    if trigger_tokens and hit_count >= max(1, min(2, len(trigger_tokens))):
-                        if response_text.lower().startswith("do these steps"):
-                            return None
-                        return response_text
+                trigger = re.split(r"if someone asks?|tell them", lower)[1].strip(" ,.-")
+                if intent == "staff" and "staff" not in trigger:
+                    continue
+                if intent == "member" and ("staff" in trigger or not any(x in trigger for x in ["member", "join", "gang", "group"])):
+                    continue
+                response_text = raw[raw.lower().find("tell them") + len("tell them"):].strip(" ,.-")
+                if response_text.lower().startswith(("do these steps", "follow these steps", "follow these instructions")):
+                    return None
+                return response_text[:350]
             except Exception:
                 pass
 
-    # exact intent-aware colon matching
     for key, value in colon_pairs:
         key_l = key.lower()
-        if "staff" in key_l and any(x in user_lower for x in ["staff", "staff member", "apply for staff", "become staff"]):
-            if value.lower() == "closed":
+        val = value.strip()
+
+        if intent == "staff":
+            if "staff" not in key_l:
+                continue
+            if val.lower() == "closed":
                 return "Staff applications are closed right now."
-            if value.lower() == "open":
+            if val.lower() == "open":
                 return "Staff applications are open right now."
-            return value
-        if any(x in key_l for x in ["member", "join", "application"]) and "staff" not in user_lower and any(x in user_lower for x in ["member", "join", "join the gang", "become a member"]):
-            if value.lower() == "closed":
+            return val[:350]
+
+        if intent == "member":
+            if "staff" in key_l:
+                continue
+            if not any(x in key_l for x in ["member", "join", "application"]):
+                continue
+            if val.lower() == "closed":
                 return "Member applications are closed right now."
-            if value.lower() == "open":
+            if val.lower() == "open":
                 return "Member applications are open right now."
-            return value
+            return val[:350]
 
     return None
 
-def classify_user_intent_for_prompt(user_text: str) -> set[str]:
+def ai_get_hard_intent(user_text: str) -> str:
     t = normalize_simple_text(user_text)
-    tags: set[str] = set()
-
-    # staff must win over generic "member"
-    if any(x in t for x in [
-        "staff member", "become staff", "be a staff", "join staff",
-        "staff application", "staff applications", "apply for staff",
-        "i wanna become a staff", "i wanna be a staff", "hr"
-    ]):
-        tags.add("staff_application")
-
-    if "staff_application" not in tags and any(x in t for x in [
-        "join the gang", "become a member", "be a member", "join the group",
-        "join group", "become member", "member application", "join member"
-    ]):
-        tags.add("join_member")
-
+    if t in {"hi", "hello", "hey", "yo"}:
+        return "greeting"
+    if any(p in t for p in [
+        "staff member", "become a staff", "become staff", "be a staff",
+        "join staff", "staff application", "staff applications", "staff app",
+        "apply for staff", "i wanna become a staff", "i want to become a staff",
+        "i wanna be a staff", "i want to be a staff", "can i become staff",
+        "can i be staff", "moderator", "admin application"
+    ]) or "staff" in t:
+        return "staff"
+    if any(p in t for p in [
+        "become a member", "be a member", "join the gang", "join the group",
+        "join group", "become member", "member application", "join member",
+        "how do i join", "how can i join", "i want to join", "i wanna join"
+    ]) or ("member" in t and "staff" not in t):
+        return "member"
     if any(x in t for x in ["turf", "buy turf"]):
-        tags.add("turf")
-
+        return "turf"
     if t in {"done", "finished", "i'm done", "im done"} or " done" in t:
-        tags.add("done")
+        return "done"
+    return "unknown"
 
+
+def prompt_block_matches_intent(block: str, intent: str) -> bool:
+    low = block.lower()
+    block_staff = "staff" in low
+    block_member = any(x in low for x in ["member", "join the gang", "join the group", "join group", "how to join"]) and not block_staff
+    block_turf = "turf" in low
+    block_done = any(x in low for x in ['say "done"', "say 'done'", "say done", "when they're done", "when their done"])
+    if intent == "staff":
+        return block_staff
+    if intent == "member":
+        return block_member
+    if intent == "turf":
+        return block_turf
+    if intent == "done":
+        return block_done
+    return False
+
+
+def classify_user_intent_for_prompt(user_text: str) -> set[str]:
+    intent = ai_get_hard_intent(user_text)
+    tags: set[str] = set()
+    if intent == "greeting":
+        tags.add("greeting")
+    elif intent == "staff":
+        tags.add("staff_application")
+    elif intent == "member":
+        tags.add("join_member")
+    elif intent == "turf":
+        tags.add("turf")
+    elif intent == "done":
+        tags.add("done")
     return tags
 
 def extract_structured_prompt_rule(user_text: str, prompt_text: str) -> Optional[dict[str, Any]]:
@@ -5521,8 +5553,9 @@ async def get_ai_response_advanced(
         custom_prompt = custom_prompts_cache.get(guild_id, "") or ""
 
     lower = normalize_simple_text(user_message)
+    intent = ai_get_hard_intent(user_message)
 
-    if lower in {"hi", "hello", "hey", "yo"}:
+    if intent == "greeting":
         return {
             "reply": "Hello! How can I help you today?",
             "close_ticket": False,
@@ -5531,10 +5564,6 @@ async def get_ai_response_advanced(
             "suggested_category": "",
             "rename_to": ""
         }
-
-    structured = extract_structured_prompt_rule(user_message, custom_prompt)
-    if structured:
-        return structured
 
     direct = extract_prompt_directive_response(user_message, custom_prompt)
     if direct:
@@ -5547,11 +5576,11 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    explicit_close = lower in ADVANCED_END_WORDS
-    categories_text = ", ".join(available_categories)
-    recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
+    structured = extract_structured_prompt_rule(user_message, custom_prompt)
+    if structured:
+        return structured
 
-    if explicit_close:
+    if lower in ADVANCED_END_WORDS:
         return {
             "reply": "Alright, I'll close this ticket now.",
             "close_ticket": True,
@@ -5581,17 +5610,14 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    system_prompt = f"""You are a highly capable Discord ticket assistant helping users BEFORE staff claim the ticket.
-
-Current ticket category: {ticket_category}
-Available categories: {categories_text}
-User name: {opener_name}
-
-You must return ONLY valid JSON.
-
-JSON format:
+    categories_text = ", ".join(available_categories)
+    recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
+    system_prompt = f"""You are a Discord ticket assistant.
+Answer only the user's exact question. Do not include unrelated rules.
+Never treat staff member as regular member.
+Return ONLY JSON:
 {{
-  "reply": "short helpful message",
+  "reply": "short answer",
   "close_ticket": false,
   "needs_staff": false,
   "staff_summary": "",
@@ -5599,15 +5625,9 @@ JSON format:
   "rename_to": ""
 }}
 
-Rules:
-1. Answer only the user's actual question.
-2. Do not include unrelated extra info.
-3. Never auto-close unless the user clearly indicates they are done.
-4. Respect prompt channel instructions exactly when they apply.
-5. Only set rename_to if a real staff member needs to step in.
-6. Never copy internal admin workflow text to the user.
-
-Prompt channel instructions:
+Current category: {ticket_category}
+Available categories: {categories_text}
+Prompt rules:
 {custom_prompt}
 """
 
@@ -5616,7 +5636,7 @@ Prompt channel instructions:
         {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nNewest user message:\n{user_message}"}
     ]
 
-    response = await call_deepseek_api_fast(messages, max_tokens=120)
+    response = await call_deepseek_api_fast(messages, max_tokens=100)
     parsed = extract_json_object(response or "")
 
     if not parsed:
@@ -5629,19 +5649,13 @@ Prompt channel instructions:
             "rename_to": ""
         }
 
-    reply = str(parsed.get("reply", "")).strip()[:350]
-    needs_staff = bool(parsed.get("needs_staff", False))
-    staff_summary = str(parsed.get("staff_summary", "")).strip()[:200]
-    rename_to = str(parsed.get("rename_to", "")).strip()[:60] if needs_staff else ""
-    suggested_category = str(parsed.get("suggested_category", "")).strip()[:100]
-
     return {
-        "reply": reply,
+        "reply": str(parsed.get("reply", "")).strip()[:350],
         "close_ticket": False,
-        "needs_staff": needs_staff,
-        "staff_summary": staff_summary,
-        "suggested_category": suggested_category,
-        "rename_to": rename_to
+        "needs_staff": bool(parsed.get("needs_staff", False)),
+        "staff_summary": str(parsed.get("staff_summary", "")).strip()[:200],
+        "suggested_category": str(parsed.get("suggested_category", "")).strip()[:100],
+        "rename_to": str(parsed.get("rename_to", "")).strip()[:60] if bool(parsed.get("needs_staff", False)) else ""
     }
 
 async def handle_ai_assistant_message_advanced(message: discord.Message):
