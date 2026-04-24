@@ -1369,6 +1369,73 @@ def natural_member_reply_from_prompt(prompt_text: str) -> str:
     return "Sure! To become a member, follow the instructions in the server and then send proof here when you're finished."
 
 
+
+def ai_is_simple_greeting(text: str) -> bool:
+    return normalize_simple_text(text) in {"hi", "hello", "hey", "yo", "sup", "hej"}
+
+
+def ai_user_wants_close(text: str) -> bool:
+    t = normalize_simple_text(text)
+    return t in {
+        "no", "nope", "nah", "no thanks", "no thank you",
+        "nothing else", "all good", "thats all", "that's all",
+        "done", "finished", "close", "close it"
+    }
+
+
+def ai_user_says_yes_only(text: str) -> bool:
+    return normalize_simple_text(text) in {"yes", "yeah", "yep", "sure", "ok", "okay"}
+
+
+def clean_prompt_knowledge(prompt_text: str) -> str:
+    """
+    Prompt channel is knowledge, not ready-made responses.
+    Keep useful facts, remove bot workflow/internal instructions.
+    """
+    if not prompt_text:
+        return ""
+
+    kept = []
+    for raw in prompt_text.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if not line:
+            continue
+
+        if any(x in low for x in [
+            "then you should", "assistant should", "rename ticket", "rename the ticket",
+            "call hr", "ping hr", "alert hr", "notify hr",
+            "once they", "after they", "check proof", "check so the proof",
+            "do these steps", "follow these steps"
+        ]):
+            continue
+
+        kept.append(line)
+
+    # newest first from fetch; limit to avoid confusing the model
+    return "\n".join(kept[:25])
+
+
+def fallback_helpful_reply(user_text: str, prompt_knowledge: str) -> str:
+    t = normalize_simple_text(user_text)
+
+    if ai_is_simple_greeting(user_text):
+        return "Hi! How can I help you?"
+
+    if "staff" in t:
+        if "staff" in prompt_knowledge.lower() and "closed" in prompt_knowledge.lower():
+            return "Unfortunately, staff applications are currently closed. It will be announced when they open again, so stay tuned!"
+        return "I can help with staff-related questions. What would you like to know?"
+
+    if "member" in t or "join" in t:
+        return "Sure! I can help you with that. Please follow the server’s member instructions, then send proof here when you’re finished."
+
+    if "proof" in t or "done" in t or "finished" in t:
+        return "Alright, I’ll get a staff member to double-check it and help finish this."
+
+    return "Tell me what you need help with and I’ll guide you."
+
+
 def ai_detect_user_intent(user_text: str) -> str:
     t = normalize_simple_text(user_text)
 
@@ -2645,7 +2712,7 @@ async def fetch_prompt_from_channel(channel_id: int) -> Optional[str]:
     except Exception:
         return None
 
-async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 120) -> Optional[str]:
+async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 180) -> Optional[str]:
     if not DEEPSEEK_API_KEY:
         return None
 
@@ -2661,7 +2728,7 @@ async def call_deepseek_api_fast(messages: list[dict], max_tokens: int = 120) ->
         "temperature": 0.15
     }
 
-    timeout = aiohttp.ClientTimeout(total=2.8, connect=1, sock_read=2)
+    timeout = aiohttp.ClientTimeout(total=4, connect=1.5, sock_read=3)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
             async with session.post(
@@ -5729,17 +5796,19 @@ async def get_ai_response_advanced(
 ) -> dict[str, Any]:
     ai_config = await get_ai_assistant_config(guild_id)
 
-    custom_prompt = ""
+    raw_prompt = ""
     if ai_config and ai_config.get("prompt_channel_id"):
         fetched_prompt = await fetch_prompt_from_channel(ai_config["prompt_channel_id"])
         if fetched_prompt:
-            custom_prompt = normalize_ai_prompt_text(fetched_prompt)
-    if not custom_prompt:
-        custom_prompt = custom_prompts_cache.get(guild_id, "") or ""
+            raw_prompt = normalize_ai_prompt_text(fetched_prompt)
+    if not raw_prompt:
+        raw_prompt = custom_prompts_cache.get(guild_id, "") or ""
 
-    intent = ai_detect_user_intent(user_message)
+    prompt_knowledge = clean_prompt_knowledge(raw_prompt)
+    lower = normalize_simple_text(user_message)
 
-    if intent == "greeting":
+    # Hard simple cases. No prompt matching, no copy/paste.
+    if ai_is_simple_greeting(user_message):
         return {
             "reply": "Hi! How can I help you?",
             "close_ticket": False,
@@ -5749,37 +5818,7 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    if intent == "member":
-        return {
-            "reply": natural_member_reply_from_prompt(custom_prompt),
-            "close_ticket": False,
-            "needs_staff": False,
-            "staff_summary": "",
-            "suggested_category": "",
-            "rename_to": ""
-        }
-
-    if intent == "staff":
-        return {
-            "reply": natural_staff_reply_from_prompt(custom_prompt),
-            "close_ticket": False,
-            "needs_staff": False,
-            "staff_summary": "",
-            "suggested_category": "",
-            "rename_to": ""
-        }
-
-    if intent == "proof_done":
-        return {
-            "reply": "Alright, I'll get a staff member to double-check it and help finish this.",
-            "close_ticket": False,
-            "needs_staff": True,
-            "staff_summary": "User says they completed the required steps and sent proof.",
-            "suggested_category": "",
-            "rename_to": "waiting-review"
-        }
-
-    if intent == "negative_close":
+    if ai_user_wants_close(user_message):
         return {
             "reply": "Alright, I'll close this ticket now.",
             "close_ticket": True,
@@ -5789,46 +5828,45 @@ async def get_ai_response_advanced(
             "rename_to": ""
         }
 
-    if intent == "purchase":
-        facts = prompt_extract_user_facing_facts(custom_prompt, "purchase")
-        if facts:
-            reply = " ".join(facts[:2])
-        else:
-            reply = "I'll get you a staff member to help you with this."
+    # If user only says yes after a question, ask what they need instead of repeating old answer.
+    if ai_user_says_yes_only(user_message):
         return {
-            "reply": reply[:350],
+            "reply": "Okay, what more can I do for you?",
             "close_ticket": False,
-            "needs_staff": True,
-            "staff_summary": "User needs help with a purchase/payment-related request.",
+            "needs_staff": False,
+            "staff_summary": "",
             "suggested_category": "",
-            "rename_to": ai_build_short_topic_advanced(user_message)
+            "rename_to": ""
         }
 
-    # For normal unknown questions: use the AI freely, with prompt channel as background knowledge only.
-    categories_text = ", ".join(available_categories)
     recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
+    categories_text = ", ".join(available_categories)
 
-    system_prompt = f"""You are a smart Discord ticket assistant.
+    system_prompt = f"""You are a helpful Discord ticket assistant.
 
-Important behavior:
-- Speak naturally in your own words.
-- Do NOT copy/paste prompt channel text directly.
-- Use prompt channel only as background knowledge/facts.
-- Answer only the user's actual question.
-- Do not include unrelated information.
-- Do not treat "staff member" as regular "member".
-- Do not close tickets unless the user clearly says they are done.
-- If a real staff member is needed, set needs_staff=true.
+Your job:
+- Talk naturally like a real support assistant.
+- Answer the user's actual question.
+- Use the prompt-channel knowledge only as background facts.
+- NEVER copy/paste prompt-channel text directly.
+- NEVER dump all instructions at once unless the user asks for steps.
+- Do not repeat the same answer.
+- Do not ask "Do you need anything else?" after every reply.
+- Only ask "Anything else before I close?" after the issue is clearly finished or staff has been called.
+- If the user says they sent proof / finished steps, set needs_staff=true.
+- If the user asks about staff applications, answer naturally using the knowledge.
+- If the user asks about becoming a member, give a short helpful explanation using the knowledge.
+- If unsure, ask one short clarifying question.
 
 Current ticket category: {ticket_category}
 Available categories: {categories_text}
 
-Prompt channel knowledge:
-{custom_prompt}
+Prompt-channel knowledge:
+{prompt_knowledge}
 
 Return ONLY valid JSON:
 {{
-  "reply": "natural short answer",
+  "reply": "natural helpful answer",
   "close_ticket": false,
   "needs_staff": false,
   "staff_summary": "",
@@ -5839,29 +5877,46 @@ Return ONLY valid JSON:
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nUser message:\n{user_message}"}
+        {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nNewest user message:\n{user_message}"}
     ]
 
-    response = await call_deepseek_api_fast(messages, max_tokens=140)
+    response = await call_deepseek_api_fast(messages, max_tokens=180)
     parsed = extract_json_object(response or "")
 
     if not parsed:
         return {
-            "reply": "Could you explain what you need help with?",
+            "reply": fallback_helpful_reply(user_message, prompt_knowledge),
             "close_ticket": False,
-            "needs_staff": False,
-            "staff_summary": "",
+            "needs_staff": ("proof" in lower or "done" in lower or "finished" in lower),
+            "staff_summary": "User may need staff help." if ("proof" in lower or "done" in lower or "finished" in lower) else "",
             "suggested_category": "",
-            "rename_to": ""
+            "rename_to": "waiting-review" if ("proof" in lower or "done" in lower or "finished" in lower) else ""
         }
 
+    reply = str(parsed.get("reply", "")).strip()
+
+    # Safety: prevent prompt dumping or repeated raw admin text
+    if not reply or len(reply) > 600:
+        reply = fallback_helpful_reply(user_message, prompt_knowledge)
+
+    # remove accidental "do you need anything else" unless staff was called/finished
+    if "do you need anything else" in reply.lower() or "anything else before i close" in reply.lower():
+        if not bool(parsed.get("needs_staff", False)) and not ai_user_wants_close(user_message):
+            reply = re.sub(r"(?i)\s*(do you need anything else\??|anything else before i close\??)", "", reply).strip()
+            if not reply:
+                reply = fallback_helpful_reply(user_message, prompt_knowledge)
+
+    needs_staff = bool(parsed.get("needs_staff", False))
+    if any(x in lower for x in ["sent proof", "proof sent", "i sent proof", "done", "finished"]):
+        needs_staff = True
+
     return {
-        "reply": str(parsed.get("reply", "")).strip()[:350],
-        "close_ticket": bool(parsed.get("close_ticket", False)) and ai_detect_user_intent(user_message) == "negative_close",
-        "needs_staff": bool(parsed.get("needs_staff", False)),
-        "staff_summary": str(parsed.get("staff_summary", "")).strip()[:200],
+        "reply": reply[:350],
+        "close_ticket": bool(parsed.get("close_ticket", False)) and ai_user_wants_close(user_message),
+        "needs_staff": needs_staff,
+        "staff_summary": str(parsed.get("staff_summary", "")).strip()[:200] or ("User needs staff follow-up." if needs_staff else ""),
         "suggested_category": str(parsed.get("suggested_category", "")).strip()[:100],
-        "rename_to": str(parsed.get("rename_to", "")).strip()[:60] if bool(parsed.get("needs_staff", False)) else ""
+        "rename_to": (str(parsed.get("rename_to", "")).strip()[:60] if needs_staff else "")
     }
 
 async def handle_ai_assistant_message_advanced(message: discord.Message):
@@ -5906,26 +5961,25 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
             "last_response": None,
             "last_user_text": None,
             "close_attempted": False,
-            "awaiting_anything_else": False,
-            "flow": None
+            "awaiting_anything_else": False
         })
 
         user_text = message.content.strip()
         lower = normalize_simple_text(user_text)
-        intent = ai_detect_user_intent(user_text)
 
         if state.get("awaiting_anything_else"):
             state["awaiting_anything_else"] = False
 
-            if intent == "negative_close" or ai_is_negative_reply(user_text):
+            if ai_user_wants_close(user_text) or ai_is_negative_reply(user_text):
                 with suppress(Exception):
                     await channel.send("Alright, I'll close this ticket now.")
                 await auto_close_ticket_by_ai(channel, guild, "User said they do not need anything else.")
-                await delete_ticket_memory(channel.id)
+                with suppress(Exception):
+                    await delete_ticket_memory(channel.id)
                 cleanup_ticket_channel_lock(channel.id)
                 return
 
-            if intent == "yes_continue" or ai_is_affirmative_reply(user_text):
+            if ai_user_says_yes_only(user_text) or ai_is_affirmative_reply(user_text):
                 with suppress(Exception):
                     await channel.send("Okay, what more can I do for you?")
                 state["last_response"] = "Okay, what more can I do for you?"
@@ -5936,7 +5990,7 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         state["last_user_text"] = lower
 
         state["messages"].append(f"User: {user_text}")
-        state["messages"] = state["messages"][-24:]
+        state["messages"] = state["messages"][-20:]
 
         ticket_options = await get_ticket_options(guild.id)
         available_categories = [opt["label"] for opt in ticket_options]
@@ -5959,15 +6013,15 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
         if not reply:
             reply = "Tell me what you need help with."
 
-        if reply and state.get("last_response") == reply:
+        if reply == state.get("last_response"):
             reply = "Okay, what more can I do for you?"
 
-        if reply:
-            with suppress(Exception):
-                await channel.send(reply)
-            state["messages"].append(f"Bot: {reply}")
-            state["messages"] = state["messages"][-24:]
-            state["last_response"] = reply
+        with suppress(Exception):
+            await channel.send(reply)
+
+        state["messages"].append(f"Bot: {reply}")
+        state["messages"] = state["messages"][-20:]
+        state["last_response"] = reply
 
         if needs_staff and rename_to:
             await maybe_rename_ticket_from_ai(channel, rename_to)
@@ -5985,25 +6039,21 @@ async def handle_ai_assistant_message_advanced(message: discord.Message):
                     alert_channel_id=ai_config["alert_channel_id"]
                 )
                 state["staff_alerted"] = True
+
             await send_log(guild, "AI Requested Staff", f"Channel: {channel.mention}\nSummary: {summary}")
 
+            # Ask once only after staff escalation
             state["awaiting_anything_else"] = True
             with suppress(Exception):
-                await channel.send(build_anything_else_question())
-            state["last_response"] = build_anything_else_question()
-            return
-
-        if intent in {"staff", "member"}:
-            state["awaiting_anything_else"] = True
-            with suppress(Exception):
-                await channel.send(build_anything_else_question())
-            state["last_response"] = build_anything_else_question()
+                await channel.send("Anything else before I close?")
+            state["last_response"] = "Anything else before I close?"
             return
 
         if close_ticket and not state.get("close_attempted"):
             state["close_attempted"] = True
             await auto_close_ticket_by_ai(channel, guild, "Conversation completed.")
-            await delete_ticket_memory(channel.id)
+            with suppress(Exception):
+                await delete_ticket_memory(channel.id)
             cleanup_ticket_channel_lock(channel.id)
 
     except Exception as e:
