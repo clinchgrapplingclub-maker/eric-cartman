@@ -1253,6 +1253,122 @@ def extract_prompt_directive_response(user_text: str, prompt_text: str) -> Optio
     return None
 
 
+
+def prompt_extract_status(prompt_text: str, topic: str) -> Optional[str]:
+    """
+    Extracts simple facts from prompt channel without copying wording.
+    Example:
+    staff applications: closed -> closed
+    member applications: open -> open
+    """
+    if not prompt_text:
+        return None
+
+    topic_words = {
+        "staff": ["staff", "staff application", "staff applications"],
+        "member": ["member", "join", "application", "applications"],
+    }.get(topic, [topic])
+
+    for raw in prompt_text.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if not line:
+            continue
+
+        if any(w in low for w in topic_words):
+            if "closed" in low:
+                return "closed"
+            if "open" in low or "opened" in low:
+                return "open"
+            if "not available" in low:
+                return "closed"
+
+    return None
+
+
+def prompt_extract_user_facing_facts(prompt_text: str, intent: str) -> list[str]:
+    """
+    Pulls useful facts from prompt channel but does not copy internal workflow.
+    The AI/helper should rewrite these facts in its own words.
+    """
+    if not prompt_text:
+        return []
+
+    facts: list[str] = []
+    for raw in prompt_text.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if not line:
+            continue
+
+        # ignore internal workflow/admin instructions
+        if any(x in low for x in [
+            "if someone asks", "if someone ask", "if user asks", "if user ask",
+            "then you", "assistant should", "rename ticket", "rename the ticket",
+            "call hr", "ping hr", "alert hr", "get a staff member", "notify staff",
+            "after they", "once they", "check proof", "check so the proof",
+            "do these steps", "follow these steps", "steps"
+        ]):
+            continue
+
+        if intent == "staff":
+            if "staff" in low or "application" in low:
+                facts.append(line)
+
+        elif intent == "member":
+            if "staff" in low:
+                continue
+            if any(x in low for x in ["join", "member", "group", "proof", "verify", "display", "name"]):
+                facts.append(line)
+
+        elif intent == "purchase":
+            if any(x in low for x in ["buy", "purchase", "price", "payment", "turf", "store"]):
+                facts.append(line)
+
+    # newest first, de-dupe
+    cleaned = []
+    seen = set()
+    for f in facts:
+        key = f.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(f)
+    return cleaned[:8]
+
+
+def natural_staff_reply_from_prompt(prompt_text: str) -> str:
+    status = prompt_extract_status(prompt_text, "staff")
+    if status == "closed":
+        return "Unfortunately, staff applications are currently closed. It will be announced when they open again, so stay tuned!"
+    if status == "open":
+        return "Staff applications are currently open. Please follow the application instructions."
+
+    facts = prompt_extract_user_facing_facts(prompt_text, "staff")
+    if facts:
+        joined = " ".join(facts)
+        if "closed" in joined.lower():
+            return "Unfortunately, staff applications are currently closed. It will be announced when they open again, so stay tuned!"
+        return f"Here is what I know about staff applications: {joined}"
+
+    return "Unfortunately, staff applications are currently closed. It will be announced when they open again, so stay tuned!"
+
+
+def natural_member_reply_from_prompt(prompt_text: str) -> str:
+    facts = prompt_extract_user_facing_facts(prompt_text, "member")
+    if facts:
+        bullets = []
+        for f in facts:
+            cleaned = re.sub(r"^tell them to\s+", "", f, flags=re.I).strip()
+            cleaned = re.sub(r"^tell them that\s+", "", cleaned, flags=re.I).strip()
+            if cleaned:
+                bullets.append(f"- {cleaned}")
+        if bullets:
+            return "Sure! To become a member, please do this:\n" + "\n".join(bullets) + "\n\nWhen you're finished, send proof here."
+
+    return "Sure! To become a member, follow the instructions in the server and then send proof here when you're finished."
+
+
 def ai_detect_user_intent(user_text: str) -> str:
     t = normalize_simple_text(user_text)
 
@@ -1323,29 +1439,10 @@ def prompt_lines_for_intent(prompt_text: str, intent: str) -> list[str]:
 
 
 def build_member_steps_reply(prompt_text: str) -> str:
-    lines = prompt_lines_for_intent(prompt_text, "member")
-    if lines:
-        body = "\n".join(f"- {line}" for line in lines)
-        return f"Sure! Here are the steps:\n{body}\n\nSend proof here once you're finished."
-
-    return "Sure! Follow the member instructions, then send proof here once you're finished."
-
+    return natural_member_reply_from_prompt(prompt_text)
 
 def build_staff_reply(prompt_text: str) -> str:
-    direct = extract_prompt_directive_response("staff applications", prompt_text)
-    if direct:
-        return direct
-
-    lines = prompt_lines_for_intent(prompt_text, "staff")
-    for line in lines:
-        low = line.lower()
-        if "closed" in low:
-            return "Unfortunately, staff applications are closed right now. It will be announced when they open again, so stay tuned!"
-        if "open" in low:
-            return "Staff applications are open right now. Please follow the application instructions."
-
-    return "Unfortunately, staff applications are closed right now. It will be announced when they open again, so stay tuned!"
-
+    return natural_staff_reply_from_prompt(prompt_text)
 
 def build_anything_else_question() -> str:
     return "Anything else before I close?"
@@ -5654,7 +5751,7 @@ async def get_ai_response_advanced(
 
     if intent == "member":
         return {
-            "reply": build_member_steps_reply(custom_prompt),
+            "reply": natural_member_reply_from_prompt(custom_prompt),
             "close_ticket": False,
             "needs_staff": False,
             "staff_summary": "",
@@ -5664,7 +5761,7 @@ async def get_ai_response_advanced(
 
     if intent == "staff":
         return {
-            "reply": build_staff_reply(custom_prompt),
+            "reply": natural_staff_reply_from_prompt(custom_prompt),
             "close_ticket": False,
             "needs_staff": False,
             "staff_summary": "",
@@ -5693,8 +5790,13 @@ async def get_ai_response_advanced(
         }
 
     if intent == "purchase":
+        facts = prompt_extract_user_facing_facts(custom_prompt, "purchase")
+        if facts:
+            reply = " ".join(facts[:2])
+        else:
+            reply = "I'll get you a staff member to help you with this."
         return {
-            "reply": "I'll get you a staff member to help you with this.",
+            "reply": reply[:350],
             "close_ticket": False,
             "needs_staff": True,
             "staff_summary": "User needs help with a purchase/payment-related request.",
@@ -5702,13 +5804,64 @@ async def get_ai_response_advanced(
             "rename_to": ai_build_short_topic_advanced(user_message)
         }
 
+    # For normal unknown questions: use the AI freely, with prompt channel as background knowledge only.
+    categories_text = ", ".join(available_categories)
+    recent_convo = "\n".join(conversation[-10:]) if conversation else "(no prior conversation)"
+
+    system_prompt = f"""You are a smart Discord ticket assistant.
+
+Important behavior:
+- Speak naturally in your own words.
+- Do NOT copy/paste prompt channel text directly.
+- Use prompt channel only as background knowledge/facts.
+- Answer only the user's actual question.
+- Do not include unrelated information.
+- Do not treat "staff member" as regular "member".
+- Do not close tickets unless the user clearly says they are done.
+- If a real staff member is needed, set needs_staff=true.
+
+Current ticket category: {ticket_category}
+Available categories: {categories_text}
+
+Prompt channel knowledge:
+{custom_prompt}
+
+Return ONLY valid JSON:
+{{
+  "reply": "natural short answer",
+  "close_ticket": false,
+  "needs_staff": false,
+  "staff_summary": "",
+  "suggested_category": "",
+  "rename_to": ""
+}}
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Recent conversation:\n{recent_convo}\n\nUser message:\n{user_message}"}
+    ]
+
+    response = await call_deepseek_api_fast(messages, max_tokens=140)
+    parsed = extract_json_object(response or "")
+
+    if not parsed:
+        return {
+            "reply": "Could you explain what you need help with?",
+            "close_ticket": False,
+            "needs_staff": False,
+            "staff_summary": "",
+            "suggested_category": "",
+            "rename_to": ""
+        }
+
     return {
-        "reply": "Tell me what you need help with.",
-        "close_ticket": False,
-        "needs_staff": False,
-        "staff_summary": "",
-        "suggested_category": "",
-        "rename_to": ""
+        "reply": str(parsed.get("reply", "")).strip()[:350],
+        "close_ticket": bool(parsed.get("close_ticket", False)) and ai_detect_user_intent(user_message) == "negative_close",
+        "needs_staff": bool(parsed.get("needs_staff", False)),
+        "staff_summary": str(parsed.get("staff_summary", "")).strip()[:200],
+        "suggested_category": str(parsed.get("suggested_category", "")).strip()[:100],
+        "rename_to": str(parsed.get("rename_to", "")).strip()[:60] if bool(parsed.get("needs_staff", False)) else ""
     }
 
 async def handle_ai_assistant_message_advanced(message: discord.Message):
