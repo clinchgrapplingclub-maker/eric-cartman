@@ -5596,6 +5596,275 @@ async def setup_hook():
             cmd.default_permissions = discord.Permissions.none()
 
 
+
+# =========================================================
+# HARD CLEAN AI ASSISTANT - NO OLD PROMPT COPY LOGIC
+# =========================================================
+def hard_ai_norm(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower().strip())
+
+
+def hard_ai_close(text: str) -> bool:
+    return hard_ai_norm(text) in {
+        "no", "nope", "nah", "no thanks", "no thank you",
+        "nothing else", "all good", "that's all", "thats all",
+        "close", "close it", "you can close"
+    }
+
+
+def hard_ai_yes(text: str) -> bool:
+    return hard_ai_norm(text) in {"yes", "yeah", "yep", "sure", "ok", "okay", "yea"}
+
+
+def hard_ai_greeting(text: str) -> bool:
+    return hard_ai_norm(text) in {"hi", "hello", "hey", "yo", "sup", "hej"}
+
+
+def hard_clean_prompt_knowledge(prompt_text: str) -> str:
+    if not prompt_text:
+        return ""
+
+    kept = []
+    for raw in prompt_text.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if not line:
+            continue
+
+        # kill anything that sounds like instructions to the bot
+        if any(x in low for x in [
+            "if someone", "if user", "tell them", "bot should", "assistant should",
+            "you should", "then you", "rename", "call hr", "ping hr", "alert hr",
+            "notify", "do these steps", "follow these steps", "once they", "after they"
+        ]):
+            continue
+
+        if ":" in line:
+            left, right = line.split(":", 1)
+            if left.strip() and right.strip():
+                kept.append(f"{left.strip()} is {right.strip()}.")
+                continue
+
+        kept.append(line)
+
+    # newest first and short
+    out = []
+    seen = set()
+    for x in kept:
+        key = x.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(x)
+    return "\n".join(out[:20])
+
+
+def hard_detect_done_or_proof(text: str) -> bool:
+    t = hard_ai_norm(text)
+    return any(x in t for x in [
+        "sent proof", "proof sent", "i sent proof", "done",
+        "finished", "completed", "i did it", "paid", "payment sent"
+    ])
+
+
+async def hard_fetch_prompt_for_guild(guild_id: int) -> str:
+    ai_config = await get_ai_assistant_config(guild_id)
+    if not ai_config or not ai_config.get("prompt_channel_id"):
+        return ""
+
+    prompt = await fetch_prompt_from_channel(ai_config["prompt_channel_id"])
+    return hard_clean_prompt_knowledge(prompt or "")
+
+
+async def hard_call_support_ai(guild_id: int, state: dict[str, Any], user_text: str, ticket_category: str, available_categories: list[str]) -> dict[str, Any]:
+    knowledge = await hard_fetch_prompt_for_guild(guild_id)
+
+    if hard_ai_greeting(user_text):
+        return {"reply": "Hi! How can I help you?", "needs_staff": False, "close_ticket": False, "rename_to": "", "staff_summary": ""}
+
+    if hard_ai_close(user_text):
+        return {"reply": "Alright, I'll close this ticket now.", "needs_staff": False, "close_ticket": True, "rename_to": "", "staff_summary": ""}
+
+    if hard_ai_yes(user_text):
+        return {"reply": "Okay, what more can I help you with?", "needs_staff": False, "close_ticket": False, "rename_to": "", "staff_summary": ""}
+
+    if hard_detect_done_or_proof(user_text):
+        return {
+            "reply": "Alright, I’ll get a staff member to check it and help finish this.",
+            "needs_staff": True,
+            "close_ticket": False,
+            "rename_to": "waiting-review",
+            "staff_summary": "User says they completed the required step or sent proof."
+        }
+
+    recent = "\n".join(state.get("messages", [])[-10:])
+    categories = ", ".join(available_categories)
+
+    system_prompt = f"""You are a normal helpful Discord ticket support assistant.
+
+Rules:
+- Answer naturally in your own words.
+- Do not copy prompt-channel text directly.
+- Prompt knowledge is only background facts, not a script.
+- Do not repeat yourself.
+- Do not ask "Do you need anything else?" unless staff was just called.
+- If user asks about staff applications and knowledge says closed, say naturally that staff applications are currently closed.
+- If user asks about member/joining, explain naturally and briefly.
+- If user is unclear, ask one short clarifying question.
+- If user sent proof or needs review, set needs_staff true.
+
+Ticket category: {ticket_category}
+Available categories: {categories}
+
+Background knowledge:
+{knowledge}
+
+Return ONLY JSON:
+{{"reply":"answer in natural words","needs_staff":false,"close_ticket":false,"rename_to":"","staff_summary":""}}
+"""
+
+    response = await call_deepseek_api_fast([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Conversation:\n{recent}\n\nUser says:\n{user_text}"}
+    ], max_tokens=160)
+
+    parsed = extract_json_object(response or "")
+    if not parsed:
+        return {"reply": "Could you explain what you need help with?", "needs_staff": False, "close_ticket": False, "rename_to": "", "staff_summary": ""}
+
+    reply = str(parsed.get("reply", "")).strip()
+    if not reply:
+        reply = "Could you explain what you need help with?"
+
+    # absolute anti-copy/anti-old-bug guard
+    banned_old = "that we don’t give free ranks" in reply.lower() or "that we don't give free ranks" in reply.lower()
+    if banned_old or (knowledge and reply.lower().strip() in knowledge.lower()):
+        reply = "Could you explain exactly what you need help with?"
+
+    return {
+        "reply": reply[:400],
+        "needs_staff": bool(parsed.get("needs_staff", False)),
+        "close_ticket": bool(parsed.get("close_ticket", False)) and hard_ai_close(user_text),
+        "rename_to": str(parsed.get("rename_to", "")).strip()[:60] if bool(parsed.get("needs_staff", False)) else "",
+        "staff_summary": str(parsed.get("staff_summary", "")).strip()[:200]
+    }
+
+
+async def hard_ai_handle_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if not DEEPSEEK_API_KEY:
+        return
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+    if not isinstance(message.author, discord.Member):
+        return
+
+    guild = message.guild
+    if not guild:
+        return
+
+    ticket = await get_ticket_by_channel(message.channel.id)
+    if not ticket or ticket["status"] == "closed" or ticket["claimed_by"] is not None:
+        return
+
+    ai_config = await get_ai_assistant_config(guild.id)
+    if not ai_config or ai_config.get("enabled") is not True:
+        return
+
+    if not await get_active_premium_guild_record(guild.id):
+        return
+
+    config = await get_guild_config(guild.id)
+    if not config:
+        return
+
+    if message.channel.id in ai_processing:
+        return
+
+    ai_processing.add(message.channel.id)
+    try:
+        state = ai_conversations.setdefault(message.channel.id, {
+            "messages": [],
+            "last_response": None,
+            "awaiting_anything_else": False,
+            "staff_alerted": False
+        })
+
+        user_text = message.content.strip()
+
+        if state.get("awaiting_anything_else"):
+            state["awaiting_anything_else"] = False
+            if hard_ai_close(user_text) or ai_is_negative_reply(user_text):
+                await message.channel.send("Alright, I'll close this ticket now.")
+                await auto_close_ticket_by_ai(message.channel, guild, "User said they do not need anything else.")
+                cleanup_ticket_channel_lock(message.channel.id)
+                return
+            if hard_ai_yes(user_text) or ai_is_affirmative_reply(user_text):
+                await message.channel.send("Okay, what more can I help you with?")
+                state["last_response"] = "Okay, what more can I help you with?"
+                return
+
+        rows = await get_ticket_options(guild.id)
+        available = [r["label"] for r in rows]
+
+        result = await hard_call_support_ai(
+            guild.id,
+            state,
+            user_text,
+            ticket["option_label"],
+            available
+        )
+
+        reply = result.get("reply") or "Could you explain what you need help with?"
+
+        if reply == state.get("last_response"):
+            reply = "I may have misunderstood. Could you explain what you need in a different way?"
+
+        await message.channel.send(reply)
+
+        state["messages"].append(f"User: {user_text}")
+        state["messages"].append(f"Bot: {reply}")
+        state["messages"] = state["messages"][-20:]
+        state["last_response"] = reply
+
+        if result.get("needs_staff"):
+            rename_to = result.get("rename_to") or "waiting-review"
+            await maybe_rename_ticket_from_ai(message.channel, rename_to)
+
+            if not state.get("staff_alerted"):
+                opener = await try_fetch_member(guild, ticket["opener_id"])
+                if opener and ai_config.get("alert_channel_id"):
+                    await send_staff_alert(
+                        guild,
+                        message.channel,
+                        opener,
+                        result.get("staff_summary") or "User needs staff help.",
+                        config["support_role_id"],
+                        ai_config["alert_channel_id"]
+                    )
+                    state["staff_alerted"] = True
+
+            state["awaiting_anything_else"] = True
+            await message.channel.send("Anything else before I close?")
+            state["last_response"] = "Anything else before I close?"
+            return
+
+        if result.get("close_ticket"):
+            await auto_close_ticket_by_ai(message.channel, guild, "Conversation completed.")
+            cleanup_ticket_channel_lock(message.channel.id)
+
+    except Exception as e:
+        log.exception("Hard clean AI failed in channel %s: %s", message.channel.id, e)
+    finally:
+        ai_processing.discard(message.channel.id)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    await hard_ai_handle_message(message)
+
+
+
 # =========================================================
 # CLEAN SHUTDOWN
 # =========================================================
